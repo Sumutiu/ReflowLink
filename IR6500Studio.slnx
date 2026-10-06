@@ -1,8 +1,0 @@
-<Solution>
-  <Folder Name="/src/">
-    <Project Path="src/IR6500Studio/IR6500Studio.csproj" />
-  </Folder>
-  <Folder Name="/tests/">
-    <Project Path="tests/IR6500Studio.Tests/IR6500Studio.Tests.csproj" />
-  </Folder>
-</Solution>

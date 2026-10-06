@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <RootNamespace>ReflowLink</RootNamespace>
+    <AssemblyName>ReflowLink</AssemblyName>
+    <ApplicationIcon>Resources\app.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <StartupObject>ReflowLink.Program</StartupObject>
+
+    <!-- Single, self-contained .exe: no extra DLLs, debug info embedded, no .exe.config needed. -->
+    <DebugType>embedded</DebugType>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+
+    <!-- Assembly information -->
+    <Product>ReflowLink</Product>
+    <AssemblyTitle>ReflowLink</AssemblyTitle>
+    <Description>Control software for reflow and BGA rework stations with the ALTEC PC410 temperature controller.</Description>
+    <Company>Marius Sumutiu</Company>
+    <Authors>Marius Sumutiu</Authors>
+    <Copyright>Copyright © 2026 Marius Sumutiu. All rights reserved.</Copyright>
+    <Version>1.1.0</Version>
+    <FileVersion>1.1.0.0</FileVersion>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <NeutralLanguage>en</NeutralLanguage>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\app.ico" LogicalName="ReflowLink.app.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="ReflowLink.Tests" />
+  </ItemGroup>
+
+</Project>
