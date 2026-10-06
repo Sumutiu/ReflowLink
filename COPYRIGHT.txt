@@ -1,4 +1,4 @@
-IR6500 Studio
+ReflowLink
 Copyright (c) 2026 Marius Sumutiu. All rights reserved.
 
 No part of this software may be copied, modified or distributed without the

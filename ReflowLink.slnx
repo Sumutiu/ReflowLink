@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ReflowLink/ReflowLink.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ReflowLink.Tests/ReflowLink.Tests.csproj" />
+  </Folder>
+</Solution>
