@@ -146,11 +146,16 @@ namespace ReflowLink.Model {
                     Name = "Lead-free SAC305",
                     Notes = "Example profile. The board sensor usually reads below the joint temperature; verify with an external thermocouple.",
                     Steps = {
-                        new ProfileStep(1.0, 130, 30),
-                        new ProfileStep(0.6, 180, 60),
-                        new ProfileStep(0.8, 220, 20),
-                        new ProfileStep(1.0, 230, 25),
+                        new ProfileStep(1.0, 160, 40),
+                        new ProfileStep(0.6, 170, 40),
+                        new ProfileStep(0.8, 180, 50),
+                        new ProfileStep(0.8, 200, 30),
+                        new ProfileStep(0.6, 230, 100),
+                        new ProfileStep(1.0, 200, 0),
+                        new ProfileStep(2.0, 160, 0),
+                        new ProfileStep(4.0, 100, 0),
                     },
+                    Holdback = 5,
                 }
             },
             new() {
@@ -159,11 +164,15 @@ namespace ReflowLink.Model {
                     Name = "Leaded Sn63Pb37",
                     Notes = "Example profile. Tune ramp rates and hold times for your board and sensor placement.",
                     Steps = {
-                        new ProfileStep(1.0, 140, 30),
-                        new ProfileStep(0.6, 160, 60),
-                        new ProfileStep(0.8, 190, 20),
-                        new ProfileStep(1.0, 210, 25),
+                        new ProfileStep(1.0, 120, 30),
+                        new ProfileStep(0.6, 150, 40),
+                        new ProfileStep(0.6, 170, 30),
+                        new ProfileStep(0.8, 210, 20),
+                        new ProfileStep(0.6, 220, 30),
+                        new ProfileStep(1.0, 150, 0),
+                        new ProfileStep(2.0, 100, 0),
                     },
+                    Holdback = 5,
                 }
             },
             new() {

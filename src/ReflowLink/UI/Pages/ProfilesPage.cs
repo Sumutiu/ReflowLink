@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using ReflowLink.Model;
 using ReflowLink.Protocol;
@@ -473,7 +474,7 @@ namespace ReflowLink.UI.Pages {
 
         // ==================================================================== controller transfer
 
-        private async System.Threading.Tasks.Task ReadFromController() {
+        private async Task ReadFromController() {
             int slot = _slot.SelectedIndex;
             if (slot < 0 || !ConfirmDiscard()) return;
             var (ok, p) = await State.RunAsync($"Reading pattern {slot}", (d, progress, ct) => d.DownloadProfile(slot, progress, ct));
@@ -497,7 +498,7 @@ namespace ReflowLink.UI.Pages {
             return true;
         }
 
-        private async System.Threading.Tasks.Task WriteToController() {
+        private async Task WriteToController() {
             int slot = _slot.SelectedIndex;
             if (slot < 0) return;
             var errors = new List<string>();

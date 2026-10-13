@@ -24,9 +24,9 @@
     <Company>Marius Sumutiu</Company>
     <Authors>Marius Sumutiu</Authors>
     <Copyright>Copyright © 2026 Marius Sumutiu. All rights reserved.</Copyright>
-    <Version>1.1.0</Version>
-    <FileVersion>1.1.0.0</FileVersion>
-    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <Version>1.1.1</Version>
+    <FileVersion>1.1.1.0</FileVersion>
+    <AssemblyVersion>1.1.1.0</AssemblyVersion>
     <NeutralLanguage>en</NeutralLanguage>
   </PropertyGroup>
 
