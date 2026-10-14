@@ -15,6 +15,15 @@ Control software for reflow and BGA rework stations that use the **ALTEC PC410**
 
 You pick the station the first time ReflowLink starts, and can change it under **Settings → Station**. The choice sets the controller's units and the temperature limit. Profiles are always edited in °C per second and seconds; ReflowLink converts them to the controller's units when it reads or writes a pattern.
 
+## Temperature limits
+
+There are two limits, and a profile has to respect both:
+
+- **ReflowLink's limit** (*Settings → Profiles → Maximum temperature*). It defaults to the station manual's maximum (230 °C on the ACHI models). You can raise it up to 400 °C; ReflowLink asks you to confirm, because it doesn't change the controller.
+- **The controller's setpoint limit** (`HS`, plus `LS` as the lower limit), set in the PC410 by the station maker. ReflowLink reads it when connecting and shows it in Settings.
+
+When you write a profile, ReflowLink first checks every target against `HS`/`LS` and refuses the write if one is outside, without changing the pattern. The PC410 answers each written value with ACK (accepted) or NAK (rejected), and ReflowLink also reads the targets back in case a controller limits a value instead of rejecting it. If the controller rejects or changes a target during the write, ReflowLink stops, clears the pattern (ends it at step 1) so it can't run with partial settings, lists the rejected values, and won't start that pattern until a valid profile is written to it. Before every start, the pattern is read back and checked against both limits.
+
 ## What it does
 
 - **Dashboard**: live temperature (PV), setpoint (SP) and heater output, plotted on a chart with the planned profile drawn over it. Start, hold, resume and stop the program on the controller. Every run is recorded to CSV automatically.
@@ -86,6 +95,7 @@ Add an entry to `StationCatalog.All` in `src/ReflowLink/Model/Stations.cs`: an i
 | Works with PSoft but not here | Compare its baud rate and address. Try toggling DTR/RTS (some isolated adapters take power from them). |
 | A profile runs 60× too fast or too slow | The station's units don't match the controller. Choose the right station, or for *Other PC410 / AL808 station* switch the ramp and hold units. |
 | Values read back slightly different after writing | The controller rounds some values. The warning dialog lists each difference. |
+| "Profile rejected by the controller" or a target "above the controller's setpoint limit" | The target is above the controller's `HS`. Lower it, or raise `HS` in the controller's configuration (and ReflowLink's limit in Settings). |
 
 ## Files and folders
 

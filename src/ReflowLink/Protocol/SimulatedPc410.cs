@@ -46,7 +46,7 @@ namespace ReflowLink.Protocol {
         private double _dwellLeft;
         private double _currentRate;
 
-        public SimulatedPc410(int address, double speed = 1.0, ControllerUnits units = null) {
+        public SimulatedPc410(int address, double speed = 1.0, ControllerUnits units = null, double setpointHigh = 230) {
             Address = address;
             Speed = speed;
             Units = units ?? ControllerUnits.SecondsBased;
@@ -64,7 +64,7 @@ namespace ReflowLink.Protocol {
             _misc["XP"] = "8.0";
             _misc["TI"] = "120";
             _misc["TD"] = "30";
-            _misc["HS"] = "230";
+            _misc["HS"] = Pc410Protocol.FormatNumber(setpointHigh, 1);
             _misc["LS"] = "0";
             _misc["HA"] = "250";
             _misc["LA"] = "0";
@@ -82,6 +82,12 @@ namespace ReflowLink.Protocol {
         }
 
         public int Address { get; set; }
+        /// <summary>Test option: limit out-of-range targets to HS/LS instead of rejecting them (NAK).</summary>
+        public bool ClampTargets { get; set; }
+
+        /// <summary>Test option: don't answer reads of HS/LS, like a controller that doesn't expose them.</summary>
+        public bool HideSetpointLimits { get; set; }
+
         /// <summary>Units this emulated controller is configured for.</summary>
         public ControllerUnits Units { get; }
         /// <summary>Simulation speed multiplier (1 = real time).</summary>
@@ -160,6 +166,7 @@ namespace ReflowLink.Protocol {
                     _ => Pc410Protocol.FormatNumber(s.Dwell, Units.DwellDecimals),
                 };
             }
+            if (HideSetpointLimits && mn is "HS" or "LS") return null;
             return _misc.TryGetValue(mn, out var val) ? val : null; // unknown parameter: silence
         }
 
@@ -187,6 +194,14 @@ namespace ReflowLink.Protocol {
                         return true;
                     case 'l':
                         if (!Pc410Protocol.TryParseNumber(data, out double l) || l < 0 || l > MaxTemp) return false;
+                        if (l != 0) {
+                            // Like the real controller, targets outside the setpoint limits are refused (or limited).
+                            double hs = ParseOr(_misc["HS"], MaxTemp), ls = ParseOr(_misc["LS"], 0);
+                            if (l > hs || l < ls) {
+                                if (!ClampTargets) return false;
+                                l = Math.Max(ls, Math.Min(hs, l));
+                            }
+                        }
                         s.Level = l;
                         return true;
                     default:

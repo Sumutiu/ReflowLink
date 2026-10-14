@@ -2,8 +2,10 @@
 // Copyright (c) 2026 Marius Sumutiu. All rights reserved.
 
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Xml;
 using System.Xml.Serialization;
@@ -35,6 +37,8 @@ namespace ReflowLink.Model {
         public bool VerifyAfterWrite { get; set; } = true;
         public double PreviewStartTemperature { get; set; } = 25;
         public string LastProfilePath { get; set; } = "";
+        /// <summary>Controller patterns that were left with rejected or partial settings; they can't be started until rewritten.</summary>
+        public List<int> BlockedPatterns { get; set; } = [];
         public int LastSlot { get; set; } = 0;
 
         // Logging
@@ -146,6 +150,7 @@ namespace ReflowLink.Model {
             if (MaxTemperature is <= 0 or > 500) MaxTemperature = Station.MaxTemperature;
             if (SimulatorSpeed is < 1 or > 50) SimulatorSpeed = 1;
             if (LastSlot is < 0 or > 9) LastSlot = 0;
+            BlockedPatterns = [.. (BlockedPatterns ?? []).Where(p => p is >= 0 and <= 9).Distinct()];
             RecordAfterRunSeconds = Math.Max(0, Math.Min(3600, RecordAfterRunSeconds));
             return this;
         }

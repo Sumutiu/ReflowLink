@@ -6,7 +6,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
-using System.Linq;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using ReflowLink.Model;
 using ReflowLink.Protocol;
@@ -430,27 +430,38 @@ namespace ReflowLink.UI.Pages {
             }
         }
 
-        private async System.Threading.Tasks.Task StartProgram() {
+        private async Task StartProgram() {
             int slot = _slot.SelectedIndex;
             if (slot < 0) return;
-            bool needRead = State.SlotProfiles[slot] == null;
+            if (State.IsSlotBlocked(slot)) {
+                DarkDialog.Error(FindForm(), $"Pattern {slot} can't be started",
+                    $"The controller rejected part of the last profile written to pattern {slot}. Write a valid profile to it on the Profiles page before starting it.");
+                return;
+            }
+            // Read the pattern back and check it against ReflowLink's limit and the controller's setpoint limits
+            // right before starting, so a pattern changed elsewhere (front panel, other software) can't run out of range.
+            double limit = State.Settings.MaxTemperature;
             var (ok, prof) = await State.RunAsync($"Starting pattern {slot}", (d, progress, ct) => {
-                ReflowProfile p = null;
-                if (needRead) p = d.DownloadProfile(slot, progress, ct);
+                var p = d.CheckPattern(slot, limit, progress, ct);
                 d.Start(slot);
                 return p;
             });
             if (!ok) return;
-            if (prof != null) State.SetSlotProfile(slot, prof);
+            var known = State.SlotProfiles[slot];
+            if (known != null && known.Steps.Count == prof.Steps.Count) {
+                prof.Name = known.Name;
+                prof.Notes = known.Notes;
+            }
+            State.SetSlotProfile(slot, prof);
             State.Device.NotePattern(slot);
         }
 
-        private async System.Threading.Tasks.Task HoldOrResume() {
+        private async Task HoldOrResume() {
             if (_state == ProgramState.Hold) await State.RunAsync("Resuming program", d => d.Resume());
             else await State.RunAsync("Holding program", d => d.Hold());
         }
 
-        private async System.Threading.Tasks.Task StopProgram() {
+        private async Task StopProgram() {
             await State.RunAsync("Stopping program", d => d.Stop());
         }
 

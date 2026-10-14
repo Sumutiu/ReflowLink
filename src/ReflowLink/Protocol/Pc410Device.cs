@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Threading;
 using ReflowLink.Model;
 
@@ -39,18 +40,56 @@ namespace ReflowLink.Protocol {
         public List<string> Warnings = [];
     }
 
+    /// <summary>Setpoint limits configured in the controller (LS / HS). Null when the controller doesn't report them.</summary>
+    public readonly struct SetpointLimits(double? low, double? high) {
+        public double? Low { get; } = low;
+        public double? High { get; } = high;
+        public bool Known => Low.HasValue || High.HasValue;
+    }
+
+    /// <summary>
+    /// A profile that the controller cannot run as written: targets outside its setpoint limits,
+    /// values it refused (NAK) or values it changed (clamped) while being written.
+    /// </summary>
+    public sealed class ProfileRejectedException(int slot, IReadOnlyList<string> issues, bool patternChanged, bool patternCleared,
+        bool interrupted = false)
+        : Pc410Exception(BuildMessage(slot, issues, patternChanged, patternCleared, interrupted)) {
+        public int Slot { get; } = slot;
+        public IReadOnlyList<string> Issues { get; } = issues;
+        /// <summary>True when part of the profile had already been written to the pattern.</summary>
+        public bool PatternChanged { get; } = patternChanged;
+        /// <summary>True when the partly written pattern was emptied so it can't run.</summary>
+        public bool PatternCleared { get; } = patternCleared;
+        /// <summary>True when the write stopped because of a communication error rather than a rejected value.</summary>
+        public bool Interrupted { get; } = interrupted;
+
+        private static string BuildMessage(int slot, IReadOnlyList<string> issues, bool changed, bool cleared, bool interrupted) {
+            string list = string.Join("\n", issues.Select(i => "• " + i));
+            if (!changed) return $"Pattern {slot} was not changed:\n\n{list}";
+            string what = interrupted ? "Writing the profile was interrupted" : "The controller rejected part of the profile";
+            return cleared
+                ? $"{what}, so pattern {slot} was cleared to stop it running with partial settings:\n\n{list}"
+                : $"{what} and pattern {slot} could not be cleared. ReflowLink won't start it until a valid profile is written:\n\n{list}";
+        }
+    }
+
     /// <summary>High-level PC410 operations (telemetry, profiles, program control).</summary>
     public sealed class Pc410Device(Pc410Client client) {
-        public const string Pv = "PV", Sp = "SP", Op = "OP", Os = "OS", Sw = "SW", Se = "SE", Pattern = "ch", Holdback = "Hb", Sl = "SL";
+        public const string Pv = "PV", Sp = "SP", Op = "OP", Os = "OS", Sw = "SW", Se = "SE", Pattern = "ch", Holdback = "Hb", Sl = "SL", Hs = "HS", Ls = "LS";
 
         public const int OsStop = 0x0000, OsRun = 0x0002, OsHold = 0x0003;
 
         private bool _seSupported = true, _swSupported = true;
+        // null = not tried yet, false = the controller doesn't report it, true = it answered before.
+        private bool? _hsSupported, _lsSupported;
         private int _seMisses, _swMisses;
         private const int UnsupportedAfter = 3;
         private int _cycle;
 
         public Pc410Client Client { get; } = client;
+
+        /// <summary>Raised (on the calling thread) whenever the setpoint limits have been read from the controller.</summary>
+        public event Action<SetpointLimits> LimitsRead;
 
         /// <summary>Units the controller uses for ramp (r1..r8) and dwell (t1..t8) values.</summary>
         public ControllerUnits Units { get; set; } = ControllerUnits.SecondsBased;
@@ -158,6 +197,68 @@ namespace ReflowLink.Protocol {
             }
         }
 
+        /// <summary>
+        /// Reads the controller's setpoint limits (LS / HS). A parameter that doesn't answer the first time it is
+        /// asked for is treated as not supported. Once it has answered, a later failure is a communication error
+        /// and is thrown, so a glitch can never switch the limit checks off.
+        /// </summary>
+        public SetpointLimits ReadSetpointLimits() {
+            lock (Client.SyncRoot) {
+                double? high = ReadLimit(Hs, ref _hsSupported);
+                double? low = ReadLimit(Ls, ref _lsSupported);
+                var limits = new SetpointLimits(low, high);
+                LimitsRead?.Invoke(limits);
+                return limits;
+            }
+        }
+
+        private double? ReadLimit(string mnemonic, ref bool? supported) {
+            if (supported == false) return null;
+            try {
+                double value = Client.ReadNumber(mnemonic);
+                supported = true;
+                return value;
+            } catch (Pc410Exception) when (supported == null) {
+                supported = false;
+                return null;
+            }
+        }
+
+        /// <summary>Lists the steps whose targets are outside the given limits.</summary>
+        public static List<string> CheckTargets(ReflowProfile profile, SetpointLimits limits, double? softwareLimit = null) {
+            var issues = new List<string>();
+            for (int i = 0; i < profile.Steps.Count; i++) {
+                double t = profile.Steps[i].Target;
+                if (softwareLimit is double max && t > max + 0.05)
+                    issues.Add($"Step {i + 1}: target {t:0.#} °C is above ReflowLink's limit of {max:0.#} °C.");
+                if (limits.High is double hs && t > hs + 0.05)
+                    issues.Add($"Step {i + 1}: target {t:0.#} °C is above the controller's setpoint limit (HS = {hs:0.#} °C).");
+                if (limits.Low is double ls && t < ls - 0.05)
+                    issues.Add($"Step {i + 1}: target {t:0.#} °C is below the controller's setpoint limit (LS = {ls:0.#} °C).");
+            }
+            return issues;
+        }
+
+        /// <summary>
+        /// Reads a pattern and checks it can run: targets within ReflowLink's limit and the controller's setpoint limits.
+        /// Throws <see cref="ProfileRejectedException"/> otherwise. Used before starting a program.
+        /// </summary>
+        public ReflowProfile CheckPattern(int slot, double softwareLimit, IProgress<OperationProgress> progress, CancellationToken ct) {
+            lock (Client.SyncRoot) {
+                var profile = DownloadProfile(slot, progress, ct);
+                if (profile.Steps.Count == 0)
+                    throw new ProfileRejectedException(slot, ["The pattern is empty."], false, false);
+                var issues = CheckTargets(profile, ReadSetpointLimits(), softwareLimit);
+                if (issues.Count > 0) throw new ProfileRejectedException(slot, issues, false, false);
+                return profile;
+            }
+        }
+
+        /// <summary>
+        /// Writes a profile to a pattern. Targets outside the controller's setpoint limits are refused before anything
+        /// is written. If the controller rejects (NAK) or changes (clamps) a value during the write, writing stops,
+        /// the pattern is cleared and a <see cref="ProfileRejectedException"/> is thrown.
+        /// </summary>
         public UploadResult UploadProfile(ReflowProfile profile, int slot, UnusedStepMode unusedMode, bool verify,
             IProgress<OperationProgress> progress, CancellationToken ct) {
             if (profile == null) throw new ArgumentNullException(nameof(profile));
@@ -166,8 +267,13 @@ namespace ReflowLink.Protocol {
 
             var result = new UploadResult();
             lock (Client.SyncRoot) {
-                int total = 2 + Pc410Protocol.SegmentCount * (verify ? 2 : 1);
+                int total = 3 + Pc410Protocol.SegmentCount * 2;
                 int done = 0;
+                progress?.Report(new OperationProgress(done, total, "Checking the controller's setpoint limits…"));
+                var limitIssues = CheckTargets(profile, ReadSetpointLimits());
+                if (limitIssues.Count > 0) throw new ProfileRejectedException(slot, limitIssues, false, false);
+                done++;
+
                 progress?.Report(new OperationProgress(done, total, $"Selecting pattern {slot}…"));
                 SelectPattern(slot);
                 done++;
@@ -195,32 +301,96 @@ namespace ReflowLink.Protocol {
                     }
                 }
 
-                for (int n = 1; n <= Pc410Protocol.SegmentCount; n++) {
-                    ct.ThrowIfCancellationRequested();
-                    progress?.Report(new OperationProgress(done, total, $"Writing step {n}…"));
-                    for (int k = 0; k < 3; k++) {
-                        var item = planned[(n - 1) * 3 + k];
-                        Client.Write(item[0], item[1]);
-                    }
-                    done++;
-                }
-
-                if (verify) {
-                    for (int n = 1; n <= Pc410Protocol.SegmentCount; n++) {
+                var rejected = new List<string>();
+                int step = 1;
+                try {
+                    for (; step <= Pc410Protocol.SegmentCount && rejected.Count == 0; step++) {
                         ct.ThrowIfCancellationRequested();
-                        progress?.Report(new OperationProgress(done, total, $"Verifying step {n}…"));
+                        progress?.Report(new OperationProgress(done, total, $"Writing step {step}…"));
                         for (int k = 0; k < 3; k++) {
-                            var item = planned[(n - 1) * 3 + k];
-                            string back = Client.Read(item[0]);
-                            if (!ValuesMatch(item[1], back))
-                                result.Warnings.Add($"Step {n} {item[0]}: wrote {item[1]}, controller reports {back.Trim()}.");
+                            var item = planned[(step - 1) * 3 + k];
+                            try {
+                                Client.Write(item[0], item[1]);
+                            } catch (Pc410NakException) {
+                                rejected.Add(step <= profile.Steps.Count
+                                    ? $"Step {step}: the controller rejected {ValueName(k)} {item[1]}{UnitSuffix(k)} ({item[0]})."
+                                    : $"Step {step} is unused, and the controller refused {item[1]} for {item[0]}." +
+                                      (Pc410Protocol.IsEnd(item[1]) ? " Set Unused steps to “Write zeros” in Settings." : ""));
+                                break;
+                            }
                         }
                         done++;
                     }
+                } catch (Pc410Exception ex) {
+                    throw Interrupted(slot, $"Communication failed while writing step {step}: {ex.Message}");
                 }
+                if (rejected.Count > 0) throw new ProfileRejectedException(slot, rejected, true, TryClearPattern());
+
+                // Read back. Targets of the profile's steps are always checked, because a controller may silently
+                // limit a setpoint instead of rejecting it. Everything else is checked when verification is on.
+                for (int n = 1; n <= Pc410Protocol.SegmentCount; n++) {
+                    ct.ThrowIfCancellationRequested();
+                    progress?.Report(new OperationProgress(done, total, $"Verifying step {n}…"));
+                    for (int k = 0; k < 3; k++) {
+                        bool isTarget = k == 1 && n <= profile.Steps.Count;
+                        if (!verify && !isTarget) continue;
+                        var item = planned[(n - 1) * 3 + k];
+                        string back;
+                        try {
+                            back = Client.Read(item[0]).Trim();
+                        } catch (Pc410Exception ex) {
+                            throw Interrupted(slot, $"Communication failed while checking step {n}: {ex.Message}");
+                        }
+                        if (ValuesMatch(item[1], back)) continue;
+                        if (isTarget)
+                            rejected.Add($"Step {n}: target {item[1]} °C was changed to {back} °C by the controller (its setpoint limit is probably lower).");
+                        else
+                            result.Warnings.Add($"Step {n} {item[0]}: wrote {item[1]}, controller reports {back}.");
+                    }
+                    done++;
+                }
+                if (rejected.Count > 0) throw new ProfileRejectedException(slot, rejected, true, TryClearPattern());
                 progress?.Report(new OperationProgress(total, total, "Done"));
             }
             return result;
+        }
+
+        /// <summary>Clears a partly written pattern after a communication error and builds the exception to throw.</summary>
+        private ProfileRejectedException Interrupted(int slot, string issue) {
+            bool cleared = TryClearPattern();
+            return new ProfileRejectedException(slot, [issue], true, cleared, interrupted: true);
+        }
+
+        private static string ValueName(int k) => k switch {
+            0 => "ramp rate",
+            1 => "target",
+            _ => "hold time",
+        };
+
+        private string UnitSuffix(int k) => k switch {
+            0 => Units.Ramp == RampUnit.PerMinute ? " °C/min" : " °C/s",
+            1 => " °C",
+            _ => Units.Dwell == DwellUnit.Minutes ? " min" : " s",
+        };
+
+        /// <summary>
+        /// Empties the selected pattern after a rejected write so it can't run with partial settings:
+        /// ends the program at step 1 (END), or writes zeros to step 1 if END isn't accepted.
+        /// </summary>
+        private bool TryClearPattern() {
+            var m = SegmentMnemonics(1);
+            try {
+                Client.Write(m[0], Pc410Protocol.EndValue);
+                return true;
+            } catch (Pc410Exception) { }
+            try {
+                Client.Write(m[0], "0");
+                Client.Write(m[1], "0");
+                Client.Write(m[2], "0");
+                return true;
+            } catch (Pc410Exception) {
+                return false;
+            }
         }
 
         public static bool ValuesMatch(string written, string readBack) {

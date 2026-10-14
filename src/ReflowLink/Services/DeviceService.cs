@@ -42,6 +42,8 @@ namespace ReflowLink.Services {
         public int Address { get; private set; }
         public Telemetry Last { get; private set; }
         public int? ActivePattern { get; private set; }
+        /// <summary>Setpoint limits (LS / HS) read from the controller when connecting; unknown if not reported.</summary>
+        public SetpointLimits ControllerLimits { get; private set; }
         public string LastError { get; private set; } = "";
         public int PollIntervalMs { get; set; } = 500;
         /// <summary>Process-time multiplier: the simulator can run faster than real time.</summary>
@@ -60,7 +62,7 @@ namespace ReflowLink.Services {
             try {
                 ITransport transport;
                 if (s.UseSimulator) {
-                    transport = new SimulatedPc410(s.Address, s.SimulatorSpeed, s.Units);
+                    transport = new SimulatedPc410(s.Address, s.SimulatorSpeed, s.Units, s.Station.MaxTemperature);
                 } else {
                     if (string.IsNullOrWhiteSpace(s.PortName)) throw new InvalidOperationException("Select a serial port first.");
                     transport = new SerialTransport(new SerialSettings {
@@ -84,11 +86,13 @@ namespace ReflowLink.Services {
                 var device = new Pc410Device(client) { Units = s.Units };
 
                 int? pattern = null;
+                SetpointLimits limits = default;
                 try {
                     await Task.Run(() => {
                         transport.Open();
                         device.Probe();
                         try { pattern = device.ReadPattern(); } catch (Pc410Exception) { }
+                        limits = device.ReadSetpointLimits();
                     }).ConfigureAwait(true);
                 } catch (Exception) {
                     client.Traffic -= OnTraffic;
@@ -103,6 +107,13 @@ namespace ReflowLink.Services {
                 TimeScale = s.UseSimulator ? Math.Max(1, s.SimulatorSpeed) : 1;
                 Address = s.Address;
                 ActivePattern = pattern;
+                ControllerLimits = limits;
+                // Keep the limits current: every profile write and start check reads them again.
+                device.LimitsRead += l => Post(() => {
+                    if (_device != device) return;
+                    ControllerLimits = l;
+                    StateChanged?.Invoke(this, EventArgs.Empty);
+                });
                 PollIntervalMs = s.PollIntervalMs;
                 _lastState = ProgramState.Unknown;
                 LastError = "";
@@ -135,6 +146,7 @@ namespace ReflowLink.Services {
             }
             Last = null;
             ActivePattern = null;
+            ControllerLimits = default;
             _lastState = ProgramState.Unknown;
             SetState(LinkStatus.Disconnected);
         }

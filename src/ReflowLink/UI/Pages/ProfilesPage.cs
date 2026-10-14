@@ -250,7 +250,7 @@ namespace ReflowLink.UI.Pages {
             State.SlotProfilesChanged += () => _slot.SetItems(State.SlotLabels(), _slot.SelectedIndex);
             State.BusyChanged += UpdateButtons;
             State.StationChanged += UpdatePreview;
-            State.Device.StateChanged += (s, e) => UpdateButtons();
+            State.Device.StateChanged += (s, e) => UpdatePreview(); // also refreshes the buttons
 
             // Initial profile: last opened file, else the leaded preset.
             ReflowProfile initial = null;
@@ -307,9 +307,12 @@ namespace ReflowLink.UI.Pages {
                 if (!_holdback.IsValid) errors?.Add("Holdback must be 0–100 °C.");
                 p.Holdback = _holdback.Value;
             }
-            if (errors != null)
+            if (errors != null) {
                 foreach (var e in p.Validate(State.Settings.MaxTemperature))
                     if (!errors.Contains(e) && !e.Contains("ramp rate must be greater")) errors.Add(e);
+                // When connected, also check against the controller's own setpoint limits (HS / LS).
+                if (State.Device.IsConnected) errors.AddRange(Pc410Device.CheckTargets(p, State.Device.ControllerLimits));
+            }
             return p;
         }
 
@@ -517,6 +520,7 @@ namespace ReflowLink.UI.Pages {
             bool verify = State.Settings.VerifyAfterWrite;
             var (ok, res) = await State.RunAsync($"Writing pattern {slot}", (d, progress, ct) => d.UploadProfile(p, slot, mode, verify, progress, ct));
             if (!ok) return;
+            State.UnblockSlot(slot);
             State.SetSlotProfile(slot, p);
             State.Device.NotePattern(slot);
             if (res.Warnings.Count > 0)

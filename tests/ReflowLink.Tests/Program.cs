@@ -271,6 +271,95 @@ namespace ReflowLink.Tests {
                 Eq(230.0, s.MaxTemperature);
             });
 
+            Run("Targets above the controller limit are refused before writing", () => {
+                using var c = NewSim(out _);
+                var dev = new Pc410Device(c);
+                var ok = new ReflowProfile();
+                ok.Steps.Add(new ProfileStep(1, 150, 10));
+                dev.UploadProfile(ok, 3, UnusedStepMode.Zeros, false, null, CancellationToken.None);
+                var limits = dev.ReadSetpointLimits();
+                Eq(230.0, limits.High);
+                var hot = new ReflowProfile();
+                hot.Steps.Add(new ProfileStep(1, 200, 10));
+                hot.Steps.Add(new ProfileStep(1, 240, 10));
+                var ex = Catch<ProfileRejectedException>(() => dev.UploadProfile(hot, 3, UnusedStepMode.Zeros, true, null, CancellationToken.None));
+                False(ex.PatternChanged, "nothing written");
+                True(ex.Issues[0].Contains("HS = 230"), ex.Issues[0]);
+                Eq("150.0", c.Read("l1"));
+            });
+
+            Run("A target the controller rejects stops the write and clears the pattern", () => {
+                using var c = NewSim(out var sim);
+                sim.HideSetpointLimits = true;
+                var dev = new Pc410Device(c);
+                var hot = new ReflowProfile();
+                hot.Steps.Add(new ProfileStep(1, 200, 10));
+                hot.Steps.Add(new ProfileStep(1, 240, 10));
+                hot.Steps.Add(new ProfileStep(1, 180, 10));
+                var ex = Catch<ProfileRejectedException>(() => dev.UploadProfile(hot, 5, UnusedStepMode.Zeros, false, null, CancellationToken.None));
+                True(ex.PatternChanged && ex.PatternCleared, "pattern cleared");
+                True(ex.Issues.Count == 1 && ex.Issues[0].StartsWith("Step 2"), ex.Issues[0]);
+                Eq("END", c.Read("r1"));
+                Eq(0, dev.DownloadProfile(5, null, CancellationToken.None).Steps.Count);
+            });
+
+            Run("A target the controller silently limits is caught even without verify", () => {
+                using var c = NewSim(out var sim);
+                sim.HideSetpointLimits = true;
+                sim.ClampTargets = true;
+                var dev = new Pc410Device(c);
+                var hot = new ReflowProfile();
+                hot.Steps.Add(new ProfileStep(1, 245, 10));
+                var ex = Catch<ProfileRejectedException>(() => dev.UploadProfile(hot, 6, UnusedStepMode.Zeros, false, null, CancellationToken.None));
+                True(ex.PatternCleared, "pattern cleared");
+                True(ex.Issues[0].Contains("changed to 230"), ex.Issues[0]);
+            });
+
+            Run("A communication failure mid-write blocks the pattern", () => {
+                var sim = new SimulatedPc410(1);
+                var flaky = new FlakyTransport(sim);
+                flaky.Open();
+                using var c = new Pc410Client(flaky, 1) { ResponseTimeoutMs = 60, Retries = 0 };
+                var dev = new Pc410Device(c);
+                var p = new ReflowProfile();
+                p.Steps.Add(new ProfileStep(1, 150, 10));
+                p.Steps.Add(new ProfileStep(1, 200, 10));
+                flaky.SilentAfterWrites = 12; // limits, pattern, holdback and part of the steps get through
+                var ex = Catch<ProfileRejectedException>(() => dev.UploadProfile(p, 4, UnusedStepMode.Zeros, false, null, CancellationToken.None));
+                True(ex.Interrupted && ex.PatternChanged, "interrupted while writing");
+                False(ex.PatternCleared, "controller silent, so the pattern couldn't be cleared");
+                True(ex.Issues[0].StartsWith("Communication failed"), ex.Issues[0]);
+            });
+
+            Run("A glitch on HS never switches the limit check off", () => {
+                var sim = new SimulatedPc410(1);
+                var flaky = new FlakyTransport(sim);
+                flaky.Open();
+                using var c = new Pc410Client(flaky, 1) { ResponseTimeoutMs = 60, Retries = 0 };
+                var dev = new Pc410Device(c);
+                Eq(230.0, dev.ReadSetpointLimits().High);
+                flaky.SilentAfterWrites = 0;
+                Throws<Pc410TimeoutException>(() => dev.ReadSetpointLimits());
+                flaky.SilentAfterWrites = int.MaxValue;
+                Eq(230.0, dev.ReadSetpointLimits().High);
+            });
+
+            Run("Start check refuses a pattern outside the limits", () => {
+                var sim = new SimulatedPc410(1, 1, null, 260);
+                sim.Open();
+                using var c = new Pc410Client(sim, 1) { ResponseTimeoutMs = 150, Retries = 1 };
+                var dev = new Pc410Device(c);
+                var p = new ReflowProfile();
+                p.Steps.Add(new ProfileStep(1, 245, 10));
+                dev.UploadProfile(p, 2, UnusedStepMode.Zeros, true, null, CancellationToken.None);
+                Eq(1, dev.CheckPattern(2, 250, null, CancellationToken.None).Steps.Count);
+                var ex = Catch<ProfileRejectedException>(() => dev.CheckPattern(2, 230, null, CancellationToken.None));
+                True(ex.Issues[0].Contains("ReflowLink's limit"), ex.Issues[0]);
+                c.Write("HS", "240");
+                ex = Catch<ProfileRejectedException>(() => dev.CheckPattern(2, 250, null, CancellationToken.None));
+                True(ex.Issues[0].Contains("HS = 240"), ex.Issues[0]);
+            });
+
             Run("Planned curve timing", () => {
                 var p = new ReflowProfile();
                 p.Steps.Add(new ProfileStep(1, 125, 30));  // 100 s ramp + 30 s
@@ -332,6 +421,23 @@ namespace ReflowLink.Tests {
             public void Dispose() { }
         }
 
+        /// <summary>Passes traffic through until a number of writes, then stays silent (unplugged cable).</summary>
+        private sealed class FlakyTransport(ITransport inner) : ITransport {
+            private int _writes;
+            public int SilentAfterWrites { get; set; } = int.MaxValue;
+            public string Name => "flaky";
+            public bool IsOpen => inner.IsOpen;
+            public void Open() => inner.Open();
+            public void Close() => inner.Close();
+            public void DiscardInput() => inner.DiscardInput();
+            public void Write(byte[] data) {
+                if (_writes++ >= SilentAfterWrites) return;
+                inner.Write(data);
+            }
+            public int ReadByte(int timeoutMs) => inner.ReadByte(timeoutMs);
+            public void Dispose() => inner.Dispose();
+        }
+
         private sealed class EchoTransport(ITransport inner) : ITransport {
             private readonly ITransport _inner = inner;
             private readonly Queue<byte> _echo = new();
@@ -371,6 +477,11 @@ namespace ReflowLink.Tests {
 
         private static void True(bool cond, string what) {
             if (!cond) throw new Exception("assertion failed: " + what);
+        }
+
+        private static TEx Catch<TEx>(Action a) where TEx : Exception {
+            try { a(); } catch (TEx ex) { return ex; } catch (Exception ex) { throw new Exception($"expected {typeof(TEx).Name}, got {ex.GetType().Name}: {ex.Message}"); }
+            throw new Exception($"expected {typeof(TEx).Name}, nothing thrown");
         }
 
         private static void Throws<TEx>(Action a) where TEx : Exception {

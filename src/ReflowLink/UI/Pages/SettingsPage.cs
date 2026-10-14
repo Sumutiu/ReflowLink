@@ -14,7 +14,8 @@ namespace ReflowLink.UI.Pages {
     [System.ComponentModel.DesignerCategory("Code")]
     public sealed class SettingsPage : PageBase {
         private readonly ModernDropDown _port, _baud, _simSpeed, _unused, _station, _rampUnit, _dwellUnit;
-        private readonly ThemedLabel _stationControls, _stationNotes;
+        private readonly ThemedLabel _stationControls, _stationNotes, _controllerLimit, _limitWarning;
+        private bool _committingLimit;
         private readonly NumberBox _address, _timeout, _retries, _poll, _maxTemp, _afterRun;
         private readonly ToggleSwitch _dtr, _rts, _sim, _verify, _autoRecord;
         private readonly ModernTextBox _folder;
@@ -116,7 +117,15 @@ namespace ReflowLink.UI.Pages {
             FitCard(conn, cf);
 
             // ---------------------------------------------------------------- profiles
-            _maxTemp = Num(50, 400, 0, 5, s.MaxTemperature, "°C", v => s.MaxTemperature = v);
+            _maxTemp = new NumberBox(50, 400, 0, 5) {
+                Suffix = "°C",
+                Width = Theme.S(130),
+                Margin = Padding.Empty,
+                Value = s.MaxTemperature,
+            };
+            _maxTemp.Committed += (o, e) => CommitMaxTemperature();
+            _controllerLimit = WrapLabel(Theme.Body, Theme.TextDim, 1);
+            _limitWarning = WrapLabel(Theme.Small, Theme.Yellow, 2);
             _unused = new ModernDropDown { Width = Theme.S(260) };
             _unused.SetItems(["Write zeros (recommended)", "Write END marker"], s.UnusedSteps == UnusedStepMode.EndMarker ? 1 : 0);
             _unused.SelectedIndexChanged += (o, e) => { s.UnusedSteps = _unused.SelectedIndex == 1 ? UnusedStepMode.EndMarker : UnusedStepMode.Zeros; Changed(); };
@@ -124,7 +133,9 @@ namespace ReflowLink.UI.Pages {
 
             var prof = Card("Profiles", "Limits and how profiles are written");
             var pf = Form(prof);
-            Row(pf, "Maximum temperature", _maxTemp, "Set from the station; higher targets are rejected.");
+            Row(pf, "Maximum temperature", _maxTemp, "Defaults to the station manual's limit. Raising it here doesn't change the controller.");
+            Row(pf, "Controller limit", _controllerLimit, null);
+            Row(pf, "", _limitWarning, null);
             Row(pf, "Unused steps", _unused, "How segments after the last step are cleared.");
             Row(pf, "Verify after write", _verify, null);
             FitCard(prof, pf);
@@ -205,7 +216,7 @@ namespace ReflowLink.UI.Pages {
             scroller.Controls.Add(grid);
             Controls.Add(scroller);
 
-            State.Device.StateChanged += (o, e) => UpdateHint();
+            State.Device.StateChanged += (o, e) => { UpdateHint(); UpdateLimitInfo(); };
             State.StationChanged += ShowStation;
             RefreshPorts();
             ShowStation();
@@ -235,6 +246,7 @@ namespace ReflowLink.UI.Pages {
             _rampUnit.Enabled = _dwellUnit.Enabled = station.CustomUnits;
             _maxTemp.Value = s.MaxTemperature;
             _loading = wasLoading;
+            UpdateLimitInfo();
             UpdateHint();
         }
 
@@ -330,6 +342,64 @@ namespace ReflowLink.UI.Pages {
             State.Settings.LogFolder = d.SelectedPath;
             _folder.Text = d.SelectedPath;
             Changed();
+        }
+
+        /// <summary>
+        /// Applies a new maximum temperature. Raising it above the station manual's limit asks for confirmation,
+        /// because the controller's own setpoint limit (HS) still applies.
+        /// </summary>
+        private void CommitMaxTemperature() {
+            if (_loading || _committingLimit) return;
+            var s = State.Settings;
+            if (_maxTemp.Value is not double value || !_maxTemp.IsValid) {
+                ShowMaxTemperature();
+                return;
+            }
+            if (Math.Abs(value - s.MaxTemperature) < 0.01) return;
+
+            double manual = s.Station.MaxTemperature;
+            if (value > manual && value > s.MaxTemperature) {
+                string hs = State.Device.ControllerLimits.High is double h
+                    ? $"\n\nThis controller currently reports HS = {h:0.#} °C."
+                    : "";
+                string message =
+                    $"The {s.Station.Name} manual gives {manual:0.#} °C as the maximum.\n\n" +
+                    "Raising the limit in ReflowLink doesn't change the controller. Unless you also raise the controller's own " +
+                    "setpoint limit (HS), it will reject targets above it, and ReflowLink will refuse to write or start those profiles." + hs;
+                _committingLimit = true; // the dialog takes focus, which would commit again
+                bool raise = DarkDialog.Confirm(FindForm(), $"Raise the limit to {value:0.#} °C?", message, "Raise limit", "Cancel", danger: true);
+                _committingLimit = false;
+                if (!raise) {
+                    ShowMaxTemperature();
+                    return;
+                }
+            }
+            s.MaxTemperature = value;
+            State.ApplyStation(); // saves and refreshes the pages that validate against the limit
+            UpdateLimitInfo();
+        }
+
+        private void ShowMaxTemperature() {
+            bool wasLoading = _loading;
+            _loading = true;
+            _maxTemp.Value = State.Settings.MaxTemperature;
+            _loading = wasLoading;
+        }
+
+        /// <summary>Shows the controller's setpoint limits and warns when ReflowLink's limit is above HS.</summary>
+        private void UpdateLimitInfo() {
+            var device = State.Device;
+            var limits = device.ControllerLimits;
+            if (!device.IsConnected) {
+                _controllerLimit.Text = "Read from the controller when you connect.";
+            } else if (limits.High is double high) {
+                _controllerLimit.Text = $"HS {high:0.#} °C" + (limits.Low is double low ? $"  ·  LS {low:0.#} °C" : "") + "  (read from the controller)";
+            } else {
+                _controllerLimit.Text = "Not reported by this controller.";
+            }
+            _limitWarning.Text = device.IsConnected && limits.High is double hs && State.Settings.MaxTemperature > hs + 0.05
+                ? $"ReflowLink's limit is above the controller's HS: targets above {hs:0.#} °C will be refused."
+                : "";
         }
 
         private void Changed() {

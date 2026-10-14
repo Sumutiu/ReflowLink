@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -25,6 +26,9 @@ namespace ReflowLink.UI {
         /// <summary>Profiles known to be stored in controller patterns 0..9 (read or written this session).</summary>
         public readonly ReflowProfile[] SlotProfiles = new ReflowProfile[10];
 
+        /// <summary>Patterns the controller rejected while being written; they can't be started until rewritten.</summary>
+        private readonly HashSet<int> _blockedSlots = [.. settings.BlockedPatterns];
+
         public event Action SlotProfilesChanged;
         public event Action<string, StatusKind> StatusChanged;
         /// <summary>null = hide, negative = indeterminate, 0..1 = progress.</summary>
@@ -42,7 +46,31 @@ namespace ReflowLink.UI {
             SlotProfilesChanged?.Invoke();
         }
 
+        public bool IsSlotBlocked(int slot) => _blockedSlots.Contains(slot);
+
+        /// <summary>Marks a pattern as unusable after the controller rejected part of a profile.</summary>
+        public void BlockSlot(int slot) {
+            if (slot is < 0 or > 9) return;
+            _blockedSlots.Add(slot);
+            SlotProfiles[slot] = null;
+            SaveBlockedSlots();
+            SlotProfilesChanged?.Invoke();
+        }
+
+        public void UnblockSlot(int slot) {
+            if (!_blockedSlots.Remove(slot)) return;
+            SaveBlockedSlots();
+            SlotProfilesChanged?.Invoke();
+        }
+
+        /// <summary>Blocks survive a restart: a partly written pattern stays unusable until a valid profile is written.</summary>
+        private void SaveBlockedSlots() {
+            Settings.BlockedPatterns = [.. _blockedSlots.OrderBy(s => s)];
+            Settings.Save();
+        }
+
         public string SlotLabel(int slot) {
+            if (_blockedSlots.Contains(slot)) return $"Pattern {slot}  ·  rejected, write a valid profile";
             var p = SlotProfiles[slot];
             if (p == null) return $"Pattern {slot}";
             string name = string.IsNullOrWhiteSpace(p.Name) ? $"{p.Steps.Count} step(s)" : p.Name;
@@ -97,6 +125,12 @@ namespace ReflowLink.UI {
                 var r = await Device.RunAsync(d => op(d, progress, CancellationToken.None));
                 SetStatus(label + " — done", StatusKind.Success);
                 return (true, r);
+            } catch (ProfileRejectedException ex) {
+                if (ex.PatternChanged) BlockSlot(ex.Slot);
+                string title = ex.PatternChanged ? "Profile rejected by the controller" : label + " refused";
+                SetStatus(title, StatusKind.Error);
+                DarkDialog.Error(Owner, title, ex.Message);
+                return (false, default(T));
             } catch (Exception ex) {
                 string msg = ex is Pc410Exception or InvalidOperationException ? DeviceService.Describe(ex) : ex.Message;
                 SetStatus(label + " failed: " + msg, StatusKind.Error);
