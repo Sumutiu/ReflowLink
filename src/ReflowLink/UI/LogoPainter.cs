@@ -1,6 +1,7 @@
 // ReflowLink
 // Copyright (c) 2026 Marius Sumutiu. All rights reserved.
 
+using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 
@@ -51,10 +52,14 @@ namespace ReflowLink.UI {
 
         public static GraphicsPath RoundedRect(RectangleF r, float radius) {
             var p = new GraphicsPath();
-            float d = radius * 2;
-            if (d <= 0.5f) { p.AddRectangle(r); return p; }
-            if (d > r.Width) d = r.Width;
-            if (d > r.Height) d = r.Height;
+            // While Windows lays out, minimises or restores the window, a control can be 0 or 1 px
+            // wide or tall. GDI+ throws on arcs with a zero or negative size, so draw nothing then.
+            if (!(r.Width > 0 && r.Height > 0)) return p;
+            float d = Math.Min(radius * 2, Math.Min(r.Width, r.Height));
+            if (!(d >= 1f)) {
+                p.AddRectangle(r);
+                return p;
+            }
             p.AddArc(r.X, r.Y, d, d, 180, 90);
             p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
             p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
