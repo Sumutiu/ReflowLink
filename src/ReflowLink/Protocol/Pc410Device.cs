@@ -73,6 +73,9 @@ namespace ReflowLink.Protocol {
         }
     }
 
+    /// <summary>The controller refused a holdback value, or stored a different one.</summary>
+    public sealed class HoldbackRejectedException(string message) : Pc410Exception(message) { }
+
     /// <summary>High-level PC410 operations (telemetry, profiles, program control).</summary>
     public sealed class Pc410Device(Pc410Client client) {
         public const string Pv = "PV", Sp = "SP", Op = "OP", Os = "OS", Sw = "SW", Se = "SE", Pattern = "ch", Holdback = "Hb", Sl = "SL", Hs = "HS", Ls = "LS";
@@ -146,6 +149,29 @@ namespace ReflowLink.Protocol {
 
         public int ReadPattern() {
             return (int)Math.Round(Client.ReadNumber(Pattern));
+        }
+
+        /// <summary>Reads the holdback band (°C). The PC410 has one holdback shared by all patterns.</summary>
+        public double ReadHoldback() => Client.ReadNumber(Holdback);
+
+        /// <summary>
+        /// Writes the holdback band (°C) and reads it back. Throws if the controller refuses the value or stores a
+        /// different one. Returns the value the controller holds. Applies to every pattern.
+        /// </summary>
+        public double WriteHoldback(double value) {
+            if (value is < ReflowProfile.HoldbackMin or > ReflowProfile.HoldbackMax)
+                throw new ArgumentOutOfRangeException(nameof(value), ReflowProfile.HoldbackRangeMessage);
+            lock (Client.SyncRoot) {
+                try {
+                    Client.WriteNumber(Holdback, value, 1);
+                } catch (Pc410NakException) {
+                    throw new HoldbackRejectedException($"The controller refused holdback {value:0.#} °C.");
+                }
+                double actual = ReadHoldback();
+                if (Math.Abs(actual - value) > 0.05)
+                    throw new HoldbackRejectedException($"The controller stored holdback {actual:0.#} °C instead of {value:0.#} °C.");
+                return actual;
+            }
         }
 
         public void SelectPattern(int slot) {
@@ -278,9 +304,14 @@ namespace ReflowLink.Protocol {
                 SelectPattern(slot);
                 done++;
 
+                // Holdback goes first: if the controller refuses it, the pattern hasn't been touched yet.
                 progress?.Report(new OperationProgress(done, total, "Writing holdback…"));
-                if (profile.Holdback.HasValue) {
-                    try { Client.WriteNumber(Holdback, profile.Holdback.Value, 1); } catch (Pc410Exception ex) { result.Warnings.Add("Holdback: " + ex.Message); }
+                if (profile.Holdback is double holdback) {
+                    try {
+                        WriteHoldback(holdback);
+                    } catch (HoldbackRejectedException ex) {
+                        throw new ProfileRejectedException(slot, [ex.Message], false, false);
+                    }
                 }
                 done++;
 

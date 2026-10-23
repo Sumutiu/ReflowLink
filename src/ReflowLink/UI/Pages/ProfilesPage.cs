@@ -49,8 +49,7 @@ namespace ReflowLink.UI.Pages {
         private readonly List<StepRow> _rows = [];
         private readonly ModernTextBox _name;
         private readonly ModernDropDown _slot;
-        private readonly ModernButton _read, _write, _new, _open, _save, _saveAs;
-        private readonly ToggleSwitch _useHoldback;
+        private readonly ModernButton _read, _write, _new, _open, _save, _saveAs, _readHoldback, _writeHoldback;
         private readonly NumberBox _holdback, _startTemp;
         private readonly ThemedLabel _validation;
         private readonly CardHeader _editorHeader;
@@ -158,13 +157,23 @@ namespace ReflowLink.UI.Pages {
             extras.AutoSizeMode = AutoSizeMode.GrowAndShrink;
             extras.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             var hbRow = Flow();
-            _useHoldback = new ToggleSwitch("Set holdback band") { Margin = new Padding(0, Theme.S(3), Theme.S(12), 0) };
-            _useHoldback.CheckedChanged += (s, e) => { _holdback.Enabled = _useHoldback.Checked; MarkDirty(); };
-            _holdback = new NumberBox(0, 100, 1, 0.5) { Suffix = "°C", Width = Theme.S(100), Enabled = false, Margin = Padding.Empty };
+            var hbLabel = new ThemedLabel("Set Global Holdback", Theme.Body, Theme.Text) { Margin = new Padding(0, Theme.S(8), Theme.S(12), 0) };
+            _holdback = new NumberBox(ReflowProfile.HoldbackMin, ReflowProfile.HoldbackMax, 1, 0.5) {
+                Suffix = "°C",
+                Width = Theme.S(100),
+                Margin = new Padding(0, 0, Theme.S(8), 0),
+                Value = ReflowProfile.HoldbackDefault
+            };
             _holdback.TextChanged += (s, e) => MarkDirty();
-            hbRow.Controls.Add(_useHoldback);
-            hbRow.Controls.Add(_holdback);
-            var hbHint = new ThemedLabel("Holdback pauses the program while the temperature lags the setpoint by more than this band. Leave off to keep the controller's value.",
+            _readHoldback = new ModernButton("Read", Glyph.Download) { Margin = new Padding(0, 0, Theme.S(6), 0) };
+            _readHoldback.Click += async (s, e) => await ReadHoldback();
+            _writeHoldback = new ModernButton("Write", Glyph.Upload) { Margin = Padding.Empty };
+            _writeHoldback.Click += async (s, e) => await WriteHoldback();
+            tip.SetToolTip(_readHoldback, "Read the controller's holdback into the editor");
+            tip.SetToolTip(_writeHoldback, "Write only the holdback to the controller (applies to all patterns)");
+            hbRow.Controls.AddRange([hbLabel, _holdback, _readHoldback, _writeHoldback]);
+            var hbHint = new ThemedLabel(
+                $"Holdback pauses the program while the temperature lags the setpoint by more than this band. The controller has one holdback for all patterns, and it's written with every profile. It can't be switched off; {ReflowProfile.HoldbackMax:0} °C means it practically never triggers.",
                 Theme.Small, Theme.TextFaint) { AutoSize = true, MaximumSize = new Size(Theme.S(460), 0), Margin = new Padding(0, Theme.S(6), 0, 0) };
             _validation = new ThemedLabel("", Theme.Small, Theme.Red) { AutoSize = true, MaximumSize = new Size(Theme.S(460), 0), Margin = new Padding(0, Theme.S(10), 0, 0) };
             extras.Controls.Add(new Divider { Dock = DockStyle.None, Width = Theme.S(466), Margin = new Padding(0, Theme.S(6), 0, Theme.S(6)) }, 0, 0);
@@ -276,9 +285,7 @@ namespace ReflowLink.UI.Pages {
                 r.Target.Value = src.Target;
                 r.Hold.Value = src.HoldSeconds;
             }
-            _useHoldback.Checked = p.Holdback.HasValue;
-            _holdback.Value = p.Holdback ?? 5;
-            _holdback.Enabled = p.Holdback.HasValue;
+            _holdback.Value = p.Holdback ?? ReflowProfile.HoldbackDefault;
             _filePath = path ?? "";
             _loading = false;
             ApplyRowStates();
@@ -303,10 +310,9 @@ namespace ReflowLink.UI.Pages {
                 if (!r.Hold.IsValid) errors?.Add($"Step {i + 1}: hold time must be 0–9999 s.");
                 p.Steps.Add(new ProfileStep(r.Ramp.Value ?? 1, r.Target.Value ?? 0, (int)Math.Round(r.Hold.Value ?? 0)));
             }
-            if (_useHoldback.Checked) {
-                if (!_holdback.IsValid) errors?.Add("Holdback must be 0–100 °C.");
-                p.Holdback = _holdback.Value;
-            }
+            // Always set: every profile write also writes the (global) holdback.
+            if (!_holdback.IsValid) errors?.Add(ReflowProfile.HoldbackRangeMessage);
+            p.Holdback = _holdback.Value ?? ReflowProfile.HoldbackDefault;
             if (errors != null) {
                 foreach (var e in p.Validate(State.Settings.MaxTemperature))
                     if (!errors.Contains(e) && !e.Contains("ramp rate must be greater")) errors.Add(e);
@@ -394,6 +400,8 @@ namespace ReflowLink.UI.Pages {
             bool conn = State.Device.IsConnected, busy = State.Busy;
             _read.Enabled = conn && !busy;
             _write.Enabled = conn && !busy;
+            _readHoldback.Enabled = conn && !busy;
+            _writeHoldback.Enabled = conn && !busy;
             _slot.Enabled = !busy;
         }
 
@@ -529,6 +537,22 @@ namespace ReflowLink.UI.Pages {
                     DialogTone.Warning, ["OK"]);
             else
                 State.SetStatus($"Pattern {slot} written" + (verify ? " and verified" : ""), StatusKind.Success);
+        }
+
+        private async Task ReadHoldback() {
+            var (ok, value) = await State.RunAsync("Reading holdback", (d, progress, ct) => d.ReadHoldback());
+            if (!ok) return;
+            _holdback.Value = value;
+            State.SetStatus($"Controller holdback is {value:0.#} °C", StatusKind.Success);
+        }
+
+        private async Task WriteHoldback() {
+            if (!_holdback.IsValid || _holdback.Value is not double value) {
+                DarkDialog.Error(FindForm(), "Check the holdback", ReflowProfile.HoldbackRangeMessage);
+                return;
+            }
+            var (ok, stored) = await State.RunAsync("Writing holdback", (d, progress, ct) => d.WriteHoldback(value));
+            if (ok) State.SetStatus($"Holdback set to {stored:0.#} °C for all patterns", StatusKind.Success);
         }
 
         public override bool HandleShortcut(Keys keys) {

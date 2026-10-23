@@ -60,7 +60,7 @@ namespace ReflowLink.Protocol {
             Set(0, 2, 1.0, 205, 20);
 
             _misc["SL"] = "25.0";
-            _misc["Hb"] = "0";
+            _misc["Hb"] = "5";
             _misc["XP"] = "8.0";
             _misc["TI"] = "120";
             _misc["TD"] = "30";
@@ -82,6 +82,9 @@ namespace ReflowLink.Protocol {
         }
 
         public int Address { get; set; }
+        /// <summary>Smallest holdback accepted; the real PC410 refuses 0.</summary>
+        public double HoldbackMin { get; set; } = 1;
+
         /// <summary>Test option: limit out-of-range targets to HS/LS instead of rejecting them (NAK).</summary>
         public bool ClampTargets { get; set; }
 
@@ -209,6 +212,12 @@ namespace ReflowLink.Protocol {
                         s.Dwell = Units.Dwell == DwellUnit.Seconds ? Math.Round(t) : t;
                         return true;
                 }
+            }
+            if (mn == "Hb") {
+                // Like the real PC410: holdback can't be 0 (switched off).
+                if (!Pc410Protocol.TryParseNumber(data, out double hb) || hb < HoldbackMin || hb > 9999) return false;
+                _misc[mn] = data;
+                return true;
             }
             if (_misc.ContainsKey(mn)) {
                 if (!Pc410Protocol.TryParseNumber(data, out _)) return false;

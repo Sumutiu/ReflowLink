@@ -145,6 +145,38 @@ namespace ReflowLink.Tests {
                 Eq(5.0, back.Holdback);
             });
 
+            Run("Holdback is one setting for all patterns", () => {
+                using var c = NewSim(out _);
+                var dev = new Pc410Device(c);
+                var p = new ReflowProfile { Holdback = 10 };
+                p.Steps.Add(new ProfileStep(1, 100, 5));
+                dev.UploadProfile(p, 0, UnusedStepMode.Zeros, true, null, CancellationToken.None);
+                p.Holdback = 15;
+                dev.UploadProfile(p, 1, UnusedStepMode.Zeros, true, null, CancellationToken.None);
+                dev.SelectPattern(0);
+                Eq(15.0, dev.ReadHoldback());
+                Eq(20.0, dev.WriteHoldback(20));
+                Eq(20.0, dev.ReadHoldback());
+            });
+
+            Run("A holdback the controller refuses leaves the pattern untouched", () => {
+                using var c = NewSim(out var sim);
+                var dev = new Pc410Device(c);
+                var good = new ReflowProfile { Holdback = 5 };
+                good.Steps.Add(new ProfileStep(1, 100, 5));
+                dev.UploadProfile(good, 3, UnusedStepMode.Zeros, true, null, CancellationToken.None);
+
+                Catch<ArgumentOutOfRangeException>(() => dev.WriteHoldback(0));
+                sim.HoldbackMin = 3; // a controller with a higher minimum than ReflowLink's
+                Catch<HoldbackRejectedException>(() => dev.WriteHoldback(2));
+                var bad = new ReflowProfile { Holdback = 2 };
+                bad.Steps.Add(new ProfileStep(2, 150, 30));
+                var ex = Catch<ProfileRejectedException>(() => dev.UploadProfile(bad, 3, UnusedStepMode.Zeros, true, null, CancellationToken.None));
+                True(!ex.PatternChanged, "pattern must not count as changed");
+                Eq(5.0, dev.ReadHoldback());
+                Eq(100.0, dev.DownloadProfile(3, null, CancellationToken.None).Steps[0].Target);
+            });
+
             Run("END marker mode terminates the program", () => {
                 using var c = NewSim(out _);
                 var dev = new Pc410Device(c);

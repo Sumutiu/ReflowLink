@@ -29,7 +29,14 @@ namespace ReflowLink.Model {
         [XmlAttribute("version")] public int FormatVersion { get; set; } = 1;
         public string Name { get; set; } = "New profile";
         public string Notes { get; set; } = "";
-        /// <summary>Optional programmer holdback band (°C). Null = leave the controller value unchanged.</summary>
+        /// <summary>Holdback range the PC410 accepts (it refuses 0, so holdback can't be switched off).</summary>
+        public const double HoldbackMin = 1, HoldbackMax = 100, HoldbackDefault = 5;
+        public static readonly string HoldbackRangeMessage = $"Holdback must be between {HoldbackMin:0} and {HoldbackMax:0} °C.";
+
+        /// <summary>
+        /// Holdback band (°C). The PC410 has one holdback for all patterns, so writing any profile sets it for every
+        /// pattern. Null only in files saved by older versions; the editor then uses <see cref="HoldbackDefault"/>.
+        /// </summary>
         public double? Holdback { get; set; }
         [XmlArray("Steps"), XmlArrayItem("Step")]
         public List<ProfileStep> Steps { get; set; } = [];
@@ -55,7 +62,7 @@ namespace ReflowLink.Model {
                 if (s.HoldSeconds < 0) yield return $"Step {n}: hold time cannot be negative.";
                 if (s.HoldSeconds > 9999) yield return $"Step {n}: hold time must be 9999 s or less.";
             }
-            if (Holdback.HasValue && (Holdback < 0 || Holdback > 100)) yield return "Holdback must be between 0 and 100 °C.";
+            if (Holdback.HasValue && (Holdback < HoldbackMin || Holdback > HoldbackMax)) yield return HoldbackRangeMessage;
         }
 
         // ---------------------------------------------------------------- file I/O
