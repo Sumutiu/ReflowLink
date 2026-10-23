@@ -8,10 +8,10 @@ Control software for reflow and BGA rework stations that use the **ALTEC PC410**
 
 | Station | What the PC410 controls | Controller units | Limit |
 |---|---|---|---|
-| **ACHI IR6500** | 400 W top IR heater (the bottom preheater has its own controller) | °C/s, seconds (confirmed) | 230 °C |
-| **ACHI IR6000** | Upper IR heater (the bottom heater uses a CH6 controller) | °C/s, seconds (ACHI manual) | 230 °C |
-| **ACHI IR-PRO-SC** | Upper heater (the bottom preheat module has its own controller) | °C/s, seconds (as other ACHI models; confirm with a test run) | 230 °C |
-| **Other PC410 / AL808 station** | Whatever heater the controller drives | You choose: ramp per second or per minute, hold in seconds or minutes | 250 °C (editable) |
+| **ACHI IR6500** | 400 W top IR heater (the bottom preheater has its own controller) | °C/s, seconds (confirmed) | 260 °C |
+| **ACHI IR6000** | Upper IR heater (the bottom heater uses a CH6 controller) | °C/s, seconds (ACHI manual) | 260 °C |
+| **ACHI IR-PRO-SC** | Upper heater (the bottom preheat module has its own controller) | °C/s, seconds (as other ACHI models; confirm with a test run) | 260 °C |
+| **Other PC410 / AL808 station** | Whatever heater the controller drives | You choose: ramp per second or per minute, hold in seconds or minutes | 260 °C (editable) |
 
 You pick the station the first time ReflowLink starts, and can change it under **Settings → Station**. The choice sets the controller's units and the temperature limit. Profiles are always edited in °C per second and seconds; ReflowLink converts them to the controller's units when it reads or writes a pattern.
 
@@ -19,10 +19,21 @@ You pick the station the first time ReflowLink starts, and can change it under *
 
 There are two limits, and a profile has to respect both:
 
-- **ReflowLink's limit** (*Settings → Profiles → Maximum temperature*). It defaults to the station manual's maximum (230 °C on the ACHI models). You can raise it up to 400 °C; ReflowLink asks you to confirm, because it doesn't change the controller.
-- **The controller's setpoint limit** (`HS`, plus `LS` as the lower limit), set in the PC410 by the station maker. ReflowLink reads it when connecting and shows it in Settings.
+- **ReflowLink's limit** (*Settings → Profiles → Maximum temperature*). It defaults to the controller's factory setpoint limit (SPH = 260 °C on all listed stations). You can raise it up to 400 °C; ReflowLink asks you to confirm, because it doesn't change the controller.
+- **The controller's setpoint limit** (`HS`, plus `LS` as the lower limit), set in the PC410 by the station maker (260 °C from the factory) and adjustable on the front panel as SPH / SPL. ReflowLink reads it when connecting and shows it in Settings.
 
 When you write a profile, ReflowLink first checks every target against `HS`/`LS` and refuses the write if one is outside, without changing the pattern. The PC410 answers each written value with ACK (accepted) or NAK (rejected), and ReflowLink also reads the targets back in case a controller limits a value instead of rejecting it. If the controller rejects or changes a target during the write, ReflowLink stops, clears the pattern (ends it at step 1) so it can't run with partial settings, lists the rejected values, and won't start that pattern until a valid profile is written to it. Before every start, the pattern is read back and checked against both limits.
+
+## Control Tuning
+
+The *Control Tuning* page shows the controller's PID and output settings, explains what each one does, and lets you change them. ReflowLink reads them every time it connects; while offline it shows the factory values of an ACHI IR6500 (P 10, I 61, D 9, output limit 100 %, cycle time 3.0 s, sensor break power 0 %).
+
+- **PID graph:** a simulated heat-up on a generic IR heater model, comparing the controller's current P, I, D and output limit with your edits. Hovering a setting highlights the part of the curve it affects. It shows the direction and rough size of a change, not an exact prediction for your station.
+- **Writing:** only changed settings are written, after a confirmation; each one is read back. Writing is locked while a program or auto-tune runs, and until the controller has been read on the current connection.
+- **Auto-tune** (`XS`): starts the controller's own tune, with warnings. ReflowLink shows when it's running, blocks program starts meanwhile, and shows the new P, I and D when it ends.
+- **Advanced:** cutback (`HB`/`LB`), alarms (`HA`/`LA`/`DA`), program repeat count (`Lc`) and ramp-to-setpoint rate (`SR`). ACHI hides these on the front panel; they're editable with an extra warning.
+
+Parameter codes: `XP` (P), `TI` (I), `TD` (D), `HO` (output limit), `CH` (heat cycle time), `BP` (sensor break power). Note that `HB` (high cutback) and `Hb` (holdback) are different parameters.
 
 ## What it does
 

@@ -133,7 +133,7 @@ namespace ReflowLink.UI.Pages {
 
             var prof = Card("Profiles", "Limits and how profiles are written");
             var pf = Form(prof);
-            Row(pf, "Maximum temperature", _maxTemp, "Defaults to the station manual's limit. Raising it here doesn't change the controller.");
+            Row(pf, "Maximum temperature", _maxTemp, "Defaults to the controller's factory setpoint limit (SPH). Raising it here doesn't change the controller.");
             Row(pf, "Controller limit", _controllerLimit, null);
             Row(pf, "", _limitWarning, null);
             Row(pf, "Unused steps", _unused, "How segments after the last step are cleared.");
@@ -345,7 +345,7 @@ namespace ReflowLink.UI.Pages {
         }
 
         /// <summary>
-        /// Applies a new maximum temperature. Raising it above the station manual's limit asks for confirmation,
+        /// Applies a new maximum temperature. Raising it above the station's factory setpoint limit asks for confirmation,
         /// because the controller's own setpoint limit (HS) still applies.
         /// </summary>
         private void CommitMaxTemperature() {
@@ -357,13 +357,13 @@ namespace ReflowLink.UI.Pages {
             }
             if (Math.Abs(value - s.MaxTemperature) < 0.01) return;
 
-            double manual = s.Station.MaxTemperature;
-            if (value > manual && value > s.MaxTemperature) {
+            double factory = s.Station.MaxTemperature;
+            if (value > factory && value > s.MaxTemperature) {
                 string hs = State.Device.ControllerLimits.High is double h
                     ? $"\n\nThis controller currently reports HS = {h:0.#} °C."
                     : "";
                 string message =
-                    $"The {s.Station.Name} manual gives {manual:0.#} °C as the maximum.\n\n" +
+                    $"The {s.Station.Name}'s controller ships with its setpoint limit (SPH) at {factory:0.#} °C.\n\n" +
                     "Raising the limit in ReflowLink doesn't change the controller. Unless you also raise the controller's own " +
                     "setpoint limit (HS), it will reject targets above it, and ReflowLink will refuse to write or start those profiles." + hs;
                 _committingLimit = true; // the dialog takes focus, which would commit again

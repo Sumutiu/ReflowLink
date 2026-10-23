@@ -76,6 +76,9 @@ namespace ReflowLink.Protocol {
     /// <summary>The controller refused a holdback value, or stored a different one.</summary>
     public sealed class HoldbackRejectedException(string message) : Pc410Exception(message) { }
 
+    /// <summary>The controller refused a control setting, or stored a different value.</summary>
+    public sealed class SettingRejectedException(string message) : Pc410Exception(message) { }
+
     /// <summary>High-level PC410 operations (telemetry, profiles, program control).</summary>
     public sealed class Pc410Device(Pc410Client client) {
         public const string Pv = "PV", Sp = "SP", Op = "OP", Os = "OS", Sw = "SW", Se = "SE", Pattern = "ch", Holdback = "Hb", Sl = "SL", Hs = "HS", Ls = "LS";
@@ -84,7 +87,7 @@ namespace ReflowLink.Protocol {
 
         private bool _seSupported = true, _swSupported = true;
         // null = not tried yet, false = the controller doesn't report it, true = it answered before.
-        private bool? _hsSupported, _lsSupported;
+        private bool? _hsSupported, _lsSupported, _xsSupported;
         private int _seMisses, _swMisses;
         private const int UnsupportedAfter = 3;
         private int _cycle;
@@ -171,6 +174,114 @@ namespace ReflowLink.Protocol {
                 if (Math.Abs(actual - value) > 0.05)
                     throw new HoldbackRejectedException($"The controller stored holdback {actual:0.#} °C instead of {value:0.#} °C.");
                 return actual;
+            }
+        }
+
+        // ------------------------------------------------------------------ control tuning
+
+        /// <summary>Tuning parameters this controller doesn't answer (found out once per connection).</summary>
+        private readonly HashSet<string> _unsupported = [];
+
+        /// <summary>
+        /// Reads every Control Tuning setting. Settings the controller doesn't report are left null. Each parameter is
+        /// read on its own, so a Stop command or the telemetry poll can get in between.
+        /// </summary>
+        public TuningSnapshot ReadTuning(IProgress<OperationProgress> progress, CancellationToken ct) {
+            var snap = new TuningSnapshot { FromController = true, ReadAt = DateTime.Now };
+            int total = TuningCatalog.All.Length + 1, done = 0;
+            foreach (var p in TuningCatalog.All) {
+                ct.ThrowIfCancellationRequested();
+                progress?.Report(new OperationProgress(done++, total, $"Reading {p.Name}…"));
+                snap.Values[p.Mnemonic] = TryReadSetting(p.Mnemonic);
+            }
+            progress?.Report(new OperationProgress(done, total, "Reading auto-tune…"));
+            try { snap.AutoTune = ReadAutoTune(); } catch (Pc410Exception) { snap.AutoTune = null; }
+            if (snap.Values.Values.All(v => v == null) && snap.AutoTune == null)
+                throw new Pc410Exception("The controller didn't report any control settings.");
+            return snap;
+        }
+
+        /// <summary>
+        /// Reads one setting. A parameter that gets no answer while PV still answers is remembered as unsupported, so it
+        /// doesn't cost a timeout every time. Throws when the controller doesn't answer at all.
+        /// </summary>
+        private double? TryReadSetting(string mnemonic) {
+            if (_unsupported.Contains(mnemonic)) return null;
+            try {
+                return Client.ReadNumber(mnemonic);
+            } catch (Pc410NakException) {
+                _unsupported.Add(mnemonic);
+                return null;
+            } catch (Pc410Exception) {
+                if (!LinkAlive()) throw;
+                _unsupported.Add(mnemonic);
+                return null;
+            }
+        }
+
+        private bool LinkAlive() {
+            try { Probe(); return true; } catch (Pc410Exception) { return false; }
+        }
+
+        /// <summary>
+        /// Writes one control setting and reads it back. Refused while a program or auto-tune runs. Throws
+        /// <see cref="SettingRejectedException"/> if the controller refuses the value (NAK) or stores a different one;
+        /// in the second case the controller's value has changed.
+        /// </summary>
+        public double WriteSetting(TuningParameter p, double value) {
+            if (p == null) throw new ArgumentNullException(nameof(p));
+            value = p.Round(value);
+            if (!p.InRange(value)) throw new ArgumentOutOfRangeException(nameof(value), p.RangeText);
+            lock (Client.SyncRoot) {
+                EnsureIdle("change control settings");
+                if (ReadAutoTune() == true) throw new Pc410Exception("Auto-tune is running. Wait for it to finish before changing control settings.");
+                try {
+                    Client.WriteNumber(p.Mnemonic, value, p.Decimals);
+                } catch (Pc410NakException) {
+                    throw new SettingRejectedException($"The controller refused {p.Name} = {p.Format(value)}.");
+                }
+                double actual = Client.ReadNumber(p.Mnemonic);
+                _unsupported.Remove(p.Mnemonic);
+                if (!p.Same(actual, value))
+                    throw new SettingRejectedException($"The controller stored {p.Name} as {p.Format(actual)} instead of {p.Format(value)}.");
+                return actual;
+            }
+        }
+
+        /// <summary>
+        /// True while the controller's auto-tune runs; null when the controller doesn't have it. Once the controller has
+        /// answered, a failed read throws instead of switching the check off.
+        /// </summary>
+        public bool? ReadAutoTune() {
+            if (_xsSupported == false) return null;
+            try {
+                int word = Client.ReadHexWord(TuningCatalog.AutoTune);
+                _xsSupported = true;
+                return (word & 0x0001) != 0;
+            } catch (Pc410Exception) when (_xsSupported == null) {
+                // First attempt: no answer while PV answers means this controller has no auto-tune parameter.
+                if (!LinkAlive()) throw;
+                _xsSupported = false;
+                return null;
+            }
+        }
+
+        /// <summary>Starts or stops the controller's auto-tune (bit 0 of XS) and checks that it took effect.</summary>
+        public void SetAutoTune(bool on) {
+            lock (Client.SyncRoot) {
+                if (on) EnsureIdle("start auto-tune");
+                int word = 0;
+                try { word = Client.ReadHexWord(TuningCatalog.AutoTune); } catch (Pc410Exception) { }
+                word = on ? word | 0x0001 : word & ~0x0001;
+                try {
+                    Client.WriteHexWord(TuningCatalog.AutoTune, word);
+                } catch (Pc410NakException) {
+                    throw new SettingRejectedException(on ? "The controller refused to start auto-tune." : "The controller refused to stop auto-tune.");
+                }
+                bool running = (Client.ReadHexWord(TuningCatalog.AutoTune) & 0x0001) != 0;
+                _xsSupported = true;
+                if (running != on)
+                    throw new SettingRejectedException(on ? "The controller didn't start auto-tune." : "The controller reports that auto-tune is still running.");
             }
         }
 
@@ -434,6 +545,8 @@ namespace ReflowLink.Protocol {
 
         public void Start(int? slot) {
             lock (Client.SyncRoot) {
+                if (ReadAutoTune() == true)
+                    throw new Pc410Exception("Auto-tune is running. Wait for it to finish, or stop it on the Control Tuning page, before starting a program.");
                 if (slot.HasValue) {
                     int current = -1;
                     try { current = ReadPattern(); } catch (Pc410Exception) { }

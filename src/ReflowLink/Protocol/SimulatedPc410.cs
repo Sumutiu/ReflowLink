@@ -46,7 +46,7 @@ namespace ReflowLink.Protocol {
         private double _dwellLeft;
         private double _currentRate;
 
-        public SimulatedPc410(int address, double speed = 1.0, ControllerUnits units = null, double setpointHigh = 230) {
+        public SimulatedPc410(int address, double speed = 1.0, ControllerUnits units = null, double setpointHigh = StationModel.DefaultMaxTemperature) {
             Address = address;
             Speed = speed;
             Units = units ?? ControllerUnits.SecondsBased;
@@ -61,16 +61,11 @@ namespace ReflowLink.Protocol {
 
             _misc["SL"] = "25.0";
             _misc["Hb"] = "5";
-            _misc["XP"] = "8.0";
-            _misc["TI"] = "120";
-            _misc["TD"] = "30";
             _misc["HS"] = Pc410Protocol.FormatNumber(setpointHigh, 1);
             _misc["LS"] = "0";
-            _misc["HA"] = "250";
-            _misc["LA"] = "0";
-            _misc["CH"] = "2";
-            _misc["XS"] = ">0000";
-            _misc["Lc"] = "1";
+            // Control settings: the values of a factory ACHI IR6500.
+            foreach (var p in TuningCatalog.All) _misc[p.Mnemonic] = Pc410Protocol.FormatNumber(p.Factory, p.Decimals);
+            _misc[TuningCatalog.AutoTune] = ">0000";
             _sp = 25.0;
         }
 
@@ -82,6 +77,17 @@ namespace ReflowLink.Protocol {
         }
 
         public int Address { get; set; }
+        /// <summary>Simulated seconds an auto-tune takes before new P, I and D are stored.</summary>
+        public double AutoTuneSeconds { get; set; } = 90;
+
+        /// <summary>Test option: parameters the simulator doesn't answer, like a controller without them.</summary>
+        public HashSet<string> MissingParameters { get; } = [];
+
+        /// <summary>Test option: parameters the simulator refuses to write (NAK).</summary>
+        public HashSet<string> RefusedWrites { get; } = [];
+
+        private double _tuneLeft;
+
         /// <summary>Smallest holdback accepted; the real PC410 refuses 0.</summary>
         public double HoldbackMin { get; set; } = 1;
 
@@ -170,6 +176,7 @@ namespace ReflowLink.Protocol {
                 };
             }
             if (HideSetpointLimits && mn is "HS" or "LS") return null;
+            if (MissingParameters.Contains(mn)) return null;
             return _misc.TryGetValue(mn, out var val) ? val : null; // unknown parameter: silence
         }
 
@@ -213,6 +220,15 @@ namespace ReflowLink.Protocol {
                         return true;
                 }
             }
+            if (RefusedWrites.Contains(mn)) return false;
+            if (mn == TuningCatalog.AutoTune) {
+                if (!Pc410Protocol.TryParseHexWord(data, out int tune)) return false;
+                bool on = (tune & 0x0001) != 0;
+                if (on && _state != ProgramState.Idle) return false;
+                _tuneLeft = on ? AutoTuneSeconds : 0;
+                _misc[mn] = Pc410Protocol.FormatHexWord(on ? 0x0001 : 0x0000);
+                return true;
+            }
             if (mn == "Hb") {
                 // Like the real PC410: holdback can't be 0 (switched off).
                 if (!Pc410Protocol.TryParseNumber(data, out double hb) || hb < HoldbackMin || hb > 9999) return false;
@@ -233,6 +249,7 @@ namespace ReflowLink.Protocol {
                     _state = ProgramState.Idle;
                     return true;
                 case Pc410Device.OsRun:
+                    if (_tuneLeft > 0) return false; // can't run a program while tuning
                     if (_state == ProgramState.Idle) {
                         _segIndex = 0;
                         _phase = Phase.Ramp;
@@ -273,6 +290,16 @@ namespace ReflowLink.Protocol {
         }
 
         private void Step(double dt) {
+            if (_tuneLeft > 0) {
+                _tuneLeft -= dt;
+                if (_tuneLeft <= 0) {
+                    // Tuning finished: store "new" values and switch tuning off, like the real controller.
+                    _misc["XP"] = "12.0";
+                    _misc["TI"] = "70";
+                    _misc["TD"] = "11";
+                    _misc[TuningCatalog.AutoTune] = ">0000";
+                }
+            }
             double hb = ParseOr(_misc["Hb"], 0);
             _currentRate = 0;
 

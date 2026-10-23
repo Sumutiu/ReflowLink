@@ -40,6 +40,20 @@ namespace ReflowLink.UI {
 
         public bool Busy => _busy > 0;
 
+        /// <summary>Control settings last read from the controller, or the factory values while none have been read.</summary>
+        public TuningSnapshot Tuning { get; private set; } = TuningSnapshot.Factory();
+
+        /// <summary>True while the controller's auto-tune runs (kept up to date by the Control Tuning page).</summary>
+        public bool AutoTuneRunning { get; set; }
+
+        /// <summary>Raised when <see cref="Tuning"/> is replaced.</summary>
+        public event Action TuningChanged;
+
+        public void SetTuning(TuningSnapshot snapshot) {
+            Tuning = snapshot ?? TuningSnapshot.Factory();
+            TuningChanged?.Invoke();
+        }
+
         public void SetSlotProfile(int slot, ReflowProfile p) {
             if (slot is < 0 or > 9) return;
             SlotProfiles[slot] = p?.Clone();

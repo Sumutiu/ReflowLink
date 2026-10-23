@@ -13,6 +13,12 @@ using ReflowLink.Protocol;
 
 namespace ReflowLink.Model {
     public sealed class AppSettings {
+        /// <summary>Settings format: 0 = saved before versions were tracked (default temperature limit 230 / 250 °C).</summary>
+        public const int CurrentVersion = 2;
+
+        /// <summary>Format of the loaded file; missing in older files, so it reads as 0.</summary>
+        public int SettingsVersion { get; set; }
+
         // Station
         /// <summary>Selected station from <see cref="StationCatalog"/>. Empty until the user picks one on first run.</summary>
         public string StationId { get; set; } = "";
@@ -32,7 +38,7 @@ namespace ReflowLink.Model {
         public double SimulatorSpeed { get; set; } = 1;
 
         // Profiles
-        public double MaxTemperature { get; set; } = 230;
+        public double MaxTemperature { get; set; } = StationModel.DefaultMaxTemperature;
         public UnusedStepMode UnusedSteps { get; set; } = UnusedStepMode.Zeros;
         public bool VerifyAfterWrite { get; set; } = true;
         public double PreviewStartTemperature { get; set; } = 25;
@@ -101,7 +107,7 @@ namespace ReflowLink.Model {
                 if (File.Exists(SettingsPath)) return Read(SettingsPath).Sanitize();
                 if (File.Exists(LegacySettingsPath)) return MigrateFromIr6500Studio();
             } catch { /* corrupt settings: fall back to defaults */ }
-            return new AppSettings();
+            return new AppSettings { SettingsVersion = CurrentVersion };
         }
 
         private static AppSettings Read(string path) {
@@ -141,7 +147,13 @@ namespace ReflowLink.Model {
             } catch { /* settings are best-effort */ }
         }
 
-        private AppSettings Sanitize() {
+        internal AppSettings Sanitize() {
+            // Before version 2 the stations defaulted to 230 °C (250 °C for the generic one). The controller's factory
+            // setpoint limit is 260 °C, so a limit still at the old default moves to the new one. Other values are kept.
+            if (SettingsVersion < 2 && StationChosen && MaxTemperature is 230 or 250 && Station.MaxTemperature > MaxTemperature)
+                MaxTemperature = Station.MaxTemperature;
+            SettingsVersion = CurrentVersion;
+
             if (Address is < 0 or > 99) Address = 1;
             if (BaudRate <= 0) BaudRate = 9600;
             ResponseTimeoutMs = Math.Max(100, Math.Min(5000, ResponseTimeoutMs));

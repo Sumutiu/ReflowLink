@@ -56,7 +56,7 @@ namespace ReflowLink.UI {
                 Dock = DockStyle.Top,
                 FlowDirection = FlowDirection.TopDown,
                 WrapContents = false,
-                Height = Theme.S(4 * 46 + 12),
+                Height = Theme.S(5 * 46 + 12),
                 BackColor = Theme.Sidebar,
                 Padding = new Padding(0, Theme.S(4), 0, 0),
             };
@@ -68,6 +68,7 @@ namespace ReflowLink.UI {
             }
             AddNav("dashboard", "Dashboard", Glyph.Dashboard);
             AddNav("profiles", "Profiles", Glyph.Profile);
+            AddNav("tuning", "Control Tuning", Glyph.Tune);
             AddNav("console", "Console", Glyph.Console);
             AddNav("settings", "Settings", Glyph.Settings);
 
@@ -126,6 +127,7 @@ namespace ReflowLink.UI {
             _profiles = new ProfilesPage(_state);
             AddPage("dashboard", _dashboard);
             AddPage("profiles", _profiles);
+            AddPage("tuning", new TuningPage(_state));
             AddPage("console", new ConsolePage(_state));
             AddPage("settings", new SettingsPage(_state));
 
@@ -214,6 +216,9 @@ namespace ReflowLink.UI {
                 if (_dashboard.IsProgramActive &&
                     !DarkDialog.Confirm(this, "Disconnect while running?", "The controller keeps running the program on its own after you disconnect. Monitoring and recording will stop.", "Disconnect", "Cancel"))
                     return;
+                if (_state.AutoTuneRunning &&
+                    !DarkDialog.Confirm(this, "Disconnect during auto-tune?", AutoTuneWarning, "Disconnect", "Cancel", danger: true))
+                    return;
                 _dashboard.Shutdown();
                 _device.Disconnect();
                 SetStatus("Disconnected", StatusKind.Normal);
@@ -230,6 +235,10 @@ namespace ReflowLink.UI {
                 if (r == 0) ShowPage("settings");
             }
         }
+
+        private const string AutoTuneWarning =
+            "The controller keeps tuning on its own, and ReflowLink can't stop it once it's disconnected. "
+            + "Stop the tune first on the Control Tuning page, or switch Tune off on the controller's front panel.";
 
         // ==================================================================== window
 
@@ -283,6 +292,8 @@ namespace ReflowLink.UI {
                         if (r2 != 0) { e.Cancel = true; return; }
                     }
                 }
+                if (_state.AutoTuneRunning && _device.IsConnected &&
+                    !DarkDialog.Confirm(this, "Auto-tune is running", AutoTuneWarning, "Exit anyway", "Cancel", danger: true)) { e.Cancel = true; return; }
                 if (!_profiles.ConfirmClose()) { e.Cancel = true; return; }
             }
             var s = _state.Settings;

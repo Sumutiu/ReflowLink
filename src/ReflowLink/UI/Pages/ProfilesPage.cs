@@ -294,9 +294,9 @@ namespace ReflowLink.UI.Pages {
             UpdatePreview();
         }
 
-        private static ProfileStep DefaultStepAfter(ReflowProfile p, int index) {
+        private ProfileStep DefaultStepAfter(ReflowProfile p, int index) {
             var last = p.Steps.Count > 0 ? p.Steps[p.Steps.Count - 1] : null;
-            double target = last != null ? Math.Min(last.Target + 10 * (index - p.Steps.Count + 1), 230) : 150;
+            double target = last != null ? Math.Min(last.Target + 10 * (index - p.Steps.Count + 1), State.Settings.MaxTemperature) : 150;
             return new ProfileStep(1.0, target, 20);
         }
 

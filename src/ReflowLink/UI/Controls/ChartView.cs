@@ -35,6 +35,13 @@ namespace ReflowLink.UI.Controls {
         public Color Color = Theme.TextFaint;
     }
 
+    /// <summary>Shaded time range, used to point at part of a curve.</summary>
+    public sealed class ChartBand {
+        public double XFrom, XTo;
+        public string Label;
+        public Color Color = Theme.Accent;
+    }
+
     /// <summary>Lightweight time/temperature chart with hover read-out.</summary>
     [System.ComponentModel.DesignerCategory("Code")]
     public class ChartView : Control {
@@ -48,6 +55,7 @@ namespace ReflowLink.UI.Controls {
 
         public readonly List<ChartSeries> Series = [];
         public readonly List<ChartMarker> Markers = [];
+        public readonly List<ChartBand> Bands = [];
 
         public double? XMin { get; set; }
         public double? XMax { get; set; }
@@ -163,6 +171,21 @@ namespace ReflowLink.UI.Controls {
                     g.DrawLine(grid, px, plot.Top, px, plot.Bottom);
                     TextRenderer.DrawText(g, XLabel(x), Font, new Rectangle((int)px - Theme.S(50), plot.Bottom + Theme.S(4), Theme.S(100), Theme.S(18)), Theme.TextFaint, Theme.CenterMiddle);
                 }
+            }
+
+            // Bands
+            foreach (var band in Bands) {
+                double from = Math.Max(xmin, band.XFrom), to = Math.Min(xmax, band.XTo);
+                if (to <= from) continue;
+                var rect = new RectangleF(X(from), plot.Top, X(to) - X(from), plot.Height);
+                using (var b = new SolidBrush(Theme.WithAlpha(band.Color, 26))) g.FillRectangle(b, rect);
+                using (var pen = new Pen(Theme.WithAlpha(band.Color, 90))) {
+                    g.DrawLine(pen, rect.Left, rect.Top, rect.Left, rect.Bottom);
+                    g.DrawLine(pen, rect.Right, rect.Top, rect.Right, rect.Bottom);
+                }
+                if (!string.IsNullOrEmpty(band.Label))
+                    TextRenderer.DrawText(g, band.Label, Theme.SmallBold, new Rectangle((int)rect.Left + Theme.S(4), plot.Top + Theme.S(4), Math.Max(Theme.S(40), (int)rect.Width - Theme.S(8)), Theme.S(18)),
+                        Theme.Blend(band.Color, Theme.Text, 0.3f), TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
             }
 
             // Limit line

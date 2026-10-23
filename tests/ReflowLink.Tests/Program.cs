@@ -177,6 +177,86 @@ namespace ReflowLink.Tests {
                 Eq(100.0, dev.DownloadProfile(3, null, CancellationToken.None).Steps[0].Target);
             });
 
+            Run("Control settings: catalog is consistent", () => {
+                Eq(TuningCatalog.All.Length, TuningCatalog.All.Select(p => p.Mnemonic).Distinct(StringComparer.Ordinal).Count());
+                foreach (var p in TuningCatalog.All) True(p.InRange(p.Factory), p.Mnemonic + " factory value in range");
+                True(TuningCatalog.Find("HB") != TuningCatalog.Find("Hb"), "HB (cutback) is not Hb (holdback)");
+                Eq(null, TuningCatalog.Find("Hb"));
+            });
+
+            Run("Control settings are read, written and checked", () => {
+                using var c = NewSim(out var sim);
+                var dev = new Pc410Device(c);
+                var snap = dev.ReadTuning(null, CancellationToken.None);
+                Eq(10.0, snap[TuningCatalog.Proportional]);
+                Eq(61.0, snap[TuningCatalog.Integral]);
+                Eq(9.0, snap[TuningCatalog.Derivative]);
+                Eq(3.0, snap[TuningCatalog.CycleTime]);
+                Eq(false, snap.AutoTune == true);
+                Eq(12.0, dev.WriteSetting(TuningCatalog.Proportional, 12));
+                Eq(13.0, dev.WriteSetting(TuningCatalog.Proportional, 12.6)); // rounded to whole degrees, like the controller
+                Eq(13.0, dev.ReadTuning(null, CancellationToken.None)[TuningCatalog.Proportional]);
+                Catch<ArgumentOutOfRangeException>(() => dev.WriteSetting(TuningCatalog.SensorBreakPower, 150));
+                sim.RefusedWrites.Add("TD");
+                var ex = Catch<SettingRejectedException>(() => dev.WriteSetting(TuningCatalog.Derivative, 20));
+                True(ex.Message.Contains("refused"), ex.Message);
+                Eq(9.0, dev.ReadTuning(null, CancellationToken.None)[TuningCatalog.Derivative]);
+                dev.Start(0);
+                Catch<Pc410Exception>(() => dev.WriteSetting(TuningCatalog.Integral, 80));
+                dev.Stop();
+            });
+
+            Run("Control settings a controller doesn't have cost one timeout only", () => {
+                using var c = NewSim(out var sim);
+                sim.MissingParameters.Add("SR");
+                sim.MissingParameters.Add(TuningCatalog.AutoTune);
+                var dev = new Pc410Device(c);
+                var first = dev.ReadTuning(null, CancellationToken.None);
+                Eq(null, first[TuningCatalog.SetpointRate]);
+                Eq(null, first.AutoTune);
+                Eq(10.0, first[TuningCatalog.Proportional]);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                dev.ReadTuning(null, CancellationToken.None);
+                True(sw.ElapsedMilliseconds < 250, "second read skips the missing parameters: " + sw.ElapsedMilliseconds + " ms");
+                dev.Start(0); // no auto-tune parameter: starting isn't blocked
+                dev.Stop();
+            });
+
+            Run("Auto-tune starts, blocks programs and finishes", () => {
+                using var c = NewSim(out var sim);
+                sim.AutoTuneSeconds = 0.3;
+                var dev = new Pc410Device(c);
+                Eq(false, dev.ReadAutoTune() == true);
+                dev.SetAutoTune(true);
+                Eq(true, dev.ReadAutoTune() == true);
+                var ex = Catch<Pc410Exception>(() => dev.Start(0));
+                True(ex.Message.Contains("Auto-tune"), ex.Message);
+                ex = Catch<Pc410Exception>(() => dev.WriteSetting(TuningCatalog.Derivative, 12));
+                True(ex.Message.Contains("Auto-tune"), ex.Message);
+                Thread.Sleep(600);
+                Eq(false, dev.ReadAutoTune() == true);
+                Eq(12.0, dev.ReadTuning(null, CancellationToken.None)[TuningCatalog.Proportional]);
+                dev.Start(0);
+                Catch<Pc410Exception>(() => dev.SetAutoTune(true));
+                dev.Stop();
+            });
+
+            Run("PID simulation reacts to P, I, D and the output limit", () => {
+                var factory = PidSimulator.Run(10, 61, 9, 100, 1, 150);
+                True(factory.SettleSeconds.HasValue, "factory values settle");
+                True(factory.Overshoot < 10, "factory overshoot is moderate: " + factory.Overshoot);
+                var tightP = PidSimulator.Run(2, 61, 9, 100, 1, 150);
+                True(tightP.Swings > factory.Swings, "small P swings more");
+                var wideP = PidSimulator.Run(40, 61, 9, 100, 1, 150);
+                True(wideP.RampLag > factory.RampLag, "large P lags more");
+                var longI = PidSimulator.Run(10, 600, 9, 100, 1, 150);
+                True(longI.SettleSeconds == null || longI.SettleSeconds > factory.SettleSeconds, "long I settles later");
+                var noD = PidSimulator.Run(10, 61, 1, 100, 1, 150);
+                True(noD.Overshoot > factory.Overshoot, "less D overshoots more");
+                var limited = PidSimulator.Run(10, 61, 9, 40, 1, 150);
+                True(limited.RampLag > factory.RampLag + 5, "a low output limit can't follow the ramp");
+            });
+
             Run("END marker mode terminates the program", () => {
                 using var c = NewSim(out _);
                 var dev = new Pc410Device(c);
@@ -287,20 +367,30 @@ namespace ReflowLink.Tests {
                 True(sw.ElapsedMilliseconds > 300, "program finished suspiciously fast");
             });
 
+            Run("An old default temperature limit moves to 260 °C once", () => {
+                var old = new AppSettings { StationId = "achi-ir6500", MaxTemperature = 230 };
+                Eq(260.0, old.Sanitize().MaxTemperature);
+                Eq(AppSettings.CurrentVersion, old.SettingsVersion);
+                var custom = new AppSettings { StationId = "achi-ir6500", MaxTemperature = 240 };
+                Eq(240.0, custom.Sanitize().MaxTemperature);
+                var current = new AppSettings { StationId = "achi-ir6500", MaxTemperature = 230, SettingsVersion = AppSettings.CurrentVersion };
+                Eq(230.0, current.Sanitize().MaxTemperature); // chosen after the change: kept
+            });
+
             Run("Station catalog and settings", () => {
                 Eq("achi-ir6500", StationCatalog.Find("unknown-id").Id);
-                Eq(230.0, StationCatalog.Find("achi-ir6000").MaxTemperature);
+                Eq(260.0, StationCatalog.Find("achi-ir6000").MaxTemperature);
                 var s = new AppSettings();
                 False(s.StationChosen, "no station before first run");
                 s.SelectStation(StationCatalog.GenericId);
-                Eq(250.0, s.MaxTemperature);
+                Eq(260.0, s.MaxTemperature);
                 s.GenericRampUnit = RampUnit.PerSecond;
                 s.GenericDwellUnit = DwellUnit.Minutes;
                 Eq(RampUnit.PerSecond, s.Units.Ramp);
                 Eq(DwellUnit.Minutes, s.Units.Dwell);
                 s.SelectStation("achi-ir-pro-sc");
                 Eq(DwellUnit.Seconds, s.Units.Dwell);
-                Eq(230.0, s.MaxTemperature);
+                Eq(260.0, s.MaxTemperature);
             });
 
             Run("Targets above the controller limit are refused before writing", () => {
@@ -310,13 +400,13 @@ namespace ReflowLink.Tests {
                 ok.Steps.Add(new ProfileStep(1, 150, 10));
                 dev.UploadProfile(ok, 3, UnusedStepMode.Zeros, false, null, CancellationToken.None);
                 var limits = dev.ReadSetpointLimits();
-                Eq(230.0, limits.High);
+                Eq(260.0, limits.High);
                 var hot = new ReflowProfile();
                 hot.Steps.Add(new ProfileStep(1, 200, 10));
-                hot.Steps.Add(new ProfileStep(1, 240, 10));
+                hot.Steps.Add(new ProfileStep(1, 270, 10));
                 var ex = Catch<ProfileRejectedException>(() => dev.UploadProfile(hot, 3, UnusedStepMode.Zeros, true, null, CancellationToken.None));
                 False(ex.PatternChanged, "nothing written");
-                True(ex.Issues[0].Contains("HS = 230"), ex.Issues[0]);
+                True(ex.Issues[0].Contains("HS = 260"), ex.Issues[0]);
                 Eq("150.0", c.Read("l1"));
             });
 
@@ -326,7 +416,7 @@ namespace ReflowLink.Tests {
                 var dev = new Pc410Device(c);
                 var hot = new ReflowProfile();
                 hot.Steps.Add(new ProfileStep(1, 200, 10));
-                hot.Steps.Add(new ProfileStep(1, 240, 10));
+                hot.Steps.Add(new ProfileStep(1, 270, 10));
                 hot.Steps.Add(new ProfileStep(1, 180, 10));
                 var ex = Catch<ProfileRejectedException>(() => dev.UploadProfile(hot, 5, UnusedStepMode.Zeros, false, null, CancellationToken.None));
                 True(ex.PatternChanged && ex.PatternCleared, "pattern cleared");
@@ -341,10 +431,10 @@ namespace ReflowLink.Tests {
                 sim.ClampTargets = true;
                 var dev = new Pc410Device(c);
                 var hot = new ReflowProfile();
-                hot.Steps.Add(new ProfileStep(1, 245, 10));
+                hot.Steps.Add(new ProfileStep(1, 275, 10));
                 var ex = Catch<ProfileRejectedException>(() => dev.UploadProfile(hot, 6, UnusedStepMode.Zeros, false, null, CancellationToken.None));
                 True(ex.PatternCleared, "pattern cleared");
-                True(ex.Issues[0].Contains("changed to 230"), ex.Issues[0]);
+                True(ex.Issues[0].Contains("changed to 260"), ex.Issues[0]);
             });
 
             Run("A communication failure mid-write blocks the pattern", () => {
@@ -369,11 +459,11 @@ namespace ReflowLink.Tests {
                 flaky.Open();
                 using var c = new Pc410Client(flaky, 1) { ResponseTimeoutMs = 60, Retries = 0 };
                 var dev = new Pc410Device(c);
-                Eq(230.0, dev.ReadSetpointLimits().High);
+                Eq(260.0, dev.ReadSetpointLimits().High);
                 flaky.SilentAfterWrites = 0;
                 Throws<Pc410TimeoutException>(() => dev.ReadSetpointLimits());
                 flaky.SilentAfterWrites = int.MaxValue;
-                Eq(230.0, dev.ReadSetpointLimits().High);
+                Eq(260.0, dev.ReadSetpointLimits().High);
             });
 
             Run("Start check refuses a pattern outside the limits", () => {

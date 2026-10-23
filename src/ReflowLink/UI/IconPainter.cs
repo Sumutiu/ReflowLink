@@ -8,7 +8,7 @@ using System.Drawing.Drawing2D;
 namespace ReflowLink.UI {
     public enum Glyph {
         None, Dashboard, Profile, Console, Settings, Play, Pause, Stop, Record, Download, Upload,
-        Folder, Save, Plus, Refresh, Plug, Unplug, Image, Trash, Chevron, Check, Info, Warning, Copy, Send, Spark,
+        Folder, Save, Plus, Refresh, Plug, Unplug, Image, Trash, Chevron, Check, Info, Warning, Copy, Send, Spark, Tune,
     }
 
     /// <summary>Resolution-independent line icons drawn with GDI+ (no icon font required).</summary>
@@ -153,6 +153,14 @@ namespace ReflowLink.UI {
                             g.DrawPath(pen, gp);
                         }
                         g.DrawLine(pen, P(0.24f, 0.50f), P(0.56f, 0.50f));
+                        break;
+                    case Glyph.Tune:
+                        // Three sliders with their knobs at different positions.
+                        foreach (var (cx, knob) in new[] { (0.22f, 0.62f), (0.50f, 0.32f), (0.78f, 0.54f) }) {
+                            g.DrawLine(pen, P(cx, 0.10f), P(cx, knob - 0.10f));
+                            g.DrawLine(pen, P(cx, knob + 0.10f), P(cx, 0.90f));
+                            g.DrawEllipse(pen, R(cx - 0.10f, knob - 0.10f, 0.20f, 0.20f));
+                        }
                         break;
                     case Glyph.Spark:
                         g.DrawLines(pen, [P(0.56f, 0.08f), P(0.26f, 0.54f), P(0.50f, 0.54f), P(0.42f, 0.92f), P(0.76f, 0.42f), P(0.52f, 0.42f), P(0.56f, 0.08f)]);

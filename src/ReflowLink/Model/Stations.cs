@@ -53,7 +53,10 @@ namespace ReflowLink.Model {
         public string Controls { get; set; } = "";
         /// <summary>Short notes shown in Settings and the first-run picker.</summary>
         public string Notes { get; set; } = "";
-        public double MaxTemperature { get; set; } = 230;
+        /// <summary>ReflowLink's default limit: the controller's factory setpoint high limit (SPH / HS).</summary>
+        public double MaxTemperature { get; set; } = DefaultMaxTemperature;
+
+        public const double DefaultMaxTemperature = 260;
         public ControllerUnits Units { get; set; } = ControllerUnits.SecondsBased;
         /// <summary>True for the generic entry, whose units the user chooses.</summary>
         public bool CustomUnits { get; set; }
@@ -68,29 +71,25 @@ namespace ReflowLink.Model {
                 Id = "achi-ir6500",
                 Name = "ACHI IR6500",
                 Controls = "The PC410 controls the 400 W top IR heater. The 800 W bottom preheater has its own controller.",
-                Notes = "Ramp in °C/s and hold in seconds (confirmed). ACHI limits the station to 230 °C.",
-                MaxTemperature = 230,
+                Notes = "Ramp in °C/s and hold in seconds (confirmed). The controller's setpoint limit (SPH) is 260 °C from the factory.",
             },
             new() {
                 Id = "achi-ir6000",
                 Name = "ACHI IR6000",
                 Controls = "The PC410 controls the upper IR heater. The bottom heater uses a separate CH6 controller.",
-                Notes = "Ramp in °C/s and hold in seconds, as in ACHI's manual. Limited to 230 °C like the IR6500.",
-                MaxTemperature = 230,
+                Notes = "Ramp in °C/s and hold in seconds, as in ACHI's manual. Setpoint limit (SPH) 260 °C, like the IR6500.",
             },
             new() {
                 Id = "achi-ir-pro-sc",
                 Name = "ACHI IR-PRO-SC",
                 Controls = "The PC410 controls the upper heater. The bottom preheat module has its own controller.",
-                Notes = "Uses the same units as the other ACHI models (°C/s, seconds); run a short test profile once to confirm. ACHI sets the maximum to 230 °C.",
-                MaxTemperature = 230,
+                Notes = "Uses the same units as the other ACHI models (°C/s, seconds); run a short test profile once to confirm. Setpoint limit (SPH) 260 °C.",
             },
             new() {
                 Id = GenericId,
                 Name = "Other PC410 / AL808 station",
                 Controls = "Any station whose controller speaks the ALTEC AL808 / PC900 / PC410 protocol.",
                 Notes = "The standard AL808 setting is ramp per minute and hold in minutes; some manufacturers use seconds. Choose the units above and check with a short test profile.",
-                MaxTemperature = 250,
                 Units = ControllerUnits.MinutesBased,
                 CustomUnits = true,
             },
