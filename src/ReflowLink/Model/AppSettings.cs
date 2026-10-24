@@ -12,7 +12,21 @@ using System.Xml.Serialization;
 using ReflowLink.Protocol;
 
 namespace ReflowLink.Model {
-    public sealed class AppSettings {
+    /// <summary>Connection fields shared by the top IR settings and the bed heat settings.</summary>
+    public interface IConnectionSettings {
+        string PortName { get; set; }
+        int BaudRate { get; set; }
+        int Address { get; set; }
+        int ResponseTimeoutMs { get; set; }
+        int Retries { get; set; }
+        int PollIntervalMs { get; set; }
+        bool DtrEnable { get; set; }
+        bool RtsEnable { get; set; }
+        bool UseSimulator { get; set; }
+        double SimulatorSpeed { get; set; }
+    }
+
+    public sealed class AppSettings : IConnectionSettings {
         /// <summary>Settings format: 0 = saved before versions were tracked (default temperature limit 230 / 250 °C).</summary>
         public const int CurrentVersion = 2;
 
@@ -36,6 +50,12 @@ namespace ReflowLink.Model {
         public bool RtsEnable { get; set; } = true;
         public bool UseSimulator { get; set; } = false;
         public double SimulatorSpeed { get; set; } = 1;
+
+        /// <summary>Second PC410 that controls the bottom (bed) heater.</summary>
+        public BedSettings Bed { get; set; } = new();
+
+        /// <summary>Wait for Bed / Wait for IR choices per pattern; the controllers can't store them, so ReflowLink does.</summary>
+        public List<PatternSync> PatternSyncs { get; set; } = [];
 
         // Profiles
         public double MaxTemperature { get; set; } = StationModel.DefaultMaxTemperature;
@@ -68,6 +88,30 @@ namespace ReflowLink.Model {
 
         [XmlIgnore]
         public bool StationChosen => !string.IsNullOrEmpty(StationId);
+
+        /// <summary>Connection options for the top IR controller.</summary>
+        public ConnectionOptions IrConnection() => new() {
+            PortName = PortName,
+            BaudRate = BaudRate,
+            Address = Address,
+            ResponseTimeoutMs = ResponseTimeoutMs,
+            Retries = Retries,
+            PollIntervalMs = PollIntervalMs,
+            DtrEnable = DtrEnable,
+            RtsEnable = RtsEnable,
+            UseSimulator = UseSimulator,
+            SimulatorSpeed = SimulatorSpeed,
+            Units = Units,
+            SimulatorLimit = Station.MaxTemperature,
+        };
+
+        public PatternSync SyncFor(int pattern) => PatternSyncs?.FirstOrDefault(p => p.Pattern == pattern);
+
+        /// <summary>Remembers the Wait for Bed / Wait for IR choices written to a pattern.</summary>
+        public void SetSync(int pattern, ReflowProfile profile) {
+            PatternSyncs.RemoveAll(p => p.Pattern == pattern);
+            if (profile != null) PatternSyncs.Add(PatternSync.From(pattern, profile));
+        }
 
         /// <summary>Selects a station and applies its temperature limit.</summary>
         public void SelectStation(string id) {
@@ -163,8 +207,126 @@ namespace ReflowLink.Model {
             if (SimulatorSpeed is < 1 or > 50) SimulatorSpeed = 1;
             if (LastSlot is < 0 or > 9) LastSlot = 0;
             BlockedPatterns = [.. (BlockedPatterns ?? []).Where(p => p is >= 0 and <= 9).Distinct()];
+            Bed = (Bed ?? new BedSettings()).Sanitize();
+            PatternSyncs = [.. (PatternSyncs ?? []).Where(p => p != null && p.Pattern is >= 0 and <= 9).GroupBy(p => p.Pattern).Select(g => g.Last())];
             RecordAfterRunSeconds = Math.Max(0, Math.Min(3600, RecordAfterRunSeconds));
             return this;
+        }
+    }
+
+    /// <summary>How to reach one PC410 (built from the settings; not saved).</summary>
+    public sealed class ConnectionOptions {
+        public string PortName { get; set; } = "";
+        public int BaudRate { get; set; } = 9600;
+        public int Address { get; set; } = 1;
+        public int ResponseTimeoutMs { get; set; } = 500;
+        public int Retries { get; set; } = 2;
+        public int PollIntervalMs { get; set; } = 500;
+        public bool DtrEnable { get; set; } = true;
+        public bool RtsEnable { get; set; } = true;
+        public bool UseSimulator { get; set; }
+        public double SimulatorSpeed { get; set; } = 1;
+        public ControllerUnits Units { get; set; } = ControllerUnits.SecondsBased;
+        /// <summary>Setpoint high limit (HS) the simulator reports.</summary>
+        public double SimulatorLimit { get; set; } = StationModel.DefaultMaxTemperature;
+    }
+
+    /// <summary>Settings of the optional second PC410 that controls the bottom (bed) heater.</summary>
+    public sealed class BedSettings : IConnectionSettings {
+        /// <summary>"Use Bed Heat Control" in Settings.</summary>
+        public bool Enabled { get; set; }
+        public string PortName { get; set; } = "";
+        public int BaudRate { get; set; } = 9600;
+        public int Address { get; set; } = 1;
+        public int ResponseTimeoutMs { get; set; } = 500;
+        public int Retries { get; set; } = 2;
+        public int PollIntervalMs { get; set; } = 500;
+        public bool DtrEnable { get; set; } = true;
+        public bool RtsEnable { get; set; } = true;
+        public bool UseSimulator { get; set; }
+        public double SimulatorSpeed { get; set; } = 1;
+        /// <summary>A separately bought PC410 is treated as generic; ACHI-style seconds are the default.</summary>
+        public RampUnit RampUnit { get; set; } = RampUnit.PerSecond;
+        public DwellUnit DwellUnit { get; set; } = DwellUnit.Seconds;
+        public double MaxTemperature { get; set; } = StationModel.DefaultMaxTemperature;
+        /// <summary>How segments after the last step are cleared on the bed controller.</summary>
+        public UnusedStepMode UnusedSteps { get; set; } = UnusedStepMode.Zeros;
+        /// <summary>Read the bed pattern back after writing and compare it.</summary>
+        public bool VerifyAfterWrite { get; set; } = true;
+
+        [XmlIgnore]
+        public ControllerUnits Units => new(RampUnit, DwellUnit);
+
+        public ConnectionOptions Connection() => new() {
+            PortName = PortName,
+            BaudRate = BaudRate,
+            Address = Address,
+            ResponseTimeoutMs = ResponseTimeoutMs,
+            Retries = Retries,
+            PollIntervalMs = PollIntervalMs,
+            DtrEnable = DtrEnable,
+            RtsEnable = RtsEnable,
+            UseSimulator = UseSimulator,
+            SimulatorSpeed = SimulatorSpeed,
+            Units = Units,
+            SimulatorLimit = MaxTemperature,
+        };
+
+        internal BedSettings Sanitize() {
+            if (Address is < 0 or > 99) Address = 1;
+            if (BaudRate <= 0) BaudRate = 9600;
+            ResponseTimeoutMs = Math.Max(100, Math.Min(5000, ResponseTimeoutMs));
+            Retries = Math.Max(0, Math.Min(5, Retries));
+            PollIntervalMs = Math.Max(200, Math.Min(10000, PollIntervalMs));
+            if (MaxTemperature is <= 0 or > 500) MaxTemperature = StationModel.DefaultMaxTemperature;
+            if (SimulatorSpeed is < 1 or > 50) SimulatorSpeed = 1;
+            PortName ??= "";
+            return this;
+        }
+    }
+
+    /// <summary>Wait for Bed / Wait for IR choices and holdbacks last written to a pattern.</summary>
+    public sealed class PatternSync {
+        [XmlAttribute("pattern")] public int Pattern { get; set; }
+        /// <summary>Bit n set: step n + 1 has Wait for Bed.</summary>
+        [XmlAttribute("waitForBed")] public int WaitForBedMask { get; set; }
+        /// <summary>Bit n set: step n + 1 has Wait for IR.</summary>
+        [XmlAttribute("waitForIr")] public int WaitForIrMask { get; set; }
+        [XmlAttribute("steps")] public int Steps { get; set; }
+        [XmlAttribute("irHoldback")] public double IrHoldback { get; set; } = ReflowProfile.HoldbackDefault;
+        [XmlAttribute("bedHoldback")] public double BedHoldback { get; set; } = ReflowProfile.HoldbackDefault;
+
+        /// <summary>True when any step waits for the other heater.</summary>
+        public bool Any => (WaitForBedMask | WaitForIrMask) != 0;
+
+        public bool WaitForBed(int step) => step is >= 1 and <= 30 && (WaitForBedMask & (1 << (step - 1))) != 0;
+        public bool WaitForIr(int step) => step is >= 1 and <= 30 && (WaitForIrMask & (1 << (step - 1))) != 0;
+
+        public static PatternSync From(int pattern, ReflowProfile p) {
+            var s = new PatternSync {
+                Pattern = pattern,
+                Steps = p.Steps.Count,
+                IrHoldback = p.Holdback ?? ReflowProfile.HoldbackDefault,
+                BedHoldback = p.BedHoldback ?? ReflowProfile.HoldbackDefault,
+            };
+            for (int i = 0; i < p.Steps.Count; i++) {
+                if (p.Steps[i].WaitForBed) s.WaitForBedMask |= 1 << i;
+                if (p.Steps[i].WaitForIr) s.WaitForIrMask |= 1 << i;
+            }
+            return s;
+        }
+
+        /// <summary>
+        /// Copies the saved choices onto a profile read back from the controllers. Nothing is copied when the pattern no
+        /// longer has the same number of steps (it was changed elsewhere). Returns whether the choices were applied.
+        /// </summary>
+        public bool ApplyTo(ReflowProfile p) {
+            if (p.Steps.Count != Steps) return false;
+            for (int i = 0; i < p.Steps.Count; i++) {
+                p.Steps[i].WaitForBed = WaitForBed(i + 1);
+                p.Steps[i].WaitForIr = WaitForIr(i + 1);
+            }
+            return true;
         }
     }
 
@@ -172,23 +334,28 @@ namespace ReflowLink.Model {
     public sealed class CsvRecorder : IDisposable {
         private readonly StreamWriter _w;
         private readonly DateTime _start;
+        private readonly bool _withBed;
 
-        public CsvRecorder(string folder, string label) {
+        /// <param name="withBed">Adds the bed heat controller's columns.</param>
+        public CsvRecorder(string folder, string label, bool withBed = false) {
             Directory.CreateDirectory(folder);
             _start = DateTime.Now;
+            _withBed = withBed;
             string safe = string.IsNullOrWhiteSpace(label) ? "session" : MakeSafe(label);
             FilePath = Path.Combine(folder, $"{_start:yyyy-MM-dd_HHmmss}_{safe}.csv");
             _w = new StreamWriter(FilePath, false, new UTF8Encoding(true));
-            _w.WriteLine("timestamp,elapsed_s,pv_c,sp_c,output_pct,state,segment");
+            _w.WriteLine("timestamp,elapsed_s,pv_c,sp_c,output_pct,state,segment"
+                + (withBed ? ",bed_pv_c,bed_sp_c,bed_output_pct,bed_state,bed_segment,waiting" : ""));
             _w.Flush();
         }
 
         public string FilePath { get; }
         public int Rows { get; private set; }
 
-        public void Write(Telemetry t) {
+        /// <summary>Writes one row: the IR reading, and the latest bed reading when bed columns are recorded.</summary>
+        public void Write(Telemetry t, Telemetry bed = null, string waiting = "") {
             var c = CultureInfo.InvariantCulture;
-            _w.WriteLine(string.Join(",",
+            var line = new StringBuilder(string.Join(",",
                 t.Time.ToString("yyyy-MM-dd HH:mm:ss.fff", c),
                 (t.Time - _start).TotalSeconds.ToString("0.0", c),
                 t.Pv?.ToString("0.0", c) ?? "",
@@ -196,6 +363,16 @@ namespace ReflowLink.Model {
                 t.Op?.ToString("0", c) ?? "",
                 t.State.ToString(),
                 t.Segment?.ToString(c) ?? ""));
+            if (_withBed) {
+                line.Append(',').Append(string.Join(",",
+                    bed?.Pv?.ToString("0.0", c) ?? "",
+                    bed?.Sp?.ToString("0.0", c) ?? "",
+                    bed?.Op?.ToString("0", c) ?? "",
+                    bed?.State.ToString() ?? "",
+                    bed?.Segment?.ToString(c) ?? "",
+                    waiting ?? ""));
+            }
+            _w.WriteLine(line.ToString());
             Rows++;
             if (Rows % 10 == 0) _w.Flush();
         }

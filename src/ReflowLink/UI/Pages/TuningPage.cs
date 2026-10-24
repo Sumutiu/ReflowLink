@@ -54,7 +54,16 @@ namespace ReflowLink.UI.Pages {
         /// <summary>Counts connections, so results from an earlier connection are never shown as current.</summary>
         private int _connection, _readConnection = -1;
 
-        public TuningPage(AppState state) : base(state, "Control Tuning", "How the controller drives the heater: PID, output limits, alarms and auto-tune") {
+        private readonly ControllerChannel _ch;
+
+        private DeviceService Dev => _ch.Device;
+
+        /// <summary>"factory values of an ACHI IR6500" for the top IR; plain defaults for the separately bought bed PC410.</summary>
+        private string DefaultsName => _ch.IsBed ? "default values" : "factory values of an ACHI IR6500";
+
+        public TuningPage(AppState state, ControllerChannel channel)
+            : base(state, $"{channel.Name} Control Tuning", $"How the {channel.Name} controller drives its heater: PID, output limits, alarms and auto-tune") {
+            _ch = channel;
             // ---------------------------------------------------------------- toolbar
             _source = new ThemedLabel("", Theme.Body, Theme.TextDim) { AutoSize = true, Margin = new Padding(0, Theme.S(2), 0, 0) };
             _lockNote = new ThemedLabel("", Theme.Small, Theme.Yellow) { AutoSize = true, Margin = new Padding(0, Theme.S(4), 0, 0) };
@@ -227,13 +236,14 @@ namespace ReflowLink.UI.Pages {
             // ---------------------------------------------------------------- wiring
             _previewTimer.Tick += (s, e) => { _previewTimer.Stop(); UpdatePreview(); };
             _tunePoll.Tick += async (s, e) => await PollAutoTune();
-            State.TuningChanged += () => ShowSnapshot(State.Tuning);
+            _ch.TuningChanged += () => ShowSnapshot(_ch.Tuning);
             State.BusyChanged += UpdateState;
-            State.Device.StateChanged += (s, e) => OnConnectionChanged();
-            State.Device.ProgramStateChanged += (a, b) => UpdateState();
-            State.Device.TelemetryReceived += t => UpdateSetpointText();
+            State.BedEnabledChanged += UpdateState;
+            Dev.StateChanged += (s, e) => OnConnectionChanged();
+            Dev.ProgramStateChanged += (a, b) => UpdateState();
+            Dev.TelemetryReceived += t => UpdateSetpointText();
 
-            ShowSnapshot(State.Tuning);
+            ShowSnapshot(_ch.Tuning);
             SetFocus(null);
         }
 
@@ -355,7 +365,7 @@ namespace ReflowLink.UI.Pages {
                 if (!edited) row.Box.Value = now;
                 row.Box.Enabled = now.HasValue;
                 row.Controller.Text = now.HasValue
-                    ? (snap.FromController ? "Controller: " : "Factory: ") + p.Format(now.Value)
+                    ? (snap.FromController ? "Controller: " : _ch.IsBed ? "Default: " : "Factory: ") + p.Format(now.Value)
                     : "Not reported";
             }
             UpdateChanges();
@@ -391,19 +401,19 @@ namespace ReflowLink.UI.Pages {
             UpdatePreview();
         }
 
-        private bool ProgramActive => State.Device.IsConnected && State.Device.Last?.State is ProgramState.Running or ProgramState.Hold;
+        private bool ProgramActive => Dev.IsConnected && Dev.Last?.State is ProgramState.Running or ProgramState.Hold;
 
-        private bool IsTuning => State.Device.IsConnected && _shown?.AutoTune == true;
+        private bool IsTuning => Dev.IsConnected && _shown?.AutoTune == true;
 
         /// <summary>True when the values shown were read from the controller on the current connection.</summary>
-        private bool ReadThisConnection => State.Device.IsConnected && _shown != null && _shown.FromController && _readConnection == _connection;
+        private bool ReadThisConnection => Dev.IsConnected && _shown != null && _shown.FromController && _readConnection == _connection;
 
         private void UpdateState() {
             if (_shown == null) return;
-            bool conn = State.Device.IsConnected, busy = State.Busy;
+            bool conn = Dev.IsConnected, busy = State.Busy;
             bool locked = ProgramActive || IsTuning;
             bool fresh = ReadThisConnection;
-            State.AutoTuneRunning = IsTuning;
+            _ch.AutoTuneRunning = IsTuning;
 
             _readAll.Enabled = conn && !busy && !ProgramActive;
             _writeChanges.Enabled = conn && !busy && fresh && !locked && Changes().Count > 0;
@@ -412,11 +422,12 @@ namespace ReflowLink.UI.Pages {
             string when = _shown.ReadAt?.ToString("HH:mm:ss") ?? "";
             int missing = _shown.Values.Count(v => v.Value == null);
             _source.Text = !_shown.FromController
-                    ? conn ? "Connected  ·  factory values shown until the controller is read" : "Not connected  ·  factory values of an ACHI IR6500"
+                    ? conn ? $"Connected  ·  {DefaultsName} shown until the controller is read" : $"Not connected  ·  {DefaultsName}"
                 : fresh ? $"Read from the controller at {when}" + (missing > 0 ? $"  ·  {missing} not reported" : "")
                 : conn ? $"Showing values read at {when} on an earlier connection"
                 : $"Disconnected  ·  values read at {when}";
-            _lockNote.Text = !conn ? "Try changes in the graph. Connect to read and write the controller."
+            _lockNote.Text = !conn && _ch.IsBed && !State.BedEnabled ? "Bed heat control is switched off in Settings. You can still try changes in the graph."
+                : !conn ? $"Try changes in the graph. Connect the {_ch.Name} controller to read and write it."
                 : !fresh ? "Read the controller before writing (Read from controller)."
                 : ProgramActive ? "A program is running: settings can't be changed until it stops."
                 : IsTuning ? "Auto-tune is running: settings can't be changed until it finishes."
@@ -447,7 +458,7 @@ namespace ReflowLink.UI.Pages {
         }
 
         private void UpdateSetpointText() {
-            string text = State.Device.IsConnected && State.Device.Last?.Sp is double sp
+            string text = Dev.IsConnected && Dev.Last?.Sp is double sp
                 ? $"Controller setpoint now: {sp:0.#} °C. Auto-tune works around this temperature, so a setpoint near room temperature won't give useful values."
                 : "Auto-tune works around the controller's current setpoint.";
             if (_tuneSetpoint.Text == text) return;
@@ -458,7 +469,7 @@ namespace ReflowLink.UI.Pages {
         // ==================================================================== connection and reading
 
         private void OnConnectionChanged() {
-            bool conn = State.Device.IsConnected;
+            bool conn = Dev.IsConnected;
             if (conn && !_wasConnected) {
                 _wasConnected = true;
                 _connection++;
@@ -474,22 +485,22 @@ namespace ReflowLink.UI.Pages {
         private void ApplyRead(TuningSnapshot snap, bool replaceEdits) {
             _readConnection = _connection;
             if (replaceEdits) _shown = null;
-            State.SetTuning(snap);
+            _ch.SetTuning(snap);
             if (snap.AutoTune == true && !_tunePoll.Enabled && !_finishing) StartTunePolling();
         }
 
         /// <summary>Reads every setting right after connecting, without dialogs (a station may not report them all).</summary>
         private async Task ReadOnConnect(int connection) {
-            if (!State.Device.IsConnected) return;
-            State.SetStatus("Reading control settings…");
+            if (!Dev.IsConnected) return;
+            State.SetStatus($"Reading {_ch.Name} control settings…");
             try {
-                var snap = await State.Device.RunAsync(d => d.ReadTuning(null, System.Threading.CancellationToken.None));
-                if (connection != _connection || !State.Device.IsConnected) return;
+                var snap = await Dev.RunAsync(d => d.ReadTuning(null, System.Threading.CancellationToken.None));
+                if (connection != _connection || !Dev.IsConnected) return;
                 ApplyRead(snap, replaceEdits: false);
-                State.SetStatus("Control settings read from the controller", StatusKind.Success);
+                State.SetStatus($"{_ch.Name} control settings read", StatusKind.Success);
             } catch (Exception ex) {
-                if (connection != _connection || !State.Device.IsConnected) return;
-                State.SetStatus("Couldn't read the control settings: " + ex.Message, StatusKind.Warning);
+                if (connection != _connection || !Dev.IsConnected) return;
+                State.SetStatus($"Couldn't read the {_ch.Name} control settings: " + ex.Message, StatusKind.Warning);
             }
         }
 
@@ -498,10 +509,10 @@ namespace ReflowLink.UI.Pages {
                 !DarkDialog.Confirm(FindForm(), "Discard your changes?", "Reading the controller replaces the values you've changed but not written.", "Read", "Cancel"))
                 return;
             int connection = _connection;
-            var (ok, snap) = await State.RunAsync("Reading control settings", (d, progress, ct) => d.ReadTuning(progress, ct));
+            var (ok, snap) = await State.RunOnAsync(_ch, $"Reading {_ch.Name} control settings", (d, progress, ct) => d.ReadTuning(progress, ct));
             if (!ok || connection != _connection) return;
             ApplyRead(snap, replaceEdits: true);
-            State.SetStatus("Control settings read from the controller", StatusKind.Success);
+            State.SetStatus($"{_ch.Name} control settings read", StatusKind.Success);
         }
 
         // ==================================================================== writing
@@ -536,7 +547,7 @@ namespace ReflowLink.UI.Pages {
                 return;
 
             int connection = _connection;
-            var (ok, report) = await State.RunAsync("Writing control settings", (d, progress, ct) => {
+            var (ok, report) = await State.RunOnAsync(_ch, $"Writing {_ch.Name} control settings", (d, progress, ct) => {
                 var rep = new WriteReport();
                 for (int i = 0; i < changes.Count; i++) {
                     var (p, _, value) = changes[i];
@@ -584,14 +595,14 @@ namespace ReflowLink.UI.Pages {
 
         private async Task ToggleAutoTune() {
             if (IsTuning) {
-                var (stopped, _) = await State.RunAsync("Stopping auto-tune", d => d.SetAutoTune(false));
+                var (stopped, _) = await State.RunOnAsync(_ch, $"Stopping {_ch.Name} auto-tune", d => d.SetAutoTune(false));
                 if (stopped) {
                     _tuneStopRequested = true;
                     await FinishAutoTune();
                 }
                 return;
             }
-            double? setpoint = State.Device.Last?.Sp;
+            double? setpoint = Dev.Last?.Sp;
             string sp = setpoint is double v ? $"{v:0.#} °C" : "unknown";
             string message =
                 "The controller will drive the heater fully on and off around the current setpoint (" + sp + ") and then replace P, I and D "
@@ -602,14 +613,14 @@ namespace ReflowLink.UI.Pages {
                 + $"Current values: P {Value(TuningCatalog.Proportional)}, I {Value(TuningCatalog.Integral)}, D {Value(TuningCatalog.Derivative)}. Note them down first.";
             if (setpoint is double low && low < 80)
                 message += $"\n\n⚠ The setpoint is only {low:0.#} °C. Tuning this close to room temperature gives values that don't suit soldering temperatures.";
-            if (!DarkDialog.Confirm(FindForm(), "Start auto-tune?", message, "Start auto-tune", "Cancel", danger: true)) return;
+            if (!DarkDialog.Confirm(FindForm(), $"Start {_ch.Name} auto-tune?", message, "Start auto-tune", "Cancel", danger: true)) return;
 
             var before = _shown;
-            var (ok, _) = await State.RunAsync("Starting auto-tune", d => d.SetAutoTune(true));
+            var (ok, _) = await State.RunOnAsync(_ch, $"Starting {_ch.Name} auto-tune", d => d.SetAutoTune(true));
             if (!ok) {
                 // The start may have reached the controller even though the reply was lost: check before giving up.
                 bool? running = null;
-                try { running = await State.Device.RunAsync(d => d.ReadAutoTune()); } catch (Exception) { }
+                try { running = await Dev.RunAsync(d => d.ReadAutoTune()); } catch (Exception) { }
                 if (running != true) {
                     if (running == null)
                         State.SetStatus("Couldn't confirm whether auto-tune started. Check the controller's display.", StatusKind.Warning);
@@ -632,11 +643,11 @@ namespace ReflowLink.UI.Pages {
 
         private async Task PollAutoTune() {
             if (_tunePollBusy || _finishing) return;
-            if (!State.Device.IsConnected) { _tunePoll.Stop(); return; }
+            if (!Dev.IsConnected) { _tunePoll.Stop(); return; }
             if (State.Busy) return;
             _tunePollBusy = true;
             try {
-                bool? on = await State.Device.RunAsync(d => d.ReadAutoTune());
+                bool? on = await Dev.RunAsync(d => d.ReadAutoTune());
                 // The tune may have been stopped from the button while this read was on its way.
                 if (on == false && _tunePoll.Enabled) await FinishAutoTune();
             } catch (Exception) {
@@ -654,11 +665,11 @@ namespace ReflowLink.UI.Pages {
             try {
                 var before = _beforeTune ?? _shown;
                 int connection = _connection;
-                var (ok, snap) = await State.RunAsync("Reading the new control settings", (d, progress, ct) => d.ReadTuning(progress, ct));
+                var (ok, snap) = await State.RunOnAsync(_ch, $"Reading the new {_ch.Name} control settings", (d, progress, ct) => d.ReadTuning(progress, ct));
                 if (connection != _connection) return;
                 if (!ok) {
                     // Couldn't read (busy or a glitch): keep watching and try again on the next poll.
-                    if (State.Device.IsConnected) _tunePoll.Start();
+                    if (Dev.IsConnected) _tunePoll.Start();
                     return;
                 }
                 _beforeTune = null;

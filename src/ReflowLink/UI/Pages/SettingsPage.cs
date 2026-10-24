@@ -8,23 +8,44 @@ using System.Reflection;
 using System.Windows.Forms;
 using ReflowLink.Model;
 using ReflowLink.Protocol;
+using ReflowLink.Services;
 using ReflowLink.UI.Controls;
 
 namespace ReflowLink.UI.Pages {
     [System.ComponentModel.DesignerCategory("Code")]
     public sealed class SettingsPage : PageBase {
-        private readonly ModernDropDown _port, _baud, _simSpeed, _unused, _station, _rampUnit, _dwellUnit;
-        private readonly ThemedLabel _stationControls, _stationNotes, _controllerLimit, _limitWarning;
-        private bool _committingLimit;
-        private readonly NumberBox _address, _timeout, _retries, _poll, _maxTemp, _afterRun;
-        private readonly ToggleSwitch _dtr, _rts, _sim, _verify, _autoRecord;
+        /// <summary>The controls of one controller's connection card.</summary>
+        private sealed class ConnectionCard {
+            public IConnectionSettings Settings;
+            public ControllerChannel Channel;
+            public CardPanel Card;
+            public TableLayoutPanel Form;
+            public ModernDropDown Port, Baud, SimSpeed;
+            public ThemedLabel Hint;
+        }
+
+        /// <summary>The controls of one controller's limit card (Top IR Profiles / Bed Heat Profiles).</summary>
+        private sealed class LimitCard {
+            public ControllerChannel Channel;
+            public CardPanel Card;
+            public TableLayoutPanel Form;
+            public NumberBox MaxTemp;
+            public ThemedLabel ControllerLimit, Warning;
+            public bool Committing;
+        }
+
+        private readonly ModernDropDown _unused, _bedUnused, _station, _rampUnit, _dwellUnit, _bedRamp, _bedDwell;
+        private readonly ThemedLabel _stationControls, _stationNotes;
+        private readonly ToggleSwitch _useBed, _verify, _bedVerify, _autoRecord;
+        private readonly NumberBox _afterRun;
         private readonly ModernTextBox _folder;
-        private readonly ThemedLabel _connHint;
+        private readonly ConnectionCard _irConn, _bedConn;
+        private readonly LimitCard _irLimit, _bedLimit;
         private bool _loading;
 
         private static readonly double[] SimSpeeds = [1, 2, 5, 10, 20];
 
-        public SettingsPage(AppState state) : base(state, "Settings", "Connection, profile and logging options") {
+        public SettingsPage(AppState state) : base(state, "Settings", "Station, connections, profile limits and logging") {
             var s = State.Settings;
             _loading = true;
 
@@ -51,6 +72,21 @@ namespace ReflowLink.UI.Pages {
                 s.GenericDwellUnit = _dwellUnit.SelectedIndex == 1 ? DwellUnit.Minutes : DwellUnit.Seconds;
                 State.ApplyStation();
             };
+            _useBed = new ToggleSwitch("Use Bed Heat Control") { Checked = s.Bed.Enabled, Margin = Padding.Empty };
+            _useBed.CheckedChanged += (o, e) => {
+                if (_loading) return;
+                bool bedRunning = State.Bed.IsConnected && State.Bed.Last?.State is ProgramState.Running or ProgramState.Hold;
+                if (!_useBed.Checked && bedRunning &&
+                    !DarkDialog.Confirm(FindForm(), "Switch off bed heat control?",
+                        "The bed controller is running a program. Switching off disconnects it: it keeps running on its own, but ReflowLink can no longer keep the heaters in step or stop it.",
+                        "Switch off", "Cancel", danger: true)) {
+                    _loading = true;
+                    _useBed.Checked = true;
+                    _loading = false;
+                    return;
+                }
+                State.SetBedEnabled(_useBed.Checked);
+            };
 
             var station = Card("Station", "Which reflow / rework station the PC410 is in");
             var stf = Form(station);
@@ -59,86 +95,47 @@ namespace ReflowLink.UI.Pages {
             Row(stf, "Ramp rate unit", _rampUnit, "Profiles are always edited in °C/s.");
             Row(stf, "Hold time unit", _dwellUnit, "Profiles are always edited in seconds.");
             Row(stf, "", _stationNotes, null);
+            Row(stf, "Bed heat", _useBed, "A second PC410 controls the bottom heater. Switches on the Bed Heat connection, profile columns, console and control tuning.");
             FitCard(station, stf);
 
-            // ---------------------------------------------------------------- connection
-            _port = new ModernDropDown { Width = Theme.S(200) };
-            var refresh = new ModernButton("", Glyph.Refresh) { Margin = new Padding(Theme.S(8), 0, 0, 0) };
-            refresh.Click += (o, e) => RefreshPorts();
-            Theme.CreateToolTip().SetToolTip(refresh, "Refresh the list of serial ports");
-            var portRow = Flow();
-            portRow.Controls.Add(_port);
-            portRow.Controls.Add(refresh);
-            _port.Margin = Padding.Empty;
-            _port.SelectedIndexChanged += (o, e) => {
-                if (_loading || _port.SelectedItem == null || _port.SelectedItem.StartsWith("No serial", StringComparison.Ordinal)) return;
-                s.PortName = _port.SelectedItem.Split(' ')[0];
-                Changed();
+            // ---------------------------------------------------------------- connections
+            _irConn = BuildConnection("Top IR Connection", "Serial link to the PC410 that controls the top IR heater", s, State.Ir);
+            _bedRamp = new ModernDropDown { Width = Theme.S(180) };
+            _bedRamp.SetItems(["°C per second", "°C per minute"], s.Bed.RampUnit == RampUnit.PerMinute ? 1 : 0);
+            _bedRamp.SelectedIndexChanged += (o, e) => {
+                if (_loading) return;
+                s.Bed.RampUnit = _bedRamp.SelectedIndex == 1 ? RampUnit.PerMinute : RampUnit.PerSecond;
+                State.ApplyStation();
             };
-
-            _baud = new ModernDropDown { Width = Theme.S(200) };
-            _baud.SetItems(Pc410Protocol.StandardBaudRates.Select(b => b + " baud"), Math.Max(0, Array.IndexOf(Pc410Protocol.StandardBaudRates, s.BaudRate)));
-            _baud.SelectedIndexChanged += (o, e) => { s.BaudRate = Pc410Protocol.StandardBaudRates[_baud.SelectedIndex]; Changed(); };
-
-            _address = Num(0, 99, 0, 1, s.Address, "", v => s.Address = (int)v);
-            _timeout = Num(100, 5000, 0, 50, s.ResponseTimeoutMs, "ms", v => s.ResponseTimeoutMs = (int)v);
-            _retries = Num(0, 5, 0, 1, s.Retries, "", v => s.Retries = (int)v);
-            _poll = Num(200, 10000, 0, 100, s.PollIntervalMs, "ms", v => { s.PollIntervalMs = (int)v; State.Device.PollIntervalMs = (int)v; });
-            _dtr = Toggle("DTR on", s.DtrEnable, v => s.DtrEnable = v);
-            _rts = Toggle("RTS on", s.RtsEnable, v => s.RtsEnable = v);
-            var lines = Flow();
-            lines.Controls.Add(_dtr);
-            lines.Controls.Add(_rts);
-            _dtr.Margin = new Padding(0, 0, Theme.S(20), 0);
-
-            _sim = Toggle("Use built-in simulator", s.UseSimulator, v => { s.UseSimulator = v; _simSpeed.Enabled = v; });
-            _simSpeed = new ModernDropDown { Width = Theme.S(120), Enabled = s.UseSimulator, Margin = new Padding(Theme.S(16), 0, 0, 0) };
-            _simSpeed.SetItems(SimSpeeds.Select(v => v + "× speed"), Math.Max(0, Array.IndexOf(SimSpeeds, s.SimulatorSpeed)));
-            _simSpeed.SelectedIndexChanged += (o, e) => { s.SimulatorSpeed = SimSpeeds[_simSpeed.SelectedIndex]; Changed(); };
-            var simRow = Flow();
-            simRow.Controls.Add(_sim);
-            simRow.Controls.Add(_simSpeed);
-            _sim.Margin = new Padding(0, Theme.S(3), 0, 0);
-
-            _connHint = new ThemedLabel("", Theme.Small, Theme.Yellow) { AutoSize = true, MaximumSize = new Size(Theme.S(320), 0) };
-
-            var conn = Card("Connection", "Serial link to the PC410 controller");
-            var cf = Form(conn);
-            Row(cf, "Serial port", portRow, "USB-to-RS232 adapters appear as COM ports.");
-            Row(cf, "Baud rate", _baud, "Must match the controller's communication setting.");
-            Row(cf, "Data format", new ThemedLabel("7 data bits · even parity · 1 stop bit", Theme.Body, Theme.Text), "Fixed: required by the PC410 protocol.");
-            Row(cf, "Device address", _address, "Controller address 0–99 (often 1).");
-            Row(cf, "Response timeout", _timeout, null);
-            Row(cf, "Retries", _retries, null);
-            Row(cf, "Poll interval", _poll, "How often PV / SP / output are read.");
-            Row(cf, "Control lines", lines, "Some isolated RS232 adapters are powered from DTR/RTS.");
-            Row(cf, "Simulator", simRow, "Try the software without the station connected.");
-            Row(cf, "", _connHint, null);
-            FitCard(conn, cf);
-
-            // ---------------------------------------------------------------- profiles
-            _maxTemp = new NumberBox(50, 400, 0, 5) {
-                Suffix = "°C",
-                Width = Theme.S(130),
-                Margin = Padding.Empty,
-                Value = s.MaxTemperature,
+            _bedDwell = new ModernDropDown { Width = Theme.S(180) };
+            _bedDwell.SetItems(["Seconds", "Minutes"], s.Bed.DwellUnit == DwellUnit.Minutes ? 1 : 0);
+            _bedDwell.SelectedIndexChanged += (o, e) => {
+                if (_loading) return;
+                s.Bed.DwellUnit = _bedDwell.SelectedIndex == 1 ? DwellUnit.Minutes : DwellUnit.Seconds;
+                State.ApplyStation();
             };
-            _maxTemp.Committed += (o, e) => CommitMaxTemperature();
-            _controllerLimit = WrapLabel(Theme.Body, Theme.TextDim, 1);
-            _limitWarning = WrapLabel(Theme.Small, Theme.Yellow, 2);
+            _bedConn = BuildConnection("Bed Heat Connection", "Serial link to the second PC410 that controls the bottom heater", s.Bed, State.BedChannel,
+                ("Ramp rate unit", _bedRamp, "How the bed PC410 reads ramp rates. ACHI-style controllers use °C per second."),
+                ("Hold time unit", _bedDwell, "How the bed PC410 reads hold times."));
+
+            // ---------------------------------------------------------------- profile limits
+            _irLimit = BuildLimit("Top IR Profiles", "Limits and how profiles are written", State.Ir, s.MaxTemperature);
             _unused = new ModernDropDown { Width = Theme.S(260) };
             _unused.SetItems(["Write zeros (recommended)", "Write END marker"], s.UnusedSteps == UnusedStepMode.EndMarker ? 1 : 0);
             _unused.SelectedIndexChanged += (o, e) => { s.UnusedSteps = _unused.SelectedIndex == 1 ? UnusedStepMode.EndMarker : UnusedStepMode.Zeros; Changed(); };
             _verify = Toggle("Read back and compare", s.VerifyAfterWrite, v => s.VerifyAfterWrite = v);
+            Row(_irLimit.Form, "Unused steps", _unused, "How segments after the last step are cleared.");
+            Row(_irLimit.Form, "Verify after write", _verify, null);
+            FitCard(_irLimit.Card, _irLimit.Form);
 
-            var prof = Card("Profiles", "Limits and how profiles are written");
-            var pf = Form(prof);
-            Row(pf, "Maximum temperature", _maxTemp, "Defaults to the controller's factory setpoint limit (SPH). Raising it here doesn't change the controller.");
-            Row(pf, "Controller limit", _controllerLimit, null);
-            Row(pf, "", _limitWarning, null);
-            Row(pf, "Unused steps", _unused, "How segments after the last step are cleared.");
-            Row(pf, "Verify after write", _verify, null);
-            FitCard(prof, pf);
+            _bedLimit = BuildLimit("Bed Heat Profiles", "Limits and how bed profiles are written", State.BedChannel, s.Bed.MaxTemperature);
+            _bedUnused = new ModernDropDown { Width = Theme.S(260) };
+            _bedUnused.SetItems(["Write zeros (recommended)", "Write END marker"], s.Bed.UnusedSteps == UnusedStepMode.EndMarker ? 1 : 0);
+            _bedUnused.SelectedIndexChanged += (o, e) => { s.Bed.UnusedSteps = _bedUnused.SelectedIndex == 1 ? UnusedStepMode.EndMarker : UnusedStepMode.Zeros; Changed(); };
+            _bedVerify = Toggle("Read back and compare", s.Bed.VerifyAfterWrite, v => s.Bed.VerifyAfterWrite = v);
+            Row(_bedLimit.Form, "Unused steps", _bedUnused, "How segments after the last step are cleared on the bed controller.");
+            Row(_bedLimit.Form, "Verify after write", _bedVerify, null);
+            FitCard(_bedLimit.Card, _bedLimit.Form);
 
             // ---------------------------------------------------------------- logging
             _autoRecord = Toggle("Record every run automatically", s.AutoRecordRuns, v => s.AutoRecordRuns = v);
@@ -156,7 +153,7 @@ namespace ReflowLink.UI.Pages {
             var folderRow = Flow();
             folderRow.Controls.AddRange([_folder, browse, open]);
 
-            var log = Card("Logging", "CSV files with timestamp, PV, SP, output and state");
+            var log = Card("Logging", "CSV files with timestamp, temperatures, setpoints, output and state");
             var lf = Form(log);
             Row(lf, "Auto-record", _autoRecord, null);
             Row(lf, "Keep recording after run", _afterRun, "Captures the cool-down after the program ends.");
@@ -168,43 +165,18 @@ namespace ReflowLink.UI.Pages {
             var aboutCard = Card("About", "");
             aboutCard.Controls.Add(about);
             about.BringToFront();
+            aboutCard.Height = Theme.S(250);
 
             // ---------------------------------------------------------------- layout
-            var grid = Table(2, 2);
+            var grid = Table(2, 1);
             grid.Dock = DockStyle.Top;
             grid.AutoSize = true;
             grid.AutoSizeMode = AutoSizeMode.GrowAndShrink;
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
             grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-
-            var rightCol = Table(1, 3);
-            rightCol.Dock = DockStyle.Fill;
-            rightCol.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            for (int i = 0; i < 3; i++) rightCol.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            prof.Dock = DockStyle.Top; log.Dock = DockStyle.Top; aboutCard.Dock = DockStyle.Top;
-            prof.Margin = new Padding(Theme.S(8), 0, 0, Theme.S(16));
-            log.Margin = new Padding(Theme.S(8), 0, 0, Theme.S(16));
-            aboutCard.Margin = new Padding(Theme.S(8), 0, 0, 0);
-            aboutCard.Height = Theme.S(250);
-            rightCol.Controls.Add(prof, 0, 0);
-            rightCol.Controls.Add(log, 0, 1);
-            rightCol.Controls.Add(aboutCard, 0, 2);
-            var leftCol = Table(1, 2);
-            leftCol.Dock = DockStyle.Fill;
-            leftCol.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            for (int i = 0; i < 2; i++) leftCol.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            station.Dock = DockStyle.Top;
-            station.Margin = new Padding(0, 0, Theme.S(8), Theme.S(16));
-            conn.Dock = DockStyle.Top;
-            conn.Margin = new Padding(0, 0, Theme.S(8), 0);
-            leftCol.Controls.Add(station, 0, 0);
-            leftCol.Controls.Add(conn, 0, 1);
-            leftCol.Height = station.Height + conn.Height + Theme.S(16);
-            grid.Controls.Add(leftCol, 0, 0);
-            grid.Controls.Add(rightCol, 1, 0);
-            rightCol.Height = prof.Height + log.Height + aboutCard.Height + Theme.S(32);
+            grid.Controls.Add(Column(true, station, _irConn.Card, _bedConn.Card), 0, 0);
+            grid.Controls.Add(Column(false, _irLimit.Card, _bedLimit.Card, log, aboutCard), 1, 0);
 
             var scroller = new Panel {
                 Dock = DockStyle.Fill,
@@ -216,39 +188,122 @@ namespace ReflowLink.UI.Pages {
             scroller.Controls.Add(grid);
             Controls.Add(scroller);
 
-            State.Device.StateChanged += (o, e) => { UpdateHint(); UpdateLimitInfo(); };
+            State.Device.StateChanged += (o, e) => { UpdateHints(); UpdateLimitInfo(_irLimit); };
+            State.Bed.StateChanged += (o, e) => { UpdateHints(); UpdateLimitInfo(_bedLimit); };
             State.StationChanged += ShowStation;
-            RefreshPorts();
+            State.BedEnabledChanged += ShowBedEnabled;
+            RefreshPorts(_irConn);
+            RefreshPorts(_bedConn);
             ShowStation();
+            ShowBedEnabled();
             _loading = false;
-            UpdateHint();
+            UpdateHints();
         }
 
-        // ---------------------------------------------------------------- helpers
+        // ---------------------------------------------------------------- builders
+
+        private ConnectionCard BuildConnection(string title, string subtitle, IConnectionSettings cs, ControllerChannel channel,
+            params (string Label, Control Control, string Hint)[] extra) {
+            var c = new ConnectionCard { Settings = cs, Channel = channel };
+            c.Port = new ModernDropDown { Width = Theme.S(200), Margin = Padding.Empty };
+            var refresh = new ModernButton("", Glyph.Refresh) { Margin = new Padding(Theme.S(8), 0, 0, 0) };
+            refresh.Click += (o, e) => RefreshPorts(c);
+            Theme.CreateToolTip().SetToolTip(refresh, "Refresh the list of serial ports");
+            var portRow = Flow();
+            portRow.Controls.Add(c.Port);
+            portRow.Controls.Add(refresh);
+            c.Port.SelectedIndexChanged += (o, e) => {
+                if (_loading || c.Port.SelectedItem == null || c.Port.SelectedItem.StartsWith("No serial", StringComparison.Ordinal)) return;
+                cs.PortName = c.Port.SelectedItem.Split(' ')[0];
+                Changed();
+            };
+
+            c.Baud = new ModernDropDown { Width = Theme.S(200) };
+            c.Baud.SetItems(Pc410Protocol.StandardBaudRates.Select(b => b + " baud"), Math.Max(0, Array.IndexOf(Pc410Protocol.StandardBaudRates, cs.BaudRate)));
+            c.Baud.SelectedIndexChanged += (o, e) => { cs.BaudRate = Pc410Protocol.StandardBaudRates[c.Baud.SelectedIndex]; Changed(); };
+
+            var address = Num(0, 99, 0, 1, cs.Address, "", v => cs.Address = (int)v);
+            var timeout = Num(100, 5000, 0, 50, cs.ResponseTimeoutMs, "ms", v => cs.ResponseTimeoutMs = (int)v);
+            var retries = Num(0, 5, 0, 1, cs.Retries, "", v => cs.Retries = (int)v);
+            var poll = Num(200, 10000, 0, 100, cs.PollIntervalMs, "ms", v => { cs.PollIntervalMs = (int)v; channel.Device.PollIntervalMs = (int)v; });
+            var dtr = Toggle("DTR on", cs.DtrEnable, v => cs.DtrEnable = v);
+            var rts = Toggle("RTS on", cs.RtsEnable, v => cs.RtsEnable = v);
+            var lines = Flow();
+            lines.Controls.Add(dtr);
+            lines.Controls.Add(rts);
+            dtr.Margin = new Padding(0, 0, Theme.S(20), 0);
+
+            var sim = Toggle("Use built-in simulator", cs.UseSimulator, v => { cs.UseSimulator = v; c.SimSpeed.Enabled = v && c.Form.Enabled; });
+            c.SimSpeed = new ModernDropDown { Width = Theme.S(120), Enabled = cs.UseSimulator, Margin = new Padding(Theme.S(16), 0, 0, 0) };
+            c.SimSpeed.SetItems(SimSpeeds.Select(v => v + "× speed"), Math.Max(0, Array.IndexOf(SimSpeeds, cs.SimulatorSpeed)));
+            c.SimSpeed.SelectedIndexChanged += (o, e) => { cs.SimulatorSpeed = SimSpeeds[c.SimSpeed.SelectedIndex]; Changed(); };
+            var simRow = Flow();
+            simRow.Controls.Add(sim);
+            simRow.Controls.Add(c.SimSpeed);
+            sim.Margin = new Padding(0, Theme.S(3), 0, 0);
+
+            c.Hint = new ThemedLabel("", Theme.Small, Theme.Yellow) { AutoSize = true, MaximumSize = new Size(Theme.S(320), 0) };
+
+            c.Card = Card(title, subtitle);
+            c.Form = Form(c.Card);
+            Row(c.Form, "Serial port", portRow, "USB-to-RS232 adapters appear as COM ports. Each PC410 needs its own port.");
+            Row(c.Form, "Baud rate", c.Baud, "Must match the controller's communication setting.");
+            Row(c.Form, "Data format", new ThemedLabel("7 data bits · even parity · 1 stop bit", Theme.Body, Theme.Text), "Fixed: required by the PC410 protocol.");
+            Row(c.Form, "Device address", address, "Controller address 0–99 (often 1).");
+            Row(c.Form, "Response timeout", timeout, null);
+            Row(c.Form, "Retries", retries, null);
+            Row(c.Form, "Poll interval", poll, "How often PV / SP / output are read.");
+            Row(c.Form, "Control lines", lines, "Some isolated RS232 adapters are powered from DTR/RTS.");
+            Row(c.Form, "Simulator", simRow, "Try the software without the station connected.");
+            foreach (var (label, control, hint) in extra) Row(c.Form, label, control, hint);
+            Row(c.Form, "", c.Hint, null);
+            FitCard(c.Card, c.Form);
+            return c;
+        }
+
+        private LimitCard BuildLimit(string title, string subtitle, ControllerChannel channel, double value) {
+            var l = new LimitCard { Channel = channel };
+            l.MaxTemp = new NumberBox(50, 400, 0, 5) {
+                Suffix = "°C",
+                Width = Theme.S(130),
+                Margin = Padding.Empty,
+                Value = value,
+            };
+            l.MaxTemp.Committed += (o, e) => CommitMaxTemperature(l);
+            l.ControllerLimit = WrapLabel(Theme.Body, Theme.TextDim, 1);
+            l.Warning = WrapLabel(Theme.Small, Theme.Yellow, 2);
+            l.Card = Card(title, subtitle);
+            l.Form = Form(l.Card);
+            Row(l.Form, "Maximum temperature", l.MaxTemp,
+                (channel.IsBed ? "Highest bed target allowed." : "Highest IR target allowed.") + " Defaults to the controller's factory setpoint limit (SPH). Raising it here doesn't change the controller.");
+            Row(l.Form, "Controller limit", l.ControllerLimit, null);
+            Row(l.Form, "", l.Warning, null);
+            return l;
+        }
+
+        /// <summary>One settings column: cards stacked from the top, with the column height set to fit them.</summary>
+        private static TableLayoutPanel Column(bool left, params CardPanel[] cards) {
+            var col = Table(1, cards.Length);
+            col.Dock = DockStyle.Fill;
+            col.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            int height = 0;
+            for (int i = 0; i < cards.Length; i++) {
+                col.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                var card = cards[i];
+                card.Dock = DockStyle.Top;
+                int bottom = i < cards.Length - 1 ? Theme.S(16) : 0;
+                card.Margin = left ? new Padding(0, 0, Theme.S(8), bottom) : new Padding(Theme.S(8), 0, 0, bottom);
+                col.Controls.Add(card, 0, i);
+                height += card.Height + bottom;
+            }
+            col.Height = height;
+            return col;
+        }
 
         private static ThemedLabel WrapLabel(Font font, Color color, int lines) => new("", font, color) {
             AutoSize = false,
             Size = new Size(Theme.S(330), font.Height * lines + Theme.S(4)),
         };
-
-        /// <summary>Shows the selected station's details, units and temperature limit.</summary>
-        private void ShowStation() {
-            var s = State.Settings;
-            var station = s.Station;
-            var units = s.Units;
-            bool wasLoading = _loading;
-            _loading = true;
-            _station.SelectedIndex = StationCatalog.IndexOf(station.Id);
-            _stationControls.Text = station.Controls;
-            _stationNotes.Text = station.Notes;
-            _rampUnit.SelectedIndex = units.Ramp == RampUnit.PerMinute ? 1 : 0;
-            _dwellUnit.SelectedIndex = units.Dwell == DwellUnit.Minutes ? 1 : 0;
-            _rampUnit.Enabled = _dwellUnit.Enabled = station.CustomUnits;
-            _maxTemp.Value = s.MaxTemperature;
-            _loading = wasLoading;
-            UpdateLimitInfo();
-            UpdateHint();
-        }
 
         private NumberBox Num(double min, double max, int decimals, double step, double value, string suffix, Action<double> apply) {
             var n = new NumberBox(min, max, decimals, step) {
@@ -321,17 +376,61 @@ namespace ReflowLink.UI.Pages {
             t.RowCount = r + 1;
         }
 
-        private void RefreshPorts() {
+        // ---------------------------------------------------------------- behaviour
+
+        /// <summary>Shows the selected station's details, units and temperature limit.</summary>
+        private void ShowStation() {
             var s = State.Settings;
-            var ports = SerialTransport.GetPortNames().ToList();
-            if (!string.IsNullOrEmpty(s.PortName) && !ports.Contains(s.PortName)) ports.Add(s.PortName + "  (not present)");
+            var station = s.Station;
+            var units = s.Units;
             bool wasLoading = _loading;
             _loading = true;
-            if (ports.Count == 0) _port.SetItems(["No serial ports found"], 0);
+            _station.SelectedIndex = StationCatalog.IndexOf(station.Id);
+            _stationControls.Text = station.Controls;
+            _stationNotes.Text = station.Notes;
+            _rampUnit.SelectedIndex = units.Ramp == RampUnit.PerMinute ? 1 : 0;
+            _dwellUnit.SelectedIndex = units.Dwell == DwellUnit.Minutes ? 1 : 0;
+            _rampUnit.Enabled = _dwellUnit.Enabled = station.CustomUnits;
+            _irLimit.MaxTemp.Value = s.MaxTemperature;
+            _bedLimit.MaxTemp.Value = s.Bed.MaxTemperature;
+            _loading = wasLoading;
+            UpdateLimitInfo(_irLimit);
+            UpdateLimitInfo(_bedLimit);
+            UpdateHints();
+        }
+
+        /// <summary>Greys out the bed heat cards while "Use Bed Heat Control" is off.</summary>
+        private void ShowBedEnabled() {
+            bool on = State.BedEnabled;
+            bool wasLoading = _loading;
+            _loading = true;
+            _useBed.Checked = on;
+            _loading = wasLoading;
+            _bedConn.Form.Enabled = on;
+            _bedConn.SimSpeed.Enabled = on && State.Settings.Bed.UseSimulator;
+            _bedLimit.Form.Enabled = on;
+            _bedConn.Card.Invalidate(true);
+            _bedLimit.Card.Invalidate(true);
+            UpdateLimitInfo(_bedLimit);
+            UpdateHints();
+        }
+
+        private void RefreshPorts(ConnectionCard c) {
+            var cs = c.Settings;
+            var ports = SerialTransport.GetPortNames().ToList();
+            if (!string.IsNullOrEmpty(cs.PortName) && !ports.Contains(cs.PortName)) ports.Add(cs.PortName + "  (not present)");
+            bool wasLoading = _loading;
+            _loading = true;
+            if (ports.Count == 0) c.Port.SetItems(["No serial ports found"], 0);
             else {
-                int idx = ports.FindIndex(p => p.Split(' ')[0] == s.PortName);
-                _port.SetItems(ports, Math.Max(0, idx));
-                if (idx < 0 && string.IsNullOrEmpty(s.PortName)) s.PortName = ports[0].Split(' ')[0];
+                int idx = ports.FindIndex(p => p.Split(' ')[0] == cs.PortName);
+                if (idx < 0 && string.IsNullOrEmpty(cs.PortName)) {
+                    // Suggest a port the other controller doesn't use.
+                    string other = c.Channel.IsBed ? State.Settings.PortName : State.Settings.Bed.PortName;
+                    idx = Math.Max(0, ports.FindIndex(p => !string.Equals(p.Split(' ')[0], other, StringComparison.OrdinalIgnoreCase)));
+                    cs.PortName = ports[idx].Split(' ')[0];
+                }
+                c.Port.SetItems(ports, Math.Max(0, idx));
             }
             _loading = wasLoading;
         }
@@ -344,60 +443,70 @@ namespace ReflowLink.UI.Pages {
             Changed();
         }
 
+        private double GetMax(LimitCard l) => l.Channel.IsBed ? State.Settings.Bed.MaxTemperature : State.Settings.MaxTemperature;
+
+        private void SetMax(LimitCard l, double value) {
+            if (l.Channel.IsBed) State.Settings.Bed.MaxTemperature = value;
+            else State.Settings.MaxTemperature = value;
+        }
+
         /// <summary>
-        /// Applies a new maximum temperature. Raising it above the station's factory setpoint limit asks for confirmation,
-        /// because the controller's own setpoint limit (HS) still applies.
+        /// Applies a new maximum temperature. Raising it above the factory setpoint limit asks for confirmation, because the
+        /// controller's own setpoint limit (HS) still applies.
         /// </summary>
-        private void CommitMaxTemperature() {
-            if (_loading || _committingLimit) return;
-            var s = State.Settings;
-            if (_maxTemp.Value is not double value || !_maxTemp.IsValid) {
-                ShowMaxTemperature();
+        private void CommitMaxTemperature(LimitCard l) {
+            if (_loading || l.Committing) return;
+            if (l.MaxTemp.Value is not double value || !l.MaxTemp.IsValid) {
+                ShowMaxTemperature(l);
                 return;
             }
-            if (Math.Abs(value - s.MaxTemperature) < 0.01) return;
+            double current = GetMax(l);
+            if (Math.Abs(value - current) < 0.01) return;
 
-            double factory = s.Station.MaxTemperature;
-            if (value > factory && value > s.MaxTemperature) {
-                string hs = State.Device.ControllerLimits.High is double h
+            double factory = l.Channel.IsBed ? StationModel.DefaultMaxTemperature : State.Settings.Station.MaxTemperature;
+            if (value > factory && value > current) {
+                string hs = l.Channel.Device.ControllerLimits.High is double h
                     ? $"\n\nThis controller currently reports HS = {h:0.#} °C."
                     : "";
+                string who = l.Channel.IsBed ? "A PC410" : $"The {State.Settings.Station.Name}'s controller";
                 string message =
-                    $"The {s.Station.Name}'s controller ships with its setpoint limit (SPH) at {factory:0.#} °C.\n\n" +
-                    "Raising the limit in ReflowLink doesn't change the controller. Unless you also raise the controller's own " +
+                    $"{who} ships with its setpoint limit (SPH) at {factory:0.#} °C.\n\n" +
+                    $"Raising the limit in ReflowLink doesn't change the {l.Channel.Name} controller. Unless you also raise its own " +
                     "setpoint limit (HS), it will reject targets above it, and ReflowLink will refuse to write or start those profiles." + hs;
-                _committingLimit = true; // the dialog takes focus, which would commit again
-                bool raise = DarkDialog.Confirm(FindForm(), $"Raise the limit to {value:0.#} °C?", message, "Raise limit", "Cancel", danger: true);
-                _committingLimit = false;
+                l.Committing = true; // the dialog takes focus, which would commit again
+                bool raise = DarkDialog.Confirm(FindForm(), $"Raise the {l.Channel.Name} limit to {value:0.#} °C?", message, "Raise limit", "Cancel", danger: true);
+                l.Committing = false;
                 if (!raise) {
-                    ShowMaxTemperature();
+                    ShowMaxTemperature(l);
                     return;
                 }
             }
-            s.MaxTemperature = value;
+            SetMax(l, value);
             State.ApplyStation(); // saves and refreshes the pages that validate against the limit
-            UpdateLimitInfo();
+            UpdateLimitInfo(l);
         }
 
-        private void ShowMaxTemperature() {
+        private void ShowMaxTemperature(LimitCard l) {
             bool wasLoading = _loading;
             _loading = true;
-            _maxTemp.Value = State.Settings.MaxTemperature;
+            l.MaxTemp.Value = GetMax(l);
             _loading = wasLoading;
         }
 
         /// <summary>Shows the controller's setpoint limits and warns when ReflowLink's limit is above HS.</summary>
-        private void UpdateLimitInfo() {
-            var device = State.Device;
+        private void UpdateLimitInfo(LimitCard l) {
+            var device = l.Channel.Device;
             var limits = device.ControllerLimits;
-            if (!device.IsConnected) {
-                _controllerLimit.Text = "Read from the controller when you connect.";
+            if (l.Channel.IsBed && !State.BedEnabled) {
+                l.ControllerLimit.Text = "Bed heat control is off.";
+            } else if (!device.IsConnected) {
+                l.ControllerLimit.Text = "Read from the controller when you connect.";
             } else if (limits.High is double high) {
-                _controllerLimit.Text = $"HS {high:0.#} °C" + (limits.Low is double low ? $"  ·  LS {low:0.#} °C" : "") + "  (read from the controller)";
+                l.ControllerLimit.Text = $"HS {high:0.#} °C" + (limits.Low is double low ? $"  ·  LS {low:0.#} °C" : "") + "  (read from the controller)";
             } else {
-                _controllerLimit.Text = "Not reported by this controller.";
+                l.ControllerLimit.Text = "Not reported by this controller.";
             }
-            _limitWarning.Text = device.IsConnected && limits.High is double hs && State.Settings.MaxTemperature > hs + 0.05
+            l.Warning.Text = device.IsConnected && limits.High is double hs && GetMax(l) > hs + 0.05
                 ? $"ReflowLink's limit is above the controller's HS: targets above {hs:0.#} °C will be refused."
                 : "";
         }
@@ -405,19 +514,24 @@ namespace ReflowLink.UI.Pages {
         private void Changed() {
             if (_loading) return;
             State.Settings.Save();
-            UpdateHint();
+            UpdateHints();
         }
 
-        private void UpdateHint() {
-            _connHint.Text = State.Device.IsConnected
-                ? State.Device.IsSimulator
-                    ? "Connected — connection and simulator unit changes take effect the next time you connect."
-                    : "Connected — connection changes take effect the next time you connect."
-                : "";
+        private void UpdateHints() {
+            foreach (var c in new[] { _irConn, _bedConn }) {
+                if (c == null) continue;
+                var device = c.Channel.Device;
+                c.Hint.Text = device.IsConnected
+                    ? device.IsSimulator
+                        ? "Connected — connection and simulator unit changes take effect the next time you connect."
+                        : "Connected — connection changes take effect the next time you connect."
+                    : "";
+            }
         }
 
         public override void OnShown() {
-            if (!State.Device.IsConnected) RefreshPorts();
+            if (!State.Device.IsConnected) RefreshPorts(_irConn);
+            if (!State.Bed.IsConnected) RefreshPorts(_bedConn);
         }
     }
 

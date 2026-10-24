@@ -10,16 +10,30 @@ using System.Xml.Serialization;
 
 namespace ReflowLink.Model {
     public sealed class ProfileStep {
-        /// <summary>Ramp rate in °C per second.</summary>
+        private double _bedTarget = double.NaN;
+
+        /// <summary>Ramp rate in °C per second (used by both controllers).</summary>
         [XmlAttribute("ramp")] public double RampRate { get; set; } = 1.0;
-        /// <summary>Target (level) temperature in °C.</summary>
+        /// <summary>Top IR target (level) temperature in °C.</summary>
         [XmlAttribute("target")] public double Target { get; set; } = 150;
-        /// <summary>Dwell (hold) time at target in seconds.</summary>
+        /// <summary>Bed heat target in °C. Profiles saved before bed heat control read it as the IR target.</summary>
+        [XmlAttribute("bedTarget")]
+        public double BedTarget { get => double.IsNaN(_bedTarget) ? Target : _bedTarget; set => _bedTarget = value; }
+        /// <summary>Dwell (hold) time at target in seconds (used by both controllers).</summary>
         [XmlAttribute("hold")] public int HoldSeconds { get; set; } = 30;
+        /// <summary>During this step the IR is held while the bed is behind.</summary>
+        [XmlAttribute("waitForBed")] public bool WaitForBed { get; set; }
+        /// <summary>During this step the bed is held while the IR is behind.</summary>
+        [XmlAttribute("waitForIr")] public bool WaitForIr { get; set; }
 
         public ProfileStep() { }
         public ProfileStep(double ramp, double target, int hold) { RampRate = ramp; Target = target; HoldSeconds = hold; }
-        public ProfileStep Clone() => new(RampRate, Target, HoldSeconds);
+
+        public ProfileStep Clone() => new(RampRate, Target, HoldSeconds) {
+            BedTarget = BedTarget,
+            WaitForBed = WaitForBed,
+            WaitForIr = WaitForIr,
+        };
     }
 
     [XmlRoot("ReflowProfile")]
@@ -38,6 +52,8 @@ namespace ReflowLink.Model {
         /// pattern. Null only in files saved by older versions; the editor then uses <see cref="HoldbackDefault"/>.
         /// </summary>
         public double? Holdback { get; set; }
+        /// <summary>Holdback band (°C) of the bed heat controller; also used to decide when the bed is behind.</summary>
+        public double? BedHoldback { get; set; }
         [XmlArray("Steps"), XmlArrayItem("Step")]
         public List<ProfileStep> Steps { get; set; } = [];
 
@@ -46,10 +62,40 @@ namespace ReflowLink.Model {
             Name = Name,
             Notes = Notes,
             Holdback = Holdback,
+            BedHoldback = BedHoldback,
             Steps = [.. Steps.Select(s => s.Clone())],
         };
 
-        public IEnumerable<string> Validate(double maxTemperature) {
+        /// <summary>The profile as the bed heat controller runs it: same ramps and holds, bed targets and holdback.</summary>
+        public ReflowProfile ForBed() => new() {
+            Name = Name,
+            Notes = Notes,
+            Holdback = BedHoldback ?? HoldbackDefault,
+            Steps = [.. Steps.Select(s => new ProfileStep(s.RampRate, s.BedTarget, s.HoldSeconds))],
+        };
+
+        /// <summary>
+        /// Combines a pattern read from the IR controller with the same pattern read from the bed controller.
+        /// Differences in step count, ramps or holds are reported, because both controllers should run the same timing.
+        /// </summary>
+        public static ReflowProfile Combine(ReflowProfile ir, ReflowProfile bed, List<string> warnings) {
+            var p = ir.Clone();
+            p.BedHoldback = bed?.Holdback;
+            if (bed == null) return p;
+            if (bed.Steps.Count != ir.Steps.Count)
+                warnings?.Add($"The bed controller has {bed.Steps.Count} step(s) in this pattern and the IR controller {ir.Steps.Count}.");
+            for (int i = 0; i < p.Steps.Count; i++) {
+                if (i >= bed.Steps.Count) continue;
+                var b = bed.Steps[i];
+                p.Steps[i].BedTarget = b.Target;
+                if (Math.Abs(b.RampRate - ir.Steps[i].RampRate) > 0.011 || b.HoldSeconds != ir.Steps[i].HoldSeconds)
+                    warnings?.Add($"Step {i + 1}: the bed controller has a different ramp or hold time than the IR controller.");
+            }
+            return p;
+        }
+
+        /// <summary>Checks the profile. Pass <paramref name="bedMaxTemperature"/> when bed heat control is used.</summary>
+        public IEnumerable<string> Validate(double maxTemperature, double? bedMaxTemperature = null) {
             if (Steps.Count == 0) yield return "The profile needs at least one step.";
             if (Steps.Count > MaxSteps) yield return $"The controller supports at most {MaxSteps} steps.";
             for (int i = 0; i < Steps.Count; i++) {
@@ -63,6 +109,15 @@ namespace ReflowLink.Model {
                 if (s.HoldSeconds > 9999) yield return $"Step {n}: hold time must be 9999 s or less.";
             }
             if (Holdback.HasValue && (Holdback < HoldbackMin || Holdback > HoldbackMax)) yield return HoldbackRangeMessage;
+            if (bedMaxTemperature is double bedMax) {
+                for (int i = 0; i < Steps.Count; i++) {
+                    var s = Steps[i];
+                    if (s.BedTarget < 0) yield return $"Step {i + 1}: bed target cannot be negative.";
+                    if (s.BedTarget > bedMax) yield return $"Step {i + 1}: bed target {s.BedTarget:0.#} °C exceeds the {bedMax:0} °C bed limit.";
+                }
+                if (BedHoldback.HasValue && (BedHoldback < HoldbackMin || BedHoldback > HoldbackMax))
+                    yield return $"Bed holdback must be between {HoldbackMin:0} and {HoldbackMax:0} °C.";
+            }
         }
 
         // ---------------------------------------------------------------- file I/O
@@ -163,6 +218,7 @@ namespace ReflowLink.Model {
                         new ProfileStep(4.0, 100, 0),
                     },
                     Holdback = 5,
+                    BedHoldback = 5,
                 }
             },
             new() {
@@ -180,6 +236,7 @@ namespace ReflowLink.Model {
                         new ProfileStep(2.0, 100, 0),
                     },
                     Holdback = 5,
+                    BedHoldback = 5,
                 }
             },
             new() {

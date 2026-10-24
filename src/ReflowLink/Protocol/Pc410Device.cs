@@ -297,7 +297,7 @@ namespace ReflowLink.Protocol {
             }
         }
 
-        private void EnsureIdle(string action) {
+        public void EnsureIdle(string action) {
             ProgramState st;
             try { st = ReadState(); } catch (Pc410Exception) { return; } // OS not readable: let the controller decide.
             if (st is ProgramState.Running or ProgramState.Hold)
@@ -559,5 +559,26 @@ namespace ReflowLink.Protocol {
         public void Stop() => Client.WriteHexWord(Os, OsStop);
         public void Hold() => Client.WriteHexWord(Os, OsHold);
         public void Resume() => Client.WriteHexWord(Os, OsRun);
+
+        /// <summary>Holds the program only if it's running. Returns true when a hold was sent.</summary>
+        public bool HoldIfRunning() {
+            lock (Client.SyncRoot) {
+                if (ReadState() != ProgramState.Running) return false;
+                Hold();
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Resumes the program only if it's on hold. Writing Run to an idle controller would start the selected pattern
+        /// from the beginning, so a resume must never be sent blind. Returns true when a resume was sent.
+        /// </summary>
+        public bool ResumeIfHeld() {
+            lock (Client.SyncRoot) {
+                if (ReadState() != ProgramState.Hold) return false;
+                Resume();
+                return true;
+            }
+        }
     }
 }

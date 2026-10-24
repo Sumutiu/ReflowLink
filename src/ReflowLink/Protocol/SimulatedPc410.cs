@@ -181,6 +181,7 @@ namespace ReflowLink.Protocol {
         }
 
         private bool HandleWrite(string mn, string data) {
+            if (RefusedWrites.Contains(mn)) return false;
             switch (mn) {
                 case "PV": case "SP": case "OP": case "SE": return false; // read-only
                 case "OS":
@@ -220,7 +221,6 @@ namespace ReflowLink.Protocol {
                         return true;
                 }
             }
-            if (RefusedWrites.Contains(mn)) return false;
             if (mn == TuningCatalog.AutoTune) {
                 if (!Pc410Protocol.TryParseHexWord(data, out int tune)) return false;
                 bool on = (tune & 0x0001) != 0;

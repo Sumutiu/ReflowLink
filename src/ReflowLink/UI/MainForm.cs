@@ -14,16 +14,14 @@ namespace ReflowLink.UI {
     [System.ComponentModel.DesignerCategory("Code")]
     public sealed class MainForm : Form {
         private readonly AppState _state;
-        private readonly DeviceService _device;
+        private readonly DeviceService _device, _bedDevice;
         private readonly Panel _pageHost;
         private readonly PageHeader _header;
         private readonly Dictionary<string, PageBase> _pages = [];
         private readonly Dictionary<string, NavButton> _nav = [];
         private readonly DashboardPage _dashboard;
         private readonly ProfilesPage _profiles;
-        private readonly StatusPill _linkPill;
-        private readonly ThemedLabel _linkName;
-        private readonly ModernButton _connect;
+        private readonly ConnectionBox _irBox, _bedBox;
         private readonly ThemedLabel _statusText;
         private readonly ModernProgressBar _progress;
         private readonly Timer _statusFade = new() { Interval = 8000 };
@@ -46,54 +44,49 @@ namespace ReflowLink.UI {
             } catch { }
 
             _device = new DeviceService { PollIntervalMs = settings.PollIntervalMs };
-            _state = new AppState(settings, _device) { Owner = this };
+            _bedDevice = new DeviceService { PollIntervalMs = settings.Bed.PollIntervalMs };
+            _state = new AppState(settings, _device, _bedDevice) { Owner = this };
 
             // ---------------------------------------------------------------- sidebar
             var sidebar = new Panel { Dock = DockStyle.Left, Width = Theme.S(236), BackColor = Theme.Sidebar };
             var brand = new BrandPanel { Dock = DockStyle.Top, Height = Theme.S(84), Subtitle = settings.StationChosen ? settings.Station.Name : "PC410 controller" };
 
+            // Fills the space between the brand and the connection boxes, and scrolls on very small screens.
             var navStack = new FlowLayoutPanel {
-                Dock = DockStyle.Top,
+                Dock = DockStyle.Fill,
+                AutoScroll = true,
                 FlowDirection = FlowDirection.TopDown,
                 WrapContents = false,
-                Height = Theme.S(5 * 46 + 12),
+                Height = Theme.S(7 * 44 + 12),
                 BackColor = Theme.Sidebar,
                 Padding = new Padding(0, Theme.S(4), 0, 0),
             };
             void AddNav(string key, string text, Glyph glyph) {
-                var b = new NavButton(text, glyph) { Width = Theme.S(236), Margin = new Padding(0, 0, 0, Theme.S(4)) };
+                var b = new NavButton(text, glyph) { Width = Theme.S(236), Margin = new Padding(0, 0, 0, Theme.S(2)) };
                 b.Click += (s, e) => ShowPage(key);
                 navStack.Controls.Add(b);
                 _nav[key] = b;
             }
             AddNav("dashboard", "Dashboard", Glyph.Dashboard);
             AddNav("profiles", "Profiles", Glyph.Profile);
-            AddNav("tuning", "Control Tuning", Glyph.Tune);
-            AddNav("console", "Console", Glyph.Console);
+            AddNav("tuning", "Top IR Control Tuning", Glyph.Tune);
+            AddNav("bedtuning", "Bed Heat Control Tuning", Glyph.Tune);
+            AddNav("console", "Top IR Console", Glyph.Console);
+            AddNav("bedconsole", "Bed Heat Console", Glyph.Console);
             AddNav("settings", "Settings", Glyph.Settings);
 
-            // Connection block at the bottom of the sidebar
-            var connBox = new CardPanel { Dock = DockStyle.Bottom, Height = Theme.S(150), BackColor = Theme.Surface, Padding = Theme.Pad(14) };
-            var connWrap = new Panel { Dock = DockStyle.Bottom, Height = Theme.S(150 + 16), Padding = Theme.Pad(12, 0, 12, 16), BackColor = Theme.Sidebar };
-            connWrap.Controls.Add(connBox);
-            connBox.Dock = DockStyle.Fill;
-            _linkPill = new StatusPill { Location = new Point(Theme.S(14), Theme.S(14)) };
-            _linkName = new ThemedLabel("", Theme.Small, Theme.TextDim) {
-                AutoSize = false,
-                AutoEllipsis = true,
-                Location = new Point(Theme.S(14), Theme.S(48)),
-                Size = new Size(Theme.S(236 - 24 - 28), Theme.S(36)),
-            };
-            _connect = new ModernButton("Connect", Glyph.Plug, ButtonKind.Primary) {
-                AutoWidth = false,
-                Location = new Point(Theme.S(14), Theme.S(150 - 14 - 36)),
-                Size = new Size(Theme.S(236 - 24 - 28), Theme.S(36)),
-            };
-            _connect.Click += async (s, e) => await ToggleConnection();
-            connBox.Controls.Add(_linkPill);
-            connBox.Controls.Add(_linkName);
-            connBox.Controls.Add(_connect);
+            // Connection blocks at the bottom of the sidebar: top IR, then bed heat
+            _irBox = new ConnectionBox("Top IR Connection") { Dock = DockStyle.Top };
+            _irBox.Button.Click += async (s, e) => await ToggleConnection();
+            _bedBox = new ConnectionBox("Bed Heat Control") { Dock = DockStyle.Top, Margin = Padding.Empty };
+            _bedBox.Button.Click += async (s, e) => await ToggleBedConnection();
+            var connWrap = new Panel { Dock = DockStyle.Bottom, Height = _irBox.Height * 2 + Theme.S(8 + 12), Padding = Theme.Pad(12, 0, 12, 12), BackColor = Theme.Sidebar };
+            var gap = new Panel { Dock = DockStyle.Top, Height = Theme.S(8), BackColor = Theme.Sidebar };
+            connWrap.Controls.Add(_bedBox);
+            connWrap.Controls.Add(gap);
+            connWrap.Controls.Add(_irBox);
 
+            Theme.ApplyDarkScrollbars(navStack);
             sidebar.Controls.Add(navStack);
             sidebar.Controls.Add(brand);
             sidebar.Controls.Add(connWrap);
@@ -127,8 +120,10 @@ namespace ReflowLink.UI {
             _profiles = new ProfilesPage(_state);
             AddPage("dashboard", _dashboard);
             AddPage("profiles", _profiles);
-            AddPage("tuning", new TuningPage(_state));
-            AddPage("console", new ConsolePage(_state));
+            AddPage("tuning", new TuningPage(_state, _state.Ir));
+            AddPage("bedtuning", new TuningPage(_state, _state.BedChannel));
+            AddPage("console", new ConsolePage(_state, _state.Ir));
+            AddPage("bedconsole", new ConsolePage(_state, _state.BedChannel));
             AddPage("settings", new SettingsPage(_state));
 
             // ---------------------------------------------------------------- wiring
@@ -142,6 +137,11 @@ namespace ReflowLink.UI {
             _state.StationChanged += () => brand.Subtitle = _state.Settings.Station.Name;
             _state.BusyChanged += UpdateConnectionUi;
             _device.StateChanged += (s, e) => UpdateConnectionUi();
+            _bedDevice.StateChanged += (s, e) => UpdateConnectionUi();
+            _state.BedEnabledChanged += () => {
+                if (!_state.BedEnabled && _bedDevice.IsConnected) _bedDevice.Disconnect();
+                UpdateConnectionUi();
+            };
             _statusFade.Tick += (s, e) => { _statusFade.Stop(); _statusText.ForeColor = Theme.TextFaint; };
 
             ApplySavedBounds(settings);
@@ -178,37 +178,10 @@ namespace ReflowLink.UI {
         // ==================================================================== connection
 
         private void UpdateConnectionUi() {
-            var st = _device.State;
-            switch (st) {
-                case LinkStatus.Connected:
-                    _linkPill.Set(_device.IsSimulator ? "Simulator" : "Connected", _device.IsSimulator ? Theme.Purple : Theme.Green, true);
-                    _linkName.Text = $"{_device.LinkName}\nAddress {_device.Address:00}";
-                    _connect.Text = "Disconnect";
-                    _connect.Glyph = Glyph.Unplug;
-                    _connect.Kind = ButtonKind.Secondary;
-                    break;
-                case LinkStatus.NoResponse:
-                    _linkPill.Set("No response", Theme.Red, true);
-                    _linkName.Text = _device.LinkName + "\nCheck cable and power";
-                    _connect.Text = "Disconnect";
-                    _connect.Glyph = Glyph.Unplug;
-                    _connect.Kind = ButtonKind.Secondary;
-                    break;
-                case LinkStatus.Connecting:
-                    _linkPill.Set("Connecting…", Theme.Yellow, true);
-                    _linkName.Text = _state.Settings.UseSimulator ? "Simulator" : _state.Settings.PortName;
-                    _connect.Text = "Connecting…";
-                    break;
-                default:
-                    _linkPill.Set("Offline", Theme.TextFaint);
-                    _linkName.Text = _state.Settings.UseSimulator ? "Simulator selected" :
-                        string.IsNullOrEmpty(_state.Settings.PortName) ? "No port selected" : $"{_state.Settings.PortName} · {_state.Settings.BaudRate} baud";
-                    _connect.Text = "Connect";
-                    _connect.Glyph = Glyph.Plug;
-                    _connect.Kind = ButtonKind.Primary;
-                    break;
-            }
-            _connect.Enabled = st != LinkStatus.Connecting && !_state.Busy;
+            var set = _state.Settings;
+            _irBox.Show(_device, true, !_state.Busy, set.UseSimulator, set.PortName, set.BaudRate);
+            var bed = set.Bed;
+            _bedBox.Show(_bedDevice, _state.BedEnabled, !_state.Busy, bed.UseSimulator, bed.PortName, bed.BaudRate);
         }
 
         private async System.Threading.Tasks.Task ToggleConnection() {
@@ -216,29 +189,66 @@ namespace ReflowLink.UI {
                 if (_dashboard.IsProgramActive &&
                     !DarkDialog.Confirm(this, "Disconnect while running?", "The controller keeps running the program on its own after you disconnect. Monitoring and recording will stop.", "Disconnect", "Cancel"))
                     return;
-                if (_state.AutoTuneRunning &&
+                if (_state.Ir.AutoTuneRunning &&
                     !DarkDialog.Confirm(this, "Disconnect during auto-tune?", AutoTuneWarning, "Disconnect", "Cancel", danger: true))
                     return;
                 _dashboard.Shutdown();
                 _device.Disconnect();
-                SetStatus("Disconnected", StatusKind.Normal);
+                SetStatus("Top IR controller disconnected", StatusKind.Normal);
+                return;
+            }
+            if (!_state.Settings.UseSimulator && _bedDevice.IsConnected && !_bedDevice.IsSimulator &&
+                string.Equals(_state.Settings.PortName, _state.Settings.Bed.PortName, StringComparison.OrdinalIgnoreCase)) {
+                DarkDialog.Error(this, "Same serial port", $"{_state.Settings.PortName} is already used by the Bed Heat controller. Each PC410 needs its own serial port; choose another one under Top IR Connection in Settings.");
                 return;
             }
             try {
                 SetStatus(_state.Settings.UseSimulator ? "Starting simulator…" : $"Connecting to {_state.Settings.PortName}…", StatusKind.Normal);
-                await _device.ConnectAsync(_state.Settings);
+                await _device.ConnectAsync(_state.Settings.IrConnection());
                 _state.Settings.Save();
-                SetStatus($"Connected to {_device.LinkName}", StatusKind.Success);
+                SetStatus($"Top IR connected to {_device.LinkName}", StatusKind.Success);
             } catch (Exception ex) {
-                SetStatus("Connection failed", StatusKind.Error);
-                int r = DarkDialog.Show(this, "Could not connect", ex.Message, DialogTone.Error, ["Open settings", "Close"], 1);
+                SetStatus("Top IR connection failed", StatusKind.Error);
+                int r = DarkDialog.Show(this, "Could not connect to the Top IR controller", ex.Message, DialogTone.Error, ["Open settings", "Close"], 1);
+                if (r == 0) ShowPage("settings");
+            }
+        }
+
+        private async System.Threading.Tasks.Task ToggleBedConnection() {
+            if (_bedDevice.IsConnected) {
+                if (_dashboard.IsProgramActive &&
+                    !DarkDialog.Confirm(this, "Disconnect the bed controller while running?",
+                        "The bed controller keeps running its program on its own, but ReflowLink can no longer keep the two heaters in step or record the bed.",
+                        "Disconnect", "Cancel"))
+                    return;
+                if (_state.BedChannel.AutoTuneRunning &&
+                    !DarkDialog.Confirm(this, "Disconnect during auto-tune?", AutoTuneWarning, "Disconnect", "Cancel", danger: true))
+                    return;
+                _bedDevice.Disconnect();
+                SetStatus("Bed heat controller disconnected", StatusKind.Normal);
+                return;
+            }
+            if (!_state.BedEnabled) return;
+            var bed = _state.Settings.Bed;
+            if (!bed.UseSimulator && _device.IsConnected && !_device.IsSimulator && string.Equals(bed.PortName, _state.Settings.PortName, StringComparison.OrdinalIgnoreCase)) {
+                DarkDialog.Error(this, "Same serial port", $"{bed.PortName} is already used by the Top IR controller. Each PC410 needs its own serial port; choose another one under Bed Heat Connection in Settings.");
+                return;
+            }
+            try {
+                SetStatus(bed.UseSimulator ? "Starting bed simulator…" : $"Connecting to {bed.PortName}…", StatusKind.Normal);
+                await _bedDevice.ConnectAsync(bed.Connection());
+                _state.Settings.Save();
+                SetStatus($"Bed heat connected to {_bedDevice.LinkName}", StatusKind.Success);
+            } catch (Exception ex) {
+                SetStatus("Bed heat connection failed", StatusKind.Error);
+                int r = DarkDialog.Show(this, "Could not connect to the Bed Heat controller", ex.Message, DialogTone.Error, ["Open settings", "Close"], 1);
                 if (r == 0) ShowPage("settings");
             }
         }
 
         private const string AutoTuneWarning =
             "The controller keeps tuning on its own, and ReflowLink can't stop it once it's disconnected. "
-            + "Stop the tune first on the Control Tuning page, or switch Tune off on the controller's front panel.";
+            + "Stop the tune first on its Control Tuning page, or switch Tune off on the controller's front panel.";
 
         // ==================================================================== window
 
@@ -281,7 +291,7 @@ namespace ReflowLink.UI {
                         "ReflowLink is still talking to the controller (for example writing a profile). Closing now can leave a pattern half-written.",
                         DialogTone.Warning, ["Exit anyway", "Cancel"], 1, ButtonKind.Danger) != 0) { e.Cancel = true; return; }
 
-                if (_dashboard.IsProgramActive && _device.IsConnected) {
+                if (_dashboard.IsProgramActive && (_device.IsConnected || _bedDevice.IsConnected)) {
                     int r = DarkDialog.Show(this, "A program is running", "The controller keeps running the program after ReflowLink closes.",
                         DialogTone.Warning, ["Stop program and exit", "Exit, keep running", "Cancel"], 2);
                     if (r is 2 or < 0) { e.Cancel = true; return; }
@@ -292,7 +302,7 @@ namespace ReflowLink.UI {
                         if (r2 != 0) { e.Cancel = true; return; }
                     }
                 }
-                if (_state.AutoTuneRunning && _device.IsConnected &&
+                if (_state.AutoTuneRunning && (_device.IsConnected || _bedDevice.IsConnected) &&
                     !DarkDialog.Confirm(this, "Auto-tune is running", AutoTuneWarning, "Exit anyway", "Cancel", danger: true)) { e.Cancel = true; return; }
                 if (!_profiles.ConfirmClose()) { e.Cancel = true; return; }
             }
@@ -303,23 +313,106 @@ namespace ReflowLink.UI {
             s.Save();
             _dashboard.Shutdown();
             _device.Dispose();
+            _bedDevice.Dispose();
             base.OnFormClosing(e);
         }
 
-        /// <summary>Sends Stop and confirms the controller reports idle. Returns false if that could not be confirmed.</summary>
+        /// <summary>Sends Stop to every connected controller and confirms they report idle. False if that couldn't be confirmed.</summary>
         private bool TryStopBeforeExit() {
+            _state.Sync.UserHold = true;
+            _state.Sync.Halt();
             Cursor = Cursors.WaitCursor;
             try {
-                var t = _device.RunAsync(d => {
-                    d.Stop();
-                    return d.ReadState();
-                });
-                if (!t.Wait(8000)) return false;
-                return t.Result == Protocol.ProgramState.Idle;
-            } catch { return false; } finally { Cursor = Cursors.Default; }
+                bool ok = true;
+                foreach (var device in new[] { _device, _bedDevice }) {
+                    if (!device.IsConnected) continue;
+                    try {
+                        var t = device.RunAsync(d => {
+                            d.Stop();
+                            return d.ReadState();
+                        });
+                        ok &= t.Wait(8000) && t.Result == Protocol.ProgramState.Idle;
+                    } catch { ok = false; }
+                }
+                return ok;
+            } finally { Cursor = Cursors.Default; }
         }
 
         // ==================================================================== small painted parts
+
+        /// <summary>Sidebar block with a controller's link status and its Connect button.</summary>
+        [System.ComponentModel.DesignerCategory("Code")]
+        private sealed class ConnectionBox : CardPanel {
+            private readonly ThemedLabel _caption, _name;
+            private readonly StatusPill _pill;
+
+            public ConnectionBox(string caption) {
+                Height = Theme.S(118);
+                BackColor = Theme.Surface;
+                Padding = Theme.Pad(12);
+                int w = Theme.S(236 - 24 - 24);
+                _caption = new ThemedLabel(caption.ToUpperInvariant(), Theme.SmallBold, Theme.TextFaint) {
+                    AutoSize = false,
+                    Location = new Point(Theme.S(12), Theme.S(9)),
+                    Size = new Size(w, Theme.S(16)),
+                };
+                _pill = new StatusPill { Location = new Point(Theme.S(12), Theme.S(29)) };
+                _name = new ThemedLabel("", Theme.Small, Theme.TextDim) {
+                    AutoSize = false,
+                    AutoEllipsis = true,
+                    Location = new Point(Theme.S(12), Theme.S(58)),
+                    Size = new Size(w, Theme.S(18)),
+                };
+                Button = new ModernButton("Connect", Glyph.Plug, ButtonKind.Primary) {
+                    AutoWidth = false,
+                    Location = new Point(Theme.S(12), Theme.S(118 - 10 - 32)),
+                    Size = new Size(w, Theme.S(32)),
+                };
+                Controls.AddRange([_caption, _pill, _name, Button]);
+            }
+
+            public ModernButton Button { get; }
+
+            public void Show(DeviceService device, bool enabled, bool idle, bool simulator, string port, int baud) {
+                var st = device.State;
+                if (!enabled && st == LinkStatus.Disconnected) {
+                    _pill.Set("Off", Theme.TextFaint);
+                    _name.Text = "Switch on in Settings";
+                    SetButton("Connect", Glyph.Plug, ButtonKind.Primary);
+                    Button.Enabled = false;
+                    return;
+                }
+                switch (st) {
+                    case LinkStatus.Connected:
+                        _pill.Set(device.IsSimulator ? "Simulator" : "Online", device.IsSimulator ? Theme.Purple : Theme.Green, true);
+                        _name.Text = $"{device.LinkName}  ·  address {device.Address:00}";
+                        SetButton("Disconnect", Glyph.Unplug, ButtonKind.Secondary);
+                        break;
+                    case LinkStatus.NoResponse:
+                        _pill.Set("No response", Theme.Red, true);
+                        _name.Text = device.LinkName + "  ·  check cable and power";
+                        SetButton("Disconnect", Glyph.Unplug, ButtonKind.Secondary);
+                        break;
+                    case LinkStatus.Connecting:
+                        _pill.Set("Connecting…", Theme.Yellow, true);
+                        _name.Text = simulator ? "Simulator" : port;
+                        Button.Text = "Connecting…";
+                        break;
+                    default:
+                        _pill.Set("Offline", Theme.TextFaint);
+                        _name.Text = simulator ? "Simulator selected" : string.IsNullOrEmpty(port) ? "No port selected" : $"{port}  ·  {baud} baud";
+                        SetButton("Connect", Glyph.Plug, ButtonKind.Primary);
+                        break;
+                }
+                Button.Enabled = st != LinkStatus.Connecting && idle;
+            }
+
+            private void SetButton(string text, Glyph glyph, ButtonKind kind) {
+                Button.Text = text;
+                Button.Glyph = glyph;
+                Button.Kind = kind;
+            }
+        }
 
         [System.ComponentModel.DesignerCategory("Code")]
         private sealed class BrandPanel : Control {

@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using ReflowLink.Model;
@@ -36,22 +37,27 @@ namespace ReflowLink.UI.Pages {
 
     [System.ComponentModel.DesignerCategory("Code")]
     public sealed class DashboardPage : PageBase {
+        private static readonly Color BedPvColor = Theme.Green;
+        private static readonly Color BedSpColor = Color.FromArgb(45, 212, 191);
+        private static readonly Color BedOpColor = Color.FromArgb(120, 200, 140);
+
         private readonly StatCard _pvCard, _spCard, _opCard, _stateCard;
         private readonly ChartView _chart;
-        private readonly ChartSeries _pv, _sp, _op, _plan;
+        private readonly ChartSeries _pv, _sp, _op, _plan, _bedPv, _bedSp, _bedOp, _bedPlan;
         private readonly ModernDropDown _window, _slot;
         private readonly ModernButton _run, _hold, _stop, _openLogs;
         private readonly ToggleSwitch _record;
-        private readonly InfoRow _rowState, _rowStep, _rowElapsed, _rowPlanned, _rowRemaining;
+        private readonly InfoRow _rowState, _rowStep, _rowIr, _rowBed, _rowElapsed, _rowPlanned, _rowRemaining;
         private readonly ThemedLabel _recordInfo;
+        private readonly CardHeader _chartHeader;
 
         private DateTime _sessionStart = DateTime.Now;
         private double? _runStart;
-        private PlannedCurve _runPlan;
+        private PlannedCurve _runPlan, _runBedPlan;
         private int? _runPattern;
-        private ProgramState _state = ProgramState.Unknown;
+        private ProgramState _state = ProgramState.Unknown, _bedState = ProgramState.Unknown;
         private CsvRecorder _recorder;
-        private bool _autoRecording, _settingToggle;
+        private bool _autoRecording, _settingToggle, _userStopped, _wasActive;
         private DateTime? _autoStopAt;
         private double _lastX;
 
@@ -60,9 +66,9 @@ namespace ReflowLink.UI.Pages {
 
         public DashboardPage(AppState state) : base(state, "Dashboard", "Live readings and program control") {
             // ---------------------------------------------------------------- stat cards
-            _pvCard = new StatCard("Temperature", "°C", Theme.SeriesPv) { Dock = DockStyle.Fill, Margin = new Padding(0, 0, Theme.S(8), 0) };
-            _spCard = new StatCard("Setpoint", "°C", Theme.SeriesSp) { Dock = DockStyle.Fill, Margin = new Padding(Theme.S(4), 0, Theme.S(4), 0) };
-            _opCard = new StatCard("Heater output", "%", Theme.SeriesOp) { Dock = DockStyle.Fill, Margin = new Padding(Theme.S(4), 0, Theme.S(4), 0) };
+            _pvCard = new StatCard("Temperature", "°C", Theme.SeriesPv) { Dock = DockStyle.Fill, Margin = new Padding(0, 0, Theme.S(8), 0), Label1 = "Top IR", Label2 = "Bed heat", Accent2 = BedPvColor };
+            _spCard = new StatCard("Setpoint", "°C", Theme.SeriesSp) { Dock = DockStyle.Fill, Margin = new Padding(Theme.S(4), 0, Theme.S(4), 0), Label1 = "Top IR", Label2 = "Bed heat", Accent2 = BedSpColor };
+            _opCard = new StatCard("Heater output", "%", Theme.SeriesOp) { Dock = DockStyle.Fill, Margin = new Padding(Theme.S(4), 0, Theme.S(4), 0), Label1 = "Top IR", Label2 = "Bed heat", Accent2 = BedOpColor };
             _stateCard = new StatCard("Program", "", Theme.TextFaint) { Dock = DockStyle.Fill, Margin = new Padding(Theme.S(8), 0, 0, 0) };
 
             var stats = Table(4, 1);
@@ -79,11 +85,13 @@ namespace ReflowLink.UI.Pages {
             _sp = new ChartSeries { Name = "Setpoint (SP)", Color = Theme.SeriesSp, Width = 1.6f };
             _op = new ChartSeries { Name = "Output", Color = Theme.SeriesOp, Width = 1.2f, FillArea = true, Secondary = true, Unit = "%", Format = "0" };
             _plan = new ChartSeries { Name = "Planned", Color = Theme.SeriesPlan, Width = 1.4f, Dashed = true };
+            _bedPv = new ChartSeries { Name = "Bed temp", Color = BedPvColor, Width = 2.0f };
+            _bedSp = new ChartSeries { Name = "Bed setpoint", Color = BedSpColor, Width = 1.4f };
+            _bedOp = new ChartSeries { Name = "Bed output", Color = BedOpColor, Width = 1.1f, Secondary = true, Unit = "%", Format = "0" };
+            _bedPlan = new ChartSeries { Name = "Planned bed", Color = Theme.WithAlpha(BedPvColor, 150), Width = 1.2f, Dashed = true, ShowInLegend = false };
             _chart = new ChartView { Dock = DockStyle.Fill, EmptyText = "Connect to the controller to see live data" };
-            _chart.Series.Add(_op);
-            _chart.Series.Add(_plan);
-            _chart.Series.Add(_sp);
-            _chart.Series.Add(_pv);
+            // Drawn first to last; the legend lists them last to first (IR before bed).
+            _chart.Series.AddRange([_bedOp, _op, _bedPlan, _plan, _bedSp, _sp, _bedPv, _pv]);
 
             _window = new ModernDropDown { Width = Theme.S(150), Margin = new Padding(0, 0, Theme.S(8), 0) };
             _window.SetItems(WindowNames, 2);
@@ -96,11 +104,11 @@ namespace ReflowLink.UI.Pages {
             tip.SetToolTip(export, "Export chart as PNG");
             tip.SetToolTip(clear, "Clear chart");
 
-            var chartHeader = new CardHeader("Live temperature", "Board temperature, setpoint and heater output");
-            chartHeader.Tools.Controls.AddRange([_window, export, clear]);
+            _chartHeader = new CardHeader("Live temperature", "Board temperature, setpoint and heater output");
+            _chartHeader.Tools.Controls.AddRange([_window, export, clear]);
             var chartCard = new CardPanel { Dock = DockStyle.Fill, Margin = new Padding(0, 0, Theme.S(8), 0) };
             chartCard.Controls.Add(_chart);
-            chartCard.Controls.Add(chartHeader);
+            chartCard.Controls.Add(_chartHeader);
             _chart.BringToFront();
 
             // ---------------------------------------------------------------- control card
@@ -147,11 +155,15 @@ namespace ReflowLink.UI.Pages {
             Add(new Divider(), 12);
             _rowState = new InfoRow("State");
             _rowStep = new InfoRow("Segment");
+            _rowIr = new InfoRow("Top IR");
+            _rowBed = new InfoRow("Bed heat");
             _rowElapsed = new InfoRow("Elapsed");
             _rowPlanned = new InfoRow("Planned duration");
             _rowRemaining = new InfoRow("Remaining (est.)");
             Add(_rowState);
             Add(_rowStep);
+            Add(_rowIr);
+            Add(_rowBed);
             Add(_rowElapsed);
             Add(_rowPlanned);
             Add(_rowRemaining);
@@ -198,10 +210,46 @@ namespace ReflowLink.UI.Pages {
             State.Device.TelemetryReceived += OnTelemetry;
             State.Device.StateChanged += (s, e) => OnLinkChanged();
             State.Device.ProgramStateChanged += OnProgramStateChanged;
+            State.Bed.TelemetryReceived += OnBedTelemetry;
+            State.Bed.StateChanged += (s, e) => OnBedLinkChanged();
+            State.Bed.ProgramStateChanged += (prev, now) => { _bedState = now; OnCombinedStateChanged(); UpdateProgramInfo(State.Device.Last); UpdateButtons(); };
+            State.BedEnabledChanged += ApplyBedMode;
+            State.Sync.Changed += () => { UpdateProgramInfo(State.Device.Last); UpdateButtons(); };
+            State.Sync.CommandFailed += msg => State.SetStatus(msg, StatusKind.Error);
+            State.Sync.BedLost += async () => await OnBedLost();
+            State.Sync.IrLost += () => {
+                State.SetStatus("Top IR controller stopped answering", StatusKind.Error);
+                DarkDialog.Error(FindForm(), "Top IR controller not answering",
+                    "The Top IR controller stopped answering during the run. It keeps running its program on its own, and the bed carries on with its program too. "
+                    + "Check the cable, or stop both programs on the station's front panels.");
+            };
             State.SlotProfilesChanged += () => { _slot.SetItems(State.SlotLabels(), _slot.SelectedIndex); ShowPlannedPreview(); };
             State.BusyChanged += UpdateButtons;
+            ApplyBedMode();
             OnLinkChanged();
             ShowPlannedPreview();
+        }
+
+        private bool Bed => State.BedEnabled;
+
+        /// <summary>Shows or hides everything about the bed heat controller.</summary>
+        private void ApplyBedMode() {
+            bool bed = Bed;
+            _pvCard.Split = _spCard.Split = _opCard.Split = bed;
+            foreach (var s in new[] { _bedPv, _bedSp, _bedOp, _bedPlan }) s.Visible = bed;
+            _bedPv.ShowInLegend = _bedSp.ShowInLegend = _bedOp.ShowInLegend = bed;
+            _pv.Name = bed ? "IR temp" : "Temperature (PV)";
+            _sp.Name = bed ? "IR setpoint" : "Setpoint (SP)";
+            _op.Name = bed ? "IR output" : "Output";
+            _plan.Name = bed ? "Planned IR" : "Planned";
+            _chartHeader.Subtitle = bed ? "Top IR and bed heat: temperature, setpoint and heater output" : "Board temperature, setpoint and heater output";
+            _rowStep.Visible = !bed;
+            _rowIr.Visible = _rowBed.Visible = bed;
+            if (!bed) _bedState = ProgramState.Unknown;
+            OnBedLinkChanged();
+            UpdateProgramInfo(State.Device.Last);
+            UpdateButtons();
+            _chart.Invalidate();
         }
 
         // ==================================================================== link / telemetry
@@ -236,27 +284,38 @@ namespace ReflowLink.UI.Pages {
             _chart.Invalidate();
         }
 
+        private void OnBedLinkChanged() {
+            var ls = State.Bed.State;
+            if (ls == LinkStatus.Disconnected || !Bed) {
+                _bedState = ProgramState.Unknown;
+                _pvCard.Value2 = _spCard.Value2 = _opCard.Value2 = "—";
+                _pvCard.Detail2 = _spCard.Detail2 = _opCard.Detail2 = Bed ? "Not connected" : "Off";
+                _opCard.Bar2 = null;
+            } else if (ls == LinkStatus.NoResponse) {
+                _pvCard.Detail2 = "No response";
+            }
+            UpdateProgramInfo(State.Device.Last);
+            UpdateButtons();
+        }
+
+        private double X(DateTime time, DeviceService device) => (time - _sessionStart).TotalSeconds * device.TimeScale;
+
         private void OnTelemetry(Telemetry t) {
-            double x = (t.Time - _sessionStart).TotalSeconds * State.Device.TimeScale;
+            double x = X(t.Time, State.Device);
             _lastX = x;
             if (t.Pv.HasValue) _pv.Points.Add(new PointD(x, t.Pv.Value));
             if (t.Sp.HasValue) _sp.Points.Add(new PointD(x, t.Sp.Value));
             if (t.Op.HasValue) _op.Points.Add(new PointD(x, t.Op.Value));
-            const int cap = 250000;
-            foreach (var s in new[] { _pv, _sp, _op })
-                if (s.Points.Count > cap) s.Points.RemoveRange(0, s.Points.Count - cap);
+            Trim(_pv, _sp, _op);
 
             if (t.State != ProgramState.Unknown) _state = t.State;
 
             // Cards
             _pvCard.Value = t.Pv.HasValue ? t.Pv.Value.ToString("0.0") : "—";
-            double? rate = PvRate(10);
+            double? rate = Rate(_pv, 10);
             _pvCard.Detail = rate.HasValue ? $"Rate {(rate.Value >= 0 ? "+" : "")}{rate.Value:0.00} °C/s" : "";
             _spCard.Value = t.Sp.HasValue ? t.Sp.Value.ToString("0.0") : "—";
-            if (t.Pv.HasValue && t.Sp.HasValue && _state != ProgramState.Idle) {
-                double d = t.Pv.Value - t.Sp.Value;
-                _spCard.Detail = $"Deviation {(d >= 0 ? "+" : "")}{d:0.0} °C";
-            } else _spCard.Detail = _state == ProgramState.Idle ? "Program not running" : "";
+            _spCard.Detail = Deviation(t, _state);
             _opCard.Value = t.Op.HasValue ? t.Op.Value.ToString("0") : "—";
             _opCard.Bar = t.Op.HasValue ? t.Op.Value / 100.0 : (double?)null;
             _opCard.Detail = t.StatusWord.HasValue ? $"Status word {Pc410Protocol.FormatHexWord(t.StatusWord.Value)}" : (_opCard.Detail ?? "");
@@ -265,7 +324,7 @@ namespace ReflowLink.UI.Pages {
             UpdateProgramInfo(t);
 
             if (_recorder != null) {
-                try { _recorder.Write(t); } catch (Exception ex) { State.SetStatus("Recording stopped: " + ex.Message, StatusKind.Error); StopRecording(); }
+                try { _recorder.Write(t, Bed ? State.Bed.Last : null, State.Sync.WaitingText); } catch (Exception ex) { State.SetStatus("Recording stopped: " + ex.Message, StatusKind.Error); StopRecording(); }
                 if (_autoStopAt.HasValue && DateTime.Now >= _autoStopAt.Value) StopRecording();
                 else if (_recorder != null) _recordInfo.Text = $"Recording · {_recorder.Rows} rows\n{Path.GetFileName(_recorder.FilePath)}";
             }
@@ -274,8 +333,42 @@ namespace ReflowLink.UI.Pages {
             UpdateButtons();
         }
 
-        private double? PvRate(double seconds) {
-            var pts = _pv.Points;
+        private void OnBedTelemetry(Telemetry t) {
+            if (!Bed) return;
+            double x = X(t.Time, State.Bed);
+            if (t.Pv.HasValue) _bedPv.Points.Add(new PointD(x, t.Pv.Value));
+            if (t.Sp.HasValue) _bedSp.Points.Add(new PointD(x, t.Sp.Value));
+            if (t.Op.HasValue) _bedOp.Points.Add(new PointD(x, t.Op.Value));
+            Trim(_bedPv, _bedSp, _bedOp);
+            if (t.State != ProgramState.Unknown) _bedState = t.State;
+
+            _pvCard.Value2 = t.Pv.HasValue ? t.Pv.Value.ToString("0.0") : "—";
+            double? rate = Rate(_bedPv, 10);
+            _pvCard.Detail2 = rate.HasValue ? $"Rate {(rate.Value >= 0 ? "+" : "")}{rate.Value:0.00} °C/s" : "";
+            _spCard.Value2 = t.Sp.HasValue ? t.Sp.Value.ToString("0.0") : "—";
+            _spCard.Detail2 = Deviation(t, _bedState);
+            _opCard.Value2 = t.Op.HasValue ? t.Op.Value.ToString("0") : "—";
+            _opCard.Bar2 = t.Op.HasValue ? t.Op.Value / 100.0 : (double?)null;
+            _opCard.Detail2 = "Heater power";
+            if (!State.Device.IsConnected) UpdateWindow();
+        }
+
+        private static string Deviation(Telemetry t, ProgramState state) {
+            if (t.Pv.HasValue && t.Sp.HasValue && state != ProgramState.Idle) {
+                double d = t.Pv.Value - t.Sp.Value;
+                return $"Deviation {(d >= 0 ? "+" : "")}{d:0.0} °C";
+            }
+            return state == ProgramState.Idle ? "Program not running" : "";
+        }
+
+        private static void Trim(params ChartSeries[] series) {
+            const int cap = 250000;
+            foreach (var s in series)
+                if (s.Points.Count > cap) s.Points.RemoveRange(0, s.Points.Count - cap);
+        }
+
+        private static double? Rate(ChartSeries series, double seconds) {
+            var pts = series.Points;
             if (pts.Count < 3) return null;
             var last = pts[pts.Count - 1];
             int i = pts.Count - 1;
@@ -285,40 +378,81 @@ namespace ReflowLink.UI.Pages {
             return (last.Y - first.Y) / (last.X - first.X);
         }
 
+        private static (string Text, Color Color) Describe(ProgramState state) => state switch {
+            ProgramState.Running => ("Running", Theme.Green),
+            ProgramState.Hold => ("On hold", Theme.Yellow),
+            ProgramState.Idle => ("Idle", Theme.TextDim),
+            _ => ("Unknown", Theme.TextFaint),
+        };
+
+        /// <summary>State of the whole program: either controller running counts as running.</summary>
+        private ProgramState Combined() {
+            if (!Bed || !State.Bed.IsConnected) return _state;
+            if (_state == ProgramState.Running || _bedState == ProgramState.Running) return ProgramState.Running;
+            if (_state == ProgramState.Hold || _bedState == ProgramState.Hold) return ProgramState.Hold;
+            if (_state == ProgramState.Idle && _bedState == ProgramState.Idle) return ProgramState.Idle;
+            return _state != ProgramState.Unknown ? _state : _bedState;
+        }
+
+        private string StepText(int? segment, int steps) {
+            if (segment is not int seg || seg <= 0) return "";
+            int step = SyncCoordinator.StepOf(seg, steps, State.Sync.PairedSegments) ?? seg;
+            return steps > 0 ? $"step {step} of {steps}" : $"step {step}";
+        }
+
         private void UpdateProgramInfo(Telemetry t) {
-            string st;
-            Color c;
-            switch (_state) {
-                case ProgramState.Running: st = "Running"; c = Theme.Green; break;
-                case ProgramState.Hold: st = "On hold"; c = Theme.Yellow; break;
-                case ProgramState.Idle: st = "Idle"; c = Theme.TextDim; break;
-                default: st = "Unknown"; c = Theme.TextFaint; break;
-            }
-            if (State.Device.State == LinkStatus.NoResponse) { c = Theme.Red; }
-            _stateCard.Value = st;
+            var combined = Combined();
+            var (st, c) = Describe(combined);
+            string waiting = Bed ? State.Sync.WaitingText : "";
+            if (State.Sync.UserHold && combined != ProgramState.Idle) (st, c) = ("On hold", Theme.Yellow);
+            else if (waiting.Length > 0) (st, c) = (waiting, Theme.Yellow);
+            if (State.Device.State == LinkStatus.NoResponse || (Bed && State.Bed.State == LinkStatus.NoResponse)) c = Theme.Red;
+            _stateCard.Value = waiting.Length > 0 && !State.Sync.UserHold ? "Waiting" : Describe(combined).Text;
             _stateCard.Accent = c;
             _rowState.Value = st;
             _rowState.ValueColor = c;
 
             int? pattern = _runPattern ?? State.Device.ActivePattern;
-            bool active = _state is ProgramState.Running or ProgramState.Hold;
+            bool active = combined is ProgramState.Running or ProgramState.Hold;
             int steps = _runPlan != null ? _runPlan.StepStarts.Count : 0;
             string seg = t?.Segment.HasValue == true && t.Segment.Value > 0
                 ? (steps > 0 ? $"{t.Segment.Value} of {steps}" : t.Segment.Value.ToString())
                 : "—";
             _rowStep.Value = active ? seg : "—";
+            if (Bed) {
+                var (irText, irColor) = State.Device.IsConnected ? Describe(_state) : ("Offline", Theme.TextFaint);
+                var (bedText, bedColor) = State.Bed.IsConnected ? Describe(_bedState) : ("Offline", Theme.TextFaint);
+                string irStep = active && _state != ProgramState.Idle ? StepText(t?.Segment, steps) : "";
+                string bedStep = active && _bedState != ProgramState.Idle ? StepText(State.Bed.Last?.Segment, steps) : "";
+                if (State.Sync.IrWaiting) (irText, irColor) = ("Waiting for bed", Theme.Yellow);
+                if (State.Sync.BedWaiting) (bedText, bedColor) = ("Waiting for IR", Theme.Yellow);
+                _rowIr.Value = irStep.Length > 0 ? $"{irText} · {irStep}" : irText;
+                _rowIr.ValueColor = irColor;
+                _rowBed.Value = bedStep.Length > 0 ? $"{bedText} · {bedStep}" : bedText;
+                _rowBed.ValueColor = bedColor;
+            }
 
             if (active && _runStart.HasValue) {
                 double el = _lastX - _runStart.Value;
+                double planned = PlannedTotal();
                 _rowElapsed.Value = ProfileMath.FormatDuration(el);
-                _rowRemaining.Value = _runPlan != null ? ProfileMath.FormatDuration(Math.Max(0, _runPlan.TotalSeconds - el)) : "—";
-                _stateCard.Detail = $"Pattern {pattern?.ToString() ?? "?"} · {ProfileMath.FormatDuration(el)} elapsed";
+                _rowRemaining.Value = planned > 0 ? ProfileMath.FormatDuration(Math.Max(0, planned - el)) : "—";
+                _stateCard.Detail = State.Sync.StepUnknown
+                    ? "Steps not reported: can't wait"
+                    : $"Pattern {pattern?.ToString() ?? "?"} · {ProfileMath.FormatDuration(el)} elapsed";
             } else {
                 _rowElapsed.Value = "—";
                 _rowRemaining.Value = "—";
                 _stateCard.Detail = State.Device.State == LinkStatus.NoResponse ? "No response from controller"
                     : pattern.HasValue ? $"Active pattern {pattern}" : "Ready";
             }
+        }
+
+        /// <summary>Planned duration of the run, ignoring waits (the longer of the two controllers).</summary>
+        private double PlannedTotal() {
+            double ir = _runPlan?.TotalSeconds ?? 0;
+            double bed = Bed ? _runBedPlan?.TotalSeconds ?? 0 : 0;
+            return Math.Max(ir, bed);
         }
 
         private void OnProgramStateChanged(ProgramState prev, ProgramState now) {
@@ -328,16 +462,27 @@ namespace ReflowLink.UI.Pages {
                 _runStart = _lastX;
                 _runPattern = State.Device.ActivePattern;
                 _plan.Points.Clear();
+                _bedPlan.Points.Clear();
                 _chart.Markers.Clear();
-                _runPlan = null;
+                _runPlan = _runBedPlan = null;
                 var prof = _runPattern.HasValue ? State.SlotProfiles[_runPattern.Value] : null;
+                if (_runPattern.HasValue && Bed) {
+                    // Started here or on the front panel: use the choices last written to this pattern, if they still fit.
+                    var sync = State.Settings.SyncFor(_runPattern.Value);
+                    State.Sync.Sync = sync != null && prof != null && sync.Steps == prof.Steps.Count ? sync : null;
+                }
                 if (prof != null && prev != ProgramState.Unknown) {
                     double start = _pv.Points.Count > 0 ? _pv.Points[_pv.Points.Count - 1].Y : State.Settings.PreviewStartTemperature;
                     _runPlan = ProfileMath.BuildPlannedCurve(prof, start);
                     foreach (var p in _runPlan.Points) _plan.Points.Add(new PointD(_runStart.Value + p.Time, p.Temp));
+                    if (Bed) {
+                        double bedStart = _bedPv.Points.Count > 0 ? _bedPv.Points[_bedPv.Points.Count - 1].Y : start;
+                        _runBedPlan = ProfileMath.BuildPlannedCurve(prof.ForBed(), bedStart);
+                        foreach (var p in _runBedPlan.Points) _bedPlan.Points.Add(new PointD(_runStart.Value + p.Time, p.Temp));
+                    }
                     for (int i = 0; i < _runPlan.StepStarts.Count; i++)
                         _chart.Markers.Add(new ChartMarker { X = _runStart.Value + _runPlan.StepStarts[i], Label = "S" + (i + 1) });
-                    _rowPlanned.Value = ProfileMath.FormatDuration(_runPlan.TotalSeconds);
+                    _rowPlanned.Value = ProfileMath.FormatDuration(PlannedTotal());
                 } else {
                     _chart.Markers.Add(new ChartMarker { X = _runStart.Value, Label = prev == ProgramState.Unknown ? "Run in progress" : "Start" });
                     _rowPlanned.Value = "—";
@@ -347,21 +492,46 @@ namespace ReflowLink.UI.Pages {
                 if (State.Settings.AutoRecordRuns && _recorder == null) StartRecording(true);
                 else if (_autoRecording) _autoStopAt = null;
             } else if (now == ProgramState.Idle && wasActive) {
-                _chart.Markers.Add(new ChartMarker { X = _lastX, Label = "End", Color = Theme.Green });
-                State.SetStatus("Program finished", StatusKind.Success);
-                if (_autoRecording && _recorder != null)
-                    _autoStopAt = DateTime.Now.AddSeconds(State.Settings.RecordAfterRunSeconds);
-                _runPattern = null;
+                bool bedStillRunning = Bed && State.Bed.IsConnected && _bedState is ProgramState.Running or ProgramState.Hold && !_userStopped;
+                _chart.Markers.Add(new ChartMarker { X = _lastX, Label = bedStillRunning ? "IR end" : "End", Color = Theme.Green });
+                if (bedStillRunning) State.SetStatus("Top IR program finished; bed still running", StatusKind.Success);
             }
+            OnCombinedStateChanged();
             UpdateProgramInfo(State.Device.Last);
             UpdateButtons();
         }
 
+        /// <summary>When neither controller runs any more: report the end, forget the run's waits and finish recording.</summary>
+        private void OnCombinedStateChanged() {
+            bool active = Combined() is ProgramState.Running or ProgramState.Hold;
+            if (active) {
+                if (!_wasActive) State.Sync.RunStarted();
+                _wasActive = true;
+                return;
+            }
+            if (!_wasActive || Combined() != ProgramState.Idle) return;
+            _wasActive = false;
+            State.SetStatus(_userStopped ? "Program stopped" : "Program finished", StatusKind.Success);
+            _userStopped = false;
+            State.Sync.Reset();
+            State.Sync.Sync = null;
+            if (_autoRecording && _recorder != null)
+                _autoStopAt = DateTime.Now.AddSeconds(State.Settings.RecordAfterRunSeconds);
+            _runPattern = null;
+        }
+
         private void ShowPlannedPreview() {
-            if (_state is ProgramState.Running or ProgramState.Hold) return;
+            if (Combined() is ProgramState.Running or ProgramState.Hold) return;
             int slot = _slot.SelectedIndex;
             var p = slot >= 0 ? State.SlotProfiles[slot] : null;
-            _rowPlanned.Value = p != null ? ProfileMath.FormatDuration(ProfileMath.BuildPlannedCurve(p, State.Settings.PreviewStartTemperature).TotalSeconds) : "—";
+            if (p == null) {
+                _rowPlanned.Value = "—";
+                return;
+            }
+            double start = State.Settings.PreviewStartTemperature;
+            double total = ProfileMath.BuildPlannedCurve(p, start).TotalSeconds;
+            if (Bed) total = Math.Max(total, ProfileMath.BuildPlannedCurve(p.ForBed(), start).TotalSeconds);
+            _rowPlanned.Value = ProfileMath.FormatDuration(total);
         }
 
         // ==================================================================== chart window
@@ -372,7 +542,7 @@ namespace ReflowLink.UI.Pages {
             if (w == 0) {
                 if (_runStart.HasValue) {
                     _chart.XMin = Math.Max(0, _runStart.Value - 10);
-                    double end = _runPlan != null ? _runStart.Value + _runPlan.TotalSeconds + 30 : now;
+                    double end = _runPlan != null ? _runStart.Value + PlannedTotal() + 30 : now;
                     _chart.XMax = Math.Max(now + 5, end);
                     _chart.MinXSpan = 60;
                 } else { _chart.XMin = Math.Max(0, now - 300); _chart.XMax = Math.Max(now, 300); _chart.MinXSpan = 300; }
@@ -394,13 +564,10 @@ namespace ReflowLink.UI.Pages {
         private void ClearChart() {
             _sessionStart = DateTime.Now;
             _lastX = 0;
-            _pv.Points.Clear();
-            _sp.Points.Clear();
-            _op.Points.Clear();
-            _plan.Points.Clear();
+            foreach (var s in _chart.Series) s.Points.Clear();
             _chart.Markers.Clear();
             _runStart = null;
-            _runPlan = null;
+            _runPlan = _runBedPlan = null;
             UpdateWindow();
         }
 
@@ -416,14 +583,17 @@ namespace ReflowLink.UI.Pages {
         // ==================================================================== program control
 
         private void UpdateButtons() {
-            bool conn = State.Device.IsConnected;
+            bool conn = State.Device.IsConnected && (!Bed || State.Bed.IsConnected);
+            bool any = State.Device.IsConnected || (Bed && State.Bed.IsConnected);
             bool busy = State.Busy;
-            bool active = _state is ProgramState.Running or ProgramState.Hold;
+            var combined = Combined();
+            bool active = combined is ProgramState.Running or ProgramState.Hold;
             _run.Enabled = conn && !busy && !active;
             _slot.Enabled = !busy && !active;
-            _stop.Enabled = conn && !busy;
+            _stop.Enabled = any && !busy;
             _hold.Enabled = conn && !busy && active;
-            bool resume = _state == ProgramState.Hold;
+            // With bed heat control the coordinator may hold one controller; Resume is about the user's own hold.
+            bool resume = Bed ? State.Sync.UserHold : _state == ProgramState.Hold;
             if (_hold.Text != (resume ? "Resume" : "Hold")) {
                 _hold.Text = resume ? "Resume" : "Hold";
                 _hold.Glyph = resume ? Glyph.Play : Glyph.Pause;
@@ -435,15 +605,19 @@ namespace ReflowLink.UI.Pages {
             if (slot < 0) return;
             if (State.IsSlotBlocked(slot)) {
                 DarkDialog.Error(FindForm(), $"Pattern {slot} can't be started",
-                    $"The controller rejected part of the last profile written to pattern {slot}. Write a valid profile to it on the Profiles page before starting it.");
+                    $"A controller rejected part of the last profile written to pattern {slot}. Write a valid profile to it on the Profiles page before starting it.");
                 return;
             }
-            // Read the pattern back and check it against ReflowLink's limit and the controller's setpoint limits
-            // right before starting, so a pattern changed elsewhere (front panel, other software) can't run out of range.
-            double limit = State.Settings.MaxTemperature;
-            var (ok, prof) = await State.RunAsync($"Starting pattern {slot}", (d, progress, ct) => {
-                var p = d.CheckPattern(slot, limit, progress, ct);
-                d.Start(slot);
+            // Read the pattern back and check it against ReflowLink's limits and the controllers' setpoint limits right
+            // before starting, so a pattern changed elsewhere (front panel, other software) can't run out of range.
+            double limit = State.Settings.MaxTemperature, bedLimit = State.Settings.Bed.MaxTemperature;
+            bool both = Bed;
+            var sync = both ? State.Settings.SyncFor(slot) : null;
+            State.Sync.Reset();
+            State.Sync.Sync = null; // set once the pattern has been checked
+            var (ok, prof) = await State.RunPairAsync(both ? $"Starting pattern {slot} on both controllers" : $"Starting pattern {slot}", (ir, bed, progress, ct) => {
+                var p = PatternPair.Check(ir, bed, slot, limit, bedLimit, progress, ct);
+                PatternPair.Start(ir, bed, slot);
                 return p;
             });
             if (!ok) return;
@@ -452,17 +626,58 @@ namespace ReflowLink.UI.Pages {
                 prof.Name = known.Name;
                 prof.Notes = known.Notes;
             }
+            if (sync != null && sync.ApplyTo(prof)) {
+                State.Sync.Sync = sync;
+            } else if (sync != null) {
+                State.SetStatus("The Wait for Bed / Wait for IR choices saved for this pattern don't match it any more, so they aren't used. Write the profile again.", StatusKind.Warning);
+            }
             State.SetSlotProfile(slot, prof);
             State.Device.NotePattern(slot);
+            if (both) State.Bed.NotePattern(slot);
         }
 
         private async Task HoldOrResume() {
-            if (_state == ProgramState.Hold) await State.RunAsync("Resuming program", d => d.Resume());
-            else await State.RunAsync("Holding program", d => d.Hold());
+            if (!Bed) {
+                if (_state == ProgramState.Hold) await State.RunAsync("Resuming program", d => d.ResumeIfHeld());
+                else await State.RunAsync("Holding program", d => d.Hold());
+                return;
+            }
+            if (State.Sync.UserHold) {
+                var (ok, _) = await State.RunPairAsync("Resuming both programs", (ir, bed, p, ct) => { PatternPair.Resume(ir, bed); return true; });
+                if (ok) State.Sync.UserHold = false;
+            } else {
+                // Stop the coordinator first, so it can't resume anything meanwhile. If the hold only partly worked, the user
+                // hold stays on, so Resume puts back whatever was held.
+                State.Sync.UserHold = true;
+                await State.RunPairAsync("Holding both programs", (ir, bed, p, ct) => { PatternPair.Hold(ir, bed); return true; });
+            }
+            UpdateButtons();
         }
 
         private async Task StopProgram() {
-            await State.RunAsync("Stopping program", d => d.Stop());
+            _userStopped = true;
+            if (!Bed) {
+                var (stopped, _) = await State.RunAsync("Stopping program", d => d.Stop());
+                if (!stopped) _userStopped = false;
+                return;
+            }
+            State.Sync.UserHold = true; // cancels queued holds and resumes, and blocks new ones while stopping
+            var (ok, _) = await State.StopAllAsync();
+            if (ok) State.Sync.Halt();
+            else _userStopped = false; // the user hold stays on: nothing is resumed automatically after a failed stop
+        }
+
+        /// <summary>The bed controller stopped answering during a run: stop the IR and tell the user.</summary>
+        private async Task OnBedLost() {
+            string result;
+            try {
+                await State.Device.RunAsync(d => d.Stop());
+                result = "The Top IR program was stopped. The bed controller keeps running its own program: stop it on its front panel if it's still heating.";
+            } catch (Exception ex) {
+                result = $"The Top IR program couldn't be stopped ({ex.Message}). Stop both programs on the station's front panels.";
+            }
+            State.SetStatus("Bed Heat controller stopped answering: Top IR program stopped", StatusKind.Error);
+            DarkDialog.Error(FindForm(), "Bed Heat controller not answering", "The Bed Heat controller stopped answering during the run.\n\n" + result);
         }
 
         // ==================================================================== recording
@@ -474,7 +689,7 @@ namespace ReflowLink.UI.Pages {
                 var prof = pattern.HasValue ? State.SlotProfiles[pattern.Value] : null;
                 string label = prof != null && !string.IsNullOrWhiteSpace(prof.Name) ? prof.Name
                     : pattern.HasValue ? "pattern" + pattern.Value : "session";
-                _recorder = new CsvRecorder(State.Settings.EffectiveLogFolder, label);
+                _recorder = new CsvRecorder(State.Settings.EffectiveLogFolder, label, Bed);
                 _autoRecording = auto;
                 _autoStopAt = null;
                 _recordInfo.Text = "Recording · 0 rows\n" + Path.GetFileName(_recorder.FilePath);
@@ -512,7 +727,7 @@ namespace ReflowLink.UI.Pages {
             } catch { }
         }
 
-        public bool IsProgramActive => _state is ProgramState.Running or ProgramState.Hold;
+        public bool IsProgramActive => Combined() is ProgramState.Running or ProgramState.Hold;
 
         public void Shutdown() {
             if (_recorder != null) StopRecording();

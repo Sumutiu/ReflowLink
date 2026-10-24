@@ -71,6 +71,8 @@ namespace ReflowLink.UI {
         public static readonly Font Heading = new(UiSemibold, 11.5f, SemiStyle);
         public static readonly Font Title = new(UiSemibold, 17f, SemiStyle);
         public static readonly Font Big = new(UiLight, 26f);
+        /// <summary>Read-outs in split tiles (two values side by side).</summary>
+        public static readonly Font Medium = new(UiLight, 18f);
         public static readonly Font Mono = new(MonoFamily, 9f);
 
         private static string PickFamily(params string[] names) {

@@ -8,6 +8,7 @@ using System.Linq;
 using System.Threading;
 using ReflowLink.Model;
 using ReflowLink.Protocol;
+using ReflowLink.Services;
 
 namespace ReflowLink.Tests {
     internal static class Program {
@@ -255,6 +256,273 @@ namespace ReflowLink.Tests {
                 True(noD.Overshoot > factory.Overshoot, "less D overshoots more");
                 var limited = PidSimulator.Run(10, 61, 9, 40, 1, 150);
                 True(limited.RampLag > factory.RampLag + 5, "a low output limit can't follow the ramp");
+            });
+
+            Run("Bed heat: old profiles read the bed target as the IR target", () => {
+                string path = Path.Combine(Path.GetTempPath(), "reflowlink_old" + ReflowProfile.FileExtension);
+                File.WriteAllText(path, "<?xml version=\"1.0\"?><ReflowProfile version=\"1\"><Name>Old</Name><Holdback>5</Holdback>"
+                    + "<Steps><Step ramp=\"1\" target=\"150\" hold=\"30\" /><Step ramp=\"0.5\" target=\"230\" hold=\"20\" /></Steps></ReflowProfile>");
+                var p = ReflowProfile.Load(path);
+                File.Delete(path);
+                Eq(150.0, p.Steps[0].BedTarget);
+                Eq(230.0, p.Steps[1].BedTarget);
+                False(p.Steps[0].WaitForBed || p.Steps[0].WaitForIr, "no waits in old files");
+                Eq(null, p.BedHoldback);
+            });
+
+            Run("Bed heat: profile fields round-trip and the bed copy uses bed targets", () => {
+                var p = new ReflowProfile { Name = "Pair", Holdback = 5, BedHoldback = 8 };
+                p.Steps.Add(new ProfileStep(1, 150, 30) { BedTarget = 120, WaitForBed = true });
+                p.Steps.Add(new ProfileStep(0.5, 230, 20) { BedTarget = 180, WaitForIr = true });
+                string path = Path.Combine(Path.GetTempPath(), "reflowlink_pair" + ReflowProfile.FileExtension);
+                p.Save(path);
+                var q = ReflowProfile.Load(path);
+                File.Delete(path);
+                Eq(120.0, q.Steps[0].BedTarget);
+                Eq(180.0, q.Steps[1].BedTarget);
+                True(q.Steps[0].WaitForBed && !q.Steps[0].WaitForIr, "step 1 waits for bed");
+                True(q.Steps[1].WaitForIr && !q.Steps[1].WaitForBed, "step 2 waits for IR");
+                Eq(8.0, q.BedHoldback);
+                var bed = q.ForBed();
+                Eq(180.0, bed.Steps[1].Target);
+                Eq(0.5, bed.Steps[1].RampRate);
+                Eq(20, bed.Steps[1].HoldSeconds);
+                Eq(8.0, bed.Holdback);
+                var errors = q.Validate(260, 150).ToList();
+                True(errors.Any(e => e.Contains("bed target 180")), "bed limit checked: " + string.Join(" | ", errors));
+            });
+
+            Run("Bed heat: Wait for Bed / Wait for IR choices are remembered per pattern", () => {
+                var p = new ReflowProfile { Holdback = 5, BedHoldback = 7 };
+                p.Steps.Add(new ProfileStep(1, 150, 30) { WaitForBed = true });
+                p.Steps.Add(new ProfileStep(1, 200, 30) { WaitForIr = true });
+                p.Steps.Add(new ProfileStep(1, 230, 30) { WaitForBed = true, WaitForIr = true });
+                var sync = PatternSync.From(4, p);
+                True(sync.WaitForBed(1) && !sync.WaitForBed(2) && sync.WaitForBed(3), "wait for bed mask");
+                True(!sync.WaitForIr(1) && sync.WaitForIr(2) && sync.WaitForIr(3), "wait for IR mask");
+                Eq(7.0, sync.BedHoldback);
+                var s = new AppSettings();
+                s.SetSync(4, p);
+                s.SetSync(4, p);
+                Eq(1, s.PatternSyncs.Count);
+                var read = new ReflowProfile();
+                for (int i = 0; i < 3; i++) read.Steps.Add(new ProfileStep(1, 100, 10));
+                s.SyncFor(4).ApplyTo(read);
+                True(read.Steps[2].WaitForBed && read.Steps[2].WaitForIr && read.Steps[0].WaitForBed && !read.Steps[0].WaitForIr, "applied to a read profile");
+            });
+
+            Run("Bed heat: the coordinator holds whichever heater is ahead", () => {
+                var p = new ReflowProfile { Holdback = 5, BedHoldback = 5 };
+                p.Steps.Add(new ProfileStep(1, 150, 30) { WaitForBed = true });
+                p.Steps.Add(new ProfileStep(1, 200, 30) { WaitForIr = true });
+                p.Steps.Add(new ProfileStep(1, 230, 30));
+                p.Steps.Add(new ProfileStep(1, 230, 30) { WaitForBed = true, WaitForIr = true });
+                var sync = PatternSync.From(0, p);
+                SyncSide Side(ProgramState st, double pv, double sp, int? step) => new(st, pv, sp, step);
+                var run = ProgramState.Running;
+                // Step 1 has Wait for Bed: the bed 10 °C behind its setpoint holds the IR.
+                Eq((true, false), SyncCoordinator.Decide(sync, Side(run, 140, 140, 1), Side(run, 100, 110, 1)));
+                // Within the bed holdback: nobody waits.
+                Eq((false, false), SyncCoordinator.Decide(sync, Side(run, 140, 140, 1), Side(run, 107, 110, 1)));
+                // The IR finished step 1 (Wait for Bed) first: it waits for the bed to finish step 1 too.
+                Eq((true, false), SyncCoordinator.Decide(sync, Side(run, 150, 152, 2), Side(run, 120, 120, 1)));
+                // The bed finished step 1 first, but step 1 has no Wait for IR: it carries on.
+                Eq((false, false), SyncCoordinator.Decide(sync, Side(run, 150, 150, 1), Side(run, 120, 120, 2)));
+                // Step 2, same step: the IR lagging holds the bed; the bed lagging doesn't hold the IR.
+                Eq((false, true), SyncCoordinator.Decide(sync, Side(run, 150, 170, 2), Side(run, 120, 120, 2)));
+                Eq((false, false), SyncCoordinator.Decide(sync, Side(run, 170, 170, 2), Side(run, 100, 120, 2)));
+                // Step 3 has no waits.
+                Eq((false, false), SyncCoordinator.Decide(sync, Side(run, 150, 230, 3), Side(run, 100, 150, 3)));
+                // The bed finished step 2 (Wait for IR) first: it waits for the IR.
+                Eq((false, true), SyncCoordinator.Decide(sync, Side(run, 190, 190, 2), Side(run, 150, 150, 3)));
+                // Step 4 has both: whichever lags holds the other.
+                Eq((true, false), SyncCoordinator.Decide(sync, Side(run, 230, 230, 4), Side(run, 200, 230, 4)));
+                Eq((false, true), SyncCoordinator.Decide(sync, Side(run, 200, 230, 4), Side(run, 230, 230, 4)));
+                // One controller finished or stopped: never hold the other.
+                Eq((false, false), SyncCoordinator.Decide(sync, Side(run, 150, 152, 2), Side(ProgramState.Idle, 120, 120, null)));
+                // Steps not reported: can't apply per-step choices.
+                Eq((false, false), SyncCoordinator.Decide(sync, Side(run, 140, 140, null), Side(run, 100, 110, null)));
+                Eq((false, false), SyncCoordinator.Decide(null, Side(run, 140, 140, 1), Side(run, 100, 110, 1)));
+                // Segment numbering: plain steps, or ramp + dwell counted separately.
+                Eq(3, SyncCoordinator.StepOf(3, 8, false));
+                Eq(2, SyncCoordinator.StepOf(4, 3, false));
+                Eq(3, SyncCoordinator.StepOf(5, 8, true));
+                Eq(null, SyncCoordinator.StepOf(0, 8, false));
+            });
+
+            Run("Bed heat: a pattern is written to and read from both controllers", () => {
+                using var ci = NewSim(out _);
+                using var cb = NewSim(out _);
+                var ir = new Pc410Device(ci);
+                var bed = new Pc410Device(cb);
+                var p = new ReflowProfile { Holdback = 5, BedHoldback = 9 };
+                p.Steps.Add(new ProfileStep(1, 150, 30) { BedTarget = 120 });
+                p.Steps.Add(new ProfileStep(0.5, 230, 20) { BedTarget = 180 });
+                PatternPair.Write(ir, bed, p, 3, UnusedStepMode.Zeros, true, null, CancellationToken.None);
+                Eq("230.0", ci.Read("l2"));
+                Eq("180.0", cb.Read("l2"));
+                Eq(9.0, bed.ReadHoldback());
+                var read = PatternPair.Read(ir, bed, 3, null, CancellationToken.None);
+                Eq(0, read.Warnings.Count);
+                Eq(120.0, read.Profile.Steps[0].BedTarget);
+                Eq(230.0, read.Profile.Steps[1].Target);
+                Eq(9.0, read.Profile.BedHoldback);
+                // A bed pattern with different timing is reported.
+                cb.Write("ch", "3");
+                cb.Write("t1", "45");
+                read = PatternPair.Read(ir, bed, 3, null, CancellationToken.None);
+                True(read.Warnings.Count == 1 && read.Warnings[0].Contains("Step 1"), string.Join(" | ", read.Warnings));
+            });
+
+            Run("Bed heat: limits of both controllers are checked before anything is written", () => {
+                using var ci = NewSim(out _);
+                var simBed = new SimulatedPc410(1, 1, null, 150);
+                simBed.Open();
+                using var cb = new Pc410Client(simBed, 1) { ResponseTimeoutMs = 150, Retries = 1 };
+                var ir = new Pc410Device(ci);
+                var bed = new Pc410Device(cb);
+                var p = new ReflowProfile();
+                p.Steps.Add(new ProfileStep(1, 200, 10) { BedTarget = 180 });
+                var ex = Catch<ProfileRejectedException>(() => PatternPair.Write(ir, bed, p, 2, UnusedStepMode.Zeros, true, null, CancellationToken.None));
+                False(ex.PatternChanged, "nothing written");
+                True(ex.Issues[0].StartsWith(PatternPair.BedPrefix), ex.Issues[0]);
+                ci.Write("ch", "2");
+                Eq("0.0", ci.Read("l1")); // the IR pattern wasn't touched either
+            });
+
+            Run("Bed heat: a bed refusal after the IR was written blocks the pattern", () => {
+                using var ci = NewSim(out _);
+                using var cb = NewSim(out var simBed);
+                var ir = new Pc410Device(ci);
+                var bed = new Pc410Device(cb);
+                simBed.RefusedWrites.Add("l2");
+                var p = new ReflowProfile();
+                p.Steps.Add(new ProfileStep(1, 150, 10));
+                p.Steps.Add(new ProfileStep(1, 200, 10));
+                var ex = Catch<ProfileRejectedException>(() => PatternPair.Write(ir, bed, p, 5, UnusedStepMode.Zeros, true, null, CancellationToken.None));
+                True(ex.PatternChanged, "the pair no longer matches");
+                True(ex.Issues[0].StartsWith(PatternPair.BedPrefix), ex.Issues[0]);
+            });
+
+            Run("Bed heat: both start together, and the IR is stopped if the bed can't start", () => {
+                using var ci = NewSim(out _);
+                using var cb = NewSim(out var simBed);
+                var ir = new Pc410Device(ci);
+                var bed = new Pc410Device(cb);
+                var p = new ReflowProfile();
+                p.Steps.Add(new ProfileStep(1, 150, 600));
+                PatternPair.Write(ir, bed, p, 1, UnusedStepMode.Zeros, true, null, CancellationToken.None);
+                PatternPair.Check(ir, bed, 1, 260, 260, null, CancellationToken.None);
+                PatternPair.Start(ir, bed, 1);
+                Eq(ProgramState.Running, ir.ReadState());
+                Eq(ProgramState.Running, bed.ReadState());
+                PatternPair.Hold(ir, bed);
+                Eq(ProgramState.Hold, bed.ReadState());
+                PatternPair.Stop(ir, bed);
+                Eq(ProgramState.Idle, ir.ReadState());
+                Eq(ProgramState.Idle, bed.ReadState());
+
+                simBed.RefusedWrites.Add("OS");
+                var ex = Catch<Pc410Exception>(() => PatternPair.Start(ir, bed, 1));
+                True(ex.Message.Contains("stopped again"), ex.Message);
+                Eq(ProgramState.Idle, ir.ReadState());
+            });
+
+            Run("Bed heat: resume never restarts an idle controller, and hold skips idle ones", () => {
+                using var ci = NewSim(out _);
+                using var cb = NewSim(out _);
+                var ir = new Pc410Device(ci);
+                var bed = new Pc410Device(cb);
+                False(ir.ResumeIfHeld(), "nothing to resume");
+                Eq(ProgramState.Idle, ir.ReadState());
+                bed.Start(0);
+                PatternPair.Hold(ir, bed); // the IR is idle: only the bed is held, without an error
+                Eq(ProgramState.Idle, ir.ReadState());
+                Eq(ProgramState.Hold, bed.ReadState());
+                PatternPair.Resume(ir, bed);
+                Eq(ProgramState.Idle, ir.ReadState());
+                Eq(ProgramState.Running, bed.ReadState());
+                bed.Stop();
+            });
+
+            Run("Bed heat: a start is refused when the two patterns differ", () => {
+                using var ci = NewSim(out _);
+                using var cb = NewSim(out _);
+                var ir = new Pc410Device(ci);
+                var bed = new Pc410Device(cb);
+                var p = new ReflowProfile();
+                p.Steps.Add(new ProfileStep(1, 150, 30));
+                p.Steps.Add(new ProfileStep(1, 180, 30));
+                ir.UploadProfile(p, 4, UnusedStepMode.Zeros, true, null, CancellationToken.None); // written with bed heat off
+                var one = new ReflowProfile();
+                one.Steps.Add(new ProfileStep(1, 150, 30));
+                bed.UploadProfile(one, 4, UnusedStepMode.Zeros, true, null, CancellationToken.None);
+                var ex = Catch<ProfileRejectedException>(() => PatternPair.Check(ir, bed, 4, 260, 260, null, CancellationToken.None));
+                False(ex.PatternChanged, "nothing changed");
+                True(ex.Issues.Any(i => i.Contains("step(s)")), string.Join(" | ", ex.Issues));
+            });
+
+            Run("Bed heat: nothing is written while either controller runs a program", () => {
+                using var ci = NewSim(out _);
+                using var cb = NewSim(out _);
+                var ir = new Pc410Device(ci);
+                var bed = new Pc410Device(cb);
+                bed.Start(0);
+                var p = new ReflowProfile();
+                p.Steps.Add(new ProfileStep(1, 150, 30));
+                Catch<Pc410Exception>(() => PatternPair.Write(ir, bed, p, 6, UnusedStepMode.Zeros, true, null, CancellationToken.None));
+                ci.Write("ch", "6");
+                Eq("0.0", ci.Read("l1"));
+                bed.Stop();
+            });
+
+            Run("Bed heat: a failed IR start stops both again", () => {
+                using var ci = NewSim(out var simIr);
+                using var cb = NewSim(out _);
+                var ir = new Pc410Device(ci);
+                var bed = new Pc410Device(cb);
+                simIr.RefusedWrites.Add("OS");
+                var ex = Catch<Pc410Exception>(() => PatternPair.Start(ir, bed, 0));
+                True(ex.Message.Contains("Top IR"), ex.Message);
+                Eq(ProgramState.Idle, bed.ReadState());
+            });
+
+            Run("Bed heat: operations on both connected controllers don't deadlock", () => {
+                var ir = new DeviceService();
+                var bed = new DeviceService();
+                try {
+                    var options = new ConnectionOptions { UseSimulator = true, Address = 1, PollIntervalMs = 200 };
+                    True(ir.ConnectAsync(options).Wait(10000), "IR connected");
+                    True(bed.ConnectAsync(options).Wait(10000), "bed connected");
+                    var p = new ReflowProfile { Holdback = 5, BedHoldback = 6 };
+                    p.Steps.Add(new ProfileStep(1, 150, 30) { BedTarget = 120 });
+                    for (int i = 0; i < 5; i++) {
+                        var write = DeviceService.RunBothAsync(ir, bed, (a, b) => PatternPair.Write(a, b, p, 2, UnusedStepMode.Zeros, true, null, CancellationToken.None));
+                        True(write.Wait(15000), "pair write finished (attempt " + (i + 1) + ")");
+                        var read = DeviceService.RunBothAsync(ir, bed, (a, b) => PatternPair.Read(a, b, 2, null, CancellationToken.None));
+                        True(read.Wait(15000), "pair read finished");
+                        Eq(120.0, read.Result.Profile.Steps[0].BedTarget);
+                    }
+                } finally {
+                    ir.Dispose();
+                    bed.Dispose();
+                }
+            });
+
+            Run("Bed heat: bed settings are sanitised and give their own connection", () => {
+                var s = new AppSettings();
+                s.Bed.Address = 300;
+                s.Bed.MaxTemperature = -5;
+                s.Bed.PortName = "COM7";
+                s.Bed.RampUnit = RampUnit.PerMinute;
+                s.Sanitize();
+                Eq(1, s.Bed.Address);
+                Eq(260.0, s.Bed.MaxTemperature);
+                var o = s.Bed.Connection();
+                Eq("COM7", o.PortName);
+                Eq(RampUnit.PerMinute, o.Units.Ramp);
+                Eq(DwellUnit.Seconds, o.Units.Dwell);
+                False(s.Bed.Enabled, "off by default");
             });
 
             Run("END marker mode terminates the program", () => {

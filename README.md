@@ -24,6 +24,16 @@ There are two limits, and a profile has to respect both:
 
 When you write a profile, ReflowLink first checks every target against `HS`/`LS` and refuses the write if one is outside, without changing the pattern. The PC410 answers each written value with ACK (accepted) or NAK (rejected), and ReflowLink also reads the targets back in case a controller limits a value instead of rejecting it. If the controller rejects or changes a target during the write, ReflowLink stops, clears the pattern (ends it at step 1) so it can't run with partial settings, lists the rejected values, and won't start that pattern until a valid profile is written to it. Before every start, the pattern is read back and checked against both limits.
 
+## Bed heat control (second PC410)
+
+A second PC410 can control the bottom (bed) heater. Switch on *Settings → Station → Use Bed Heat Control*, then set up *Bed Heat Connection* (its own serial port, address and units; ramp per second and hold in seconds by default) and *Bed Heat Profiles* (its own maximum temperature). The sidebar gets a second connection box, and there's a *Bed Heat Console* and *Bed Heat Control Tuning* page.
+
+- **Profiles:** each step has an *IR Target* and a *Bed Heat Target*. Both controllers use the same ramp rate and hold time, and each has its own global holdback. Writing or reading pattern N does both controllers; both setpoint limits are checked first, and if the bed controller refuses part of its profile after the IR pattern was written, pattern N is blocked until it's written again.
+- **Wait for Bed / Wait for IR (per step):** the two PC410s can't talk to each other, so ReflowLink holds whichever heater is ahead. *Wait for Bed* on a step keeps the IR from getting ahead of the bed in that step: the IR is held while the bed lags its setpoint by more than the bed holdback, or when the IR has already moved on to the next step. *Wait for IR* does the same the other way round. Put the toggle on the step where the heaters drift apart, for example the step where the bed has the longer ramp. ReflowLink remembers these choices per pattern, because the controllers can't store them.
+- **Dashboard:** temperature, setpoint and output tiles show both heaters; Start, Hold and Stop act on both. If one controller doesn't start, the other is stopped again. A pattern whose two halves don't match (different steps, ramps or holds) can't be started.
+- **Safety:** a resume is only ever sent to a controller that's on hold (Run on an idle PC410 would restart its pattern). If the bed controller stops answering during a run, the IR program is stopped and you're alerted. CSV logs get the bed columns and a "waiting" column.
+- **Step numbering:** the waits use each controller's current segment (`SE`). If a controller counts ramp and dwell as separate segments, ReflowLink switches to that once it sees a segment number above the step count.
+
 ## Control Tuning
 
 The *Control Tuning* page shows the controller's PID and output settings, explains what each one does, and lets you change them. ReflowLink reads them every time it connects; while offline it shows the factory values of an ACHI IR6500 (P 10, I 61, D 9, output limit 100 %, cycle time 3.0 s, sensor break power 0 %).

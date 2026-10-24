@@ -21,7 +21,11 @@ namespace ReflowLink.UI.Pages {
         private readonly StringBuilder _plain = new();
         private int _lines;
 
-        public ConsolePage(AppState state) : base(state, "Console", "Raw serial traffic and manual parameter access") {
+        private readonly ControllerChannel _channel;
+
+        public ConsolePage(AppState state, ControllerChannel channel)
+            : base(state, $"{channel.Name} Console", $"Raw serial traffic and manual parameter access for the {channel.Name} controller") {
+            _channel = channel;
             // ---------------------------------------------------------------- manual access card
             _mnemonic = new ModernTextBox {
                 Width = Theme.S(80),
@@ -116,15 +120,15 @@ namespace ReflowLink.UI.Pages {
             Controls.Add(spacer);
             Controls.Add(manualCard);
 
-            State.Device.Traffic += OnTraffic;
-            State.Device.StateChanged += (s, e) => UpdateButtons();
+            _channel.Device.Traffic += OnTraffic;
+            _channel.Device.StateChanged += (s, e) => UpdateButtons();
             State.BusyChanged += UpdateButtons;
             UpdateButtons();
             Append(TrafficKind.Info, null, "Console ready. Manual commands appear here; enable “Polling” to also see background telemetry.", false);
         }
 
         private void UpdateButtons() {
-            bool ok = State.Device.IsConnected && !State.Busy;
+            bool ok = _channel.Device.IsConnected && !State.Busy;
             _readBtn.Enabled = _writeBtn.Enabled = ok;
         }
 
@@ -192,7 +196,7 @@ namespace ReflowLink.UI.Pages {
 
         private async System.Threading.Tasks.Task ManualRead(string mn) {
             if (mn.Length != 2) { State.SetStatus("Enter a two-letter parameter code", StatusKind.Warning); return; }
-            var (ok, v) = await State.RunAsync($"Reading {mn}", (d, p, ct) => d.Client.Read(mn));
+            var (ok, v) = await State.RunOnAsync(_channel, $"Reading {_channel.ShortName} {mn}", (d, p, ct) => d.Client.Read(mn));
             if (ok) {
                 Append(TrafficKind.Info, null, $"{mn} = {v}", false);
                 _value.Text = v.Trim();
@@ -204,14 +208,14 @@ namespace ReflowLink.UI.Pages {
             string v = _value.Text.Trim();
             if (mn.Length != 2) { State.SetStatus("Enter a two-letter parameter code", StatusKind.Warning); return; }
             if (v.Length == 0) { State.SetStatus("Enter a value to write", StatusKind.Warning); return; }
-            if (!DarkDialog.Confirm(FindForm(), $"Write {mn} = {v}?", "The value is sent to the controller exactly as typed. Writing the wrong parameter can change controller behaviour.", "Write", "Cancel", true))
+            if (!DarkDialog.Confirm(FindForm(), $"Write {mn} = {v} to the {_channel.Name} controller?", "The value is sent exactly as typed. Writing the wrong parameter can change controller behaviour.", "Write", "Cancel", true))
                 return;
-            var (ok, _) = await State.RunAsync($"Writing {mn}", d => d.Client.Write(mn, v));
+            var (ok, _) = await State.RunOnAsync(_channel, $"Writing {_channel.ShortName} {mn}", d => d.Client.Write(mn, v));
             if (ok) Append(TrafficKind.Info, null, $"{mn} ← {v}  (accepted)", false);
         }
 
         private void SaveLog() {
-            using var d = new SaveFileDialog { Filter = "Text file (*.txt)|*.txt", FileName = $"ReflowLink_serial_{DateTime.Now:yyyy-MM-dd_HHmmss}.txt" };
+            using var d = new SaveFileDialog { Filter = "Text file (*.txt)|*.txt", FileName = $"ReflowLink_{_channel.ShortName}_serial_{DateTime.Now:yyyy-MM-dd_HHmmss}.txt" };
             if (d.ShowDialog(this) != DialogResult.OK) return;
             try {
                 File.WriteAllText(d.FileName, _plain.ToString(), Encoding.UTF8);

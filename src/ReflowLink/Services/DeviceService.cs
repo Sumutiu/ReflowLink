@@ -56,13 +56,13 @@ namespace ReflowLink.Services {
         public event Action<TrafficEntry> Traffic;
         public event Action<ProgramState, ProgramState> ProgramStateChanged;
 
-        public async Task ConnectAsync(AppSettings s) {
+        public async Task ConnectAsync(ConnectionOptions s) {
             if (IsConnected || State == LinkStatus.Connecting) return;
             SetState(LinkStatus.Connecting);
             try {
                 ITransport transport;
                 if (s.UseSimulator) {
-                    transport = new SimulatedPc410(s.Address, s.SimulatorSpeed, s.Units, s.Station.MaxTemperature);
+                    transport = new SimulatedPc410(s.Address, s.SimulatorSpeed, s.Units, s.SimulatorLimit);
                 } else {
                     if (string.IsNullOrWhiteSpace(s.PortName)) throw new InvalidOperationException("Select a serial port first.");
                     transport = new SerialTransport(new SerialSettings {
@@ -163,6 +163,22 @@ namespace ReflowLink.Services {
         }
 
         public Task RunAsync(Action<Pc410Device> op) => RunAsync<bool>(d => { op(d); return true; });
+
+        /// <summary>
+        /// Runs an operation on two controllers with both locked on the same thread (the first one first). Monitor locks
+        /// belong to a thread, so nesting two <see cref="RunAsync{T}"/> calls could deadlock.
+        /// </summary>
+        public static Task<T> RunBothAsync<T>(DeviceService first, DeviceService second, Func<Pc410Device, Pc410Device, T> op) {
+            var a = first._device ?? throw new InvalidOperationException("Not connected.");
+            var b = second?._device;
+            if (second != null && b == null) throw new InvalidOperationException("Not connected.");
+            return Task.Run(() => {
+                lock (a.Client.SyncRoot) {
+                    if (b == null) return op(a, null);
+                    lock (b.Client.SyncRoot) return op(a, b);
+                }
+            });
+        }
 
         /// <summary>Applies new controller units (station changed while connected).</summary>
         public void SetUnits(ControllerUnits units) {

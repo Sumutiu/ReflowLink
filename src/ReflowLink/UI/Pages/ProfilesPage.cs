@@ -41,20 +41,20 @@ namespace ReflowLink.UI.Pages {
     public sealed class ProfilesPage : PageBase {
         private sealed class StepRow {
             public ThemedLabel Number;
-            public ToggleSwitch Use;
-            public NumberBox Ramp, Target, Hold;
+            public ToggleSwitch Use, WaitForBed, WaitForIr;
+            public NumberBox Ramp, Target, BedTarget, Hold;
             public ThemedLabel Time;
         }
 
         private readonly List<StepRow> _rows = [];
         private readonly ModernTextBox _name;
         private readonly ModernDropDown _slot;
-        private readonly ModernButton _read, _write, _new, _open, _save, _saveAs, _readHoldback, _writeHoldback;
-        private readonly NumberBox _holdback, _startTemp;
+        private readonly ModernButton _read, _write, _new, _open, _save, _saveAs, _readHoldback, _writeHoldback, _readBedHoldback, _writeBedHoldback;
+        private readonly NumberBox _holdback, _bedHoldback, _startTemp;
         private readonly ThemedLabel _validation;
         private readonly CardHeader _editorHeader;
         private readonly ChartView _chart;
-        private readonly ChartSeries _curve;
+        private readonly ChartSeries _curve, _bedCurve;
         private readonly MiniStat _statTotal, _statPeak, _statSteps, _statRamp;
         private readonly Timer _previewTimer = new() { Interval = 120 };
 
@@ -91,8 +91,8 @@ namespace ReflowLink.UI.Pages {
             _write = new ModernButton("Write to controller", Glyph.Upload, ButtonKind.Primary) { Margin = Padding.Empty };
             _write.Click += async (s, e) => await WriteToController();
             var tip = Theme.CreateToolTip();
-            tip.SetToolTip(_read, "Read the selected pattern from the controller into the editor");
-            tip.SetToolTip(_write, "Store the edited profile in the selected controller pattern");
+            tip.SetToolTip(_read, "Read the selected pattern into the editor (from both controllers when bed heat control is on)");
+            tip.SetToolTip(_write, "Store the edited profile in the selected pattern (of both controllers when bed heat control is on)");
 
             var right = Flow();
             right.Controls.AddRange([_slot, _read, _write]);
@@ -113,40 +113,58 @@ namespace ReflowLink.UI.Pages {
             // ---------------------------------------------------------------- editor card
             var editor = new CardPanel { Dock = DockStyle.Fill, Margin = new Padding(0, 0, Theme.S(8), 0), AutoScroll = true };
             _editorHeader = new CardHeader("Profile", "Not saved yet");
-            var grid = Table(6, Pc410Protocol.SegmentCount + 1);
+            var grid = Table(9, Pc410Protocol.SegmentCount + 1);
             grid.Dock = DockStyle.Top;
             grid.AutoSize = true;
             grid.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-            int[] widths = [30, 52, 114, 114, 98, 58];
+            int[] widths = [26, 46, 100, 100, 100, 86, 60, 60, 54];
             foreach (var w in widths) grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(w)));
-            string[] heads = ["#", "Use", "Ramp", "Target", "Hold", "Time"];
+            string[] heads = ["#", "Use", "Ramp", "IR Target", "Bed Heat Target", "IR Hold", "Wait for Bed", "Wait for IR", "Time"];
             for (int c = 0; c < heads.Length; c++) {
-                var h = new ThemedLabel(heads[c].ToUpperInvariant(), Theme.SmallBold, Theme.TextFaint) { Margin = new Padding(Theme.S(2), 0, 0, Theme.S(6)) };
-                if (c is >= 2 and <= 4) { h.AutoSize = false; h.Width = Theme.S(widths[c] - 12); h.TextAlign = ContentAlignment.MiddleRight; h.Height = Theme.S(18); }
+                var h = new ThemedLabel(heads[c].ToUpperInvariant(), Theme.SmallBold, Theme.TextFaint) {
+                    AutoSize = false,
+                    Width = Theme.S(widths[c] - (c is >= 2 and <= 5 ? 12 : 2)),
+                    Height = Theme.SmallBold.Height * 2 + Theme.S(4),
+                    TextAlign = c is >= 2 and <= 5 ? ContentAlignment.BottomRight : ContentAlignment.BottomLeft,
+                    Margin = new Padding(Theme.S(2), 0, 0, Theme.S(6)),
+                };
                 grid.Controls.Add(h, c, 0);
             }
+            tip.SetToolTip(grid.GetControlFromPosition(6, 0), "Hold the top IR while the bed is behind during this step");
+            tip.SetToolTip(grid.GetControlFromPosition(7, 0), "Hold the bed while the top IR is behind during this step");
             grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             for (int i = 0; i < Pc410Protocol.SegmentCount; i++) {
                 int idx = i;
+                NumberBox Box(double min, double max, int decimals, double step, string suffix, int width) =>
+                    new(min, max, decimals, step) { Suffix = suffix, Width = Theme.S(width), Anchor = AnchorStyles.Left, Margin = new Padding(0, Theme.S(4), 0, Theme.S(4)) };
                 var r = new StepRow {
                     Number = new ThemedLabel((i + 1).ToString(), Theme.BodyBold, Theme.TextDim) { Anchor = AnchorStyles.Left, Margin = new Padding(Theme.S(4), 0, 0, 0) },
                     Use = new ToggleSwitch() { Anchor = AnchorStyles.Left, Margin = Padding.Empty },
-                    Ramp = new NumberBox(0.01, 10, 2, 0.1) { Suffix = "°C/s", Width = Theme.S(106), Anchor = AnchorStyles.Left, Margin = new Padding(0, Theme.S(4), 0, Theme.S(4)) },
-                    Target = new NumberBox(0, 400, 1, 1) { Suffix = "°C", Width = Theme.S(106), Anchor = AnchorStyles.Left, Margin = new Padding(0, Theme.S(4), 0, Theme.S(4)) },
-                    Hold = new NumberBox(0, 9999, 0, 5) { Suffix = "s", Width = Theme.S(90), Anchor = AnchorStyles.Left, Margin = new Padding(0, Theme.S(4), 0, Theme.S(4)) },
+                    Ramp = Box(0.01, 10, 2, 0.1, "°C/s", 92),
+                    Target = Box(0, 400, 1, 1, "°C", 92),
+                    BedTarget = Box(0, 400, 1, 1, "°C", 92),
+                    Hold = Box(0, 9999, 0, 5, "s", 78),
+                    WaitForBed = new ToggleSwitch() { Anchor = AnchorStyles.Left, Margin = new Padding(Theme.S(6), 0, 0, 0) },
+                    WaitForIr = new ToggleSwitch() { Anchor = AnchorStyles.Left, Margin = new Padding(Theme.S(6), 0, 0, 0) },
                     Time = new ThemedLabel("", Theme.Small, Theme.TextDim) { Anchor = AnchorStyles.Left, Margin = new Padding(Theme.S(4), 0, 0, 0) },
                 };
                 r.Use.CheckedChanged += (s, e) => OnUseChanged(idx);
                 r.Ramp.TextChanged += (s, e) => MarkDirty();
                 r.Target.TextChanged += (s, e) => MarkDirty();
+                r.BedTarget.TextChanged += (s, e) => MarkDirty();
                 r.Hold.TextChanged += (s, e) => MarkDirty();
+                r.WaitForBed.CheckedChanged += (s, e) => MarkDirty();
+                r.WaitForIr.CheckedChanged += (s, e) => MarkDirty();
                 grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
                 grid.Controls.Add(r.Number, 0, i + 1);
                 grid.Controls.Add(r.Use, 1, i + 1);
                 grid.Controls.Add(r.Ramp, 2, i + 1);
                 grid.Controls.Add(r.Target, 3, i + 1);
-                grid.Controls.Add(r.Hold, 4, i + 1);
-                grid.Controls.Add(r.Time, 5, i + 1);
+                grid.Controls.Add(r.BedTarget, 4, i + 1);
+                grid.Controls.Add(r.Hold, 5, i + 1);
+                grid.Controls.Add(r.WaitForBed, 6, i + 1);
+                grid.Controls.Add(r.WaitForIr, 7, i + 1);
+                grid.Controls.Add(r.Time, 8, i + 1);
                 _rows.Add(r);
             }
 
@@ -156,37 +174,48 @@ namespace ReflowLink.UI.Pages {
             extras.AutoSize = true;
             extras.AutoSizeMode = AutoSizeMode.GrowAndShrink;
             extras.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            var hbRow = Flow();
-            var hbLabel = new ThemedLabel("Set Global Holdback", Theme.Body, Theme.Text) { Margin = new Padding(0, Theme.S(8), Theme.S(12), 0) };
-            _holdback = new NumberBox(ReflowProfile.HoldbackMin, ReflowProfile.HoldbackMax, 1, 0.5) {
-                Suffix = "°C",
-                Width = Theme.S(100),
-                Margin = new Padding(0, 0, Theme.S(8), 0),
-                Value = ReflowProfile.HoldbackDefault
-            };
-            _holdback.TextChanged += (s, e) => MarkDirty();
-            _readHoldback = new ModernButton("Read", Glyph.Download) { Margin = new Padding(0, 0, Theme.S(6), 0) };
-            _readHoldback.Click += async (s, e) => await ReadHoldback();
-            _writeHoldback = new ModernButton("Write", Glyph.Upload) { Margin = Padding.Empty };
-            _writeHoldback.Click += async (s, e) => await WriteHoldback();
-            tip.SetToolTip(_readHoldback, "Read the controller's holdback into the editor");
-            tip.SetToolTip(_writeHoldback, "Write only the holdback to the controller (applies to all patterns)");
-            hbRow.Controls.AddRange([hbLabel, _holdback, _readHoldback, _writeHoldback]);
+            FlowLayoutPanel HoldbackRow(string label, out NumberBox box, out ModernButton read, out ModernButton write, bool bed) {
+                var row = Flow();
+                var text = new ThemedLabel(label, Theme.Body, Theme.Text) { AutoSize = false, Width = Theme.S(210), Height = Theme.S(22), Margin = new Padding(0, Theme.S(8), Theme.S(8), 0) };
+                box = new NumberBox(ReflowProfile.HoldbackMin, ReflowProfile.HoldbackMax, 1, 0.5) {
+                    Suffix = "°C",
+                    Width = Theme.S(100),
+                    Margin = new Padding(0, 0, Theme.S(8), Theme.S(6)),
+                    Value = ReflowProfile.HoldbackDefault
+                };
+                box.TextChanged += (s, e) => MarkDirty();
+                read = new ModernButton("Read", Glyph.Download) { Margin = new Padding(0, 0, Theme.S(6), 0) };
+                write = new ModernButton("Write", Glyph.Upload) { Margin = Padding.Empty };
+                string who = bed ? "Bed Heat" : "Top IR";
+                tip.SetToolTip(read, $"Read the {who} controller's holdback into the editor");
+                tip.SetToolTip(write, $"Write only the holdback to the {who} controller (applies to all its patterns)");
+                row.Controls.AddRange([text, box, read, write]);
+                return row;
+            }
+            var hbRow = HoldbackRow("Set Global IR Holdback", out _holdback, out _readHoldback, out _writeHoldback, false);
+            _readHoldback.Click += async (s, e) => await ReadHoldback(State.Ir);
+            _writeHoldback.Click += async (s, e) => await WriteHoldback(State.Ir);
+            var bedHbRow = HoldbackRow("Set Global Bed Heat Holdback", out _bedHoldback, out _readBedHoldback, out _writeBedHoldback, true);
+            _readBedHoldback.Click += async (s, e) => await ReadHoldback(State.BedChannel);
+            _writeBedHoldback.Click += async (s, e) => await WriteHoldback(State.BedChannel);
             var hbHint = new ThemedLabel(
-                $"Holdback pauses the program while the temperature lags the setpoint by more than this band. The controller has one holdback for all patterns, and it's written with every profile. It can't be switched off; {ReflowProfile.HoldbackMax:0} °C means it practically never triggers.",
-                Theme.Small, Theme.TextFaint) { AutoSize = true, MaximumSize = new Size(Theme.S(460), 0), Margin = new Padding(0, Theme.S(6), 0, 0) };
-            _validation = new ThemedLabel("", Theme.Small, Theme.Red) { AutoSize = true, MaximumSize = new Size(Theme.S(460), 0), Margin = new Padding(0, Theme.S(10), 0, 0) };
-            extras.Controls.Add(new Divider { Dock = DockStyle.None, Width = Theme.S(466), Margin = new Padding(0, Theme.S(6), 0, Theme.S(6)) }, 0, 0);
+                "Holdback pauses a controller's program while its temperature lags the setpoint by more than this band. Each controller has one holdback "
+                + $"for all its patterns, and it's written with every profile. It can't be switched off; {ReflowProfile.HoldbackMax:0} °C means it practically never triggers. "
+                + "Wait for Bed / Wait for IR use the same bands to decide when a heater is behind.",
+                Theme.Small, Theme.TextFaint) { AutoSize = true, MaximumSize = new Size(Theme.S(620), 0), Margin = new Padding(0, Theme.S(6), 0, 0) };
+            _validation = new ThemedLabel("", Theme.Small, Theme.Red) { AutoSize = true, MaximumSize = new Size(Theme.S(620), 0), Margin = new Padding(0, Theme.S(10), 0, 0) };
+            extras.Controls.Add(new Divider { Dock = DockStyle.None, Width = Theme.S(626), Margin = new Padding(0, Theme.S(6), 0, Theme.S(6)) }, 0, 0);
             extras.Controls.Add(hbRow, 0, 1);
-            extras.Controls.Add(hbHint, 0, 2);
-            extras.Controls.Add(_validation, 0, 3);
+            extras.Controls.Add(bedHbRow, 0, 2);
+            extras.Controls.Add(hbHint, 0, 3);
+            extras.Controls.Add(_validation, 0, 4);
 
             var nameRow = Table(2, 1);
             nameRow.Dock = DockStyle.Top;
             nameRow.Height = Theme.S(34 + 18);
             nameRow.Padding = new Padding(0, 0, 0, Theme.S(18));
             nameRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(82)));
-            nameRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(384)));
+            nameRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(544)));
             nameRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             nameRow.Controls.Add(new ThemedLabel("Name", Theme.Body, Theme.TextDim) { Anchor = AnchorStyles.Left, Margin = new Padding(Theme.S(4), 0, 0, 0) }, 0, 0);
             nameRow.Controls.Add(_name, 1, 0);
@@ -198,9 +227,11 @@ namespace ReflowLink.UI.Pages {
             Theme.ApplyDarkScrollbars(editor);
 
             // ---------------------------------------------------------------- preview card
-            _curve = new ChartSeries { Name = "Planned setpoint", Color = Theme.Accent, Width = 2.2f, FillArea = true };
+            _curve = new ChartSeries { Name = "Top IR", Color = Theme.Accent, Width = 2.2f, FillArea = true };
+            _bedCurve = new ChartSeries { Name = "Bed heat", Color = Theme.Green, Width = 1.8f };
             _chart = new ChartView { Dock = DockStyle.Fill, ShowSecondaryAxis = false, EmptyText = "Add a step to see the curve", ShowLegend = false };
             _chart.Series.Add(_curve);
+            _chart.Series.Add(_bedCurve);
 
             _startTemp = new NumberBox(0, 200, 0, 1) {
                 Suffix = "°C",
@@ -240,7 +271,12 @@ namespace ReflowLink.UI.Pages {
             // ---------------------------------------------------------------- root
             var main = Table(2, 1);
             main.Dock = DockStyle.Fill;
-            main.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(524)));
+            main.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(690)));
+            // On narrow windows the editor gives up width (and scrolls sideways) so the preview stays usable.
+            main.Resize += (s, e) => {
+                int width = Math.Max(Theme.S(420), Math.Min(Theme.S(690), (int)(main.Width * 0.62)));
+                if (Math.Abs(main.ColumnStyles[0].Width - width) > 1) main.ColumnStyles[0].Width = width;
+            };
             main.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             main.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             main.Controls.Add(editor, 0, 0);
@@ -260,6 +296,8 @@ namespace ReflowLink.UI.Pages {
             State.BusyChanged += UpdateButtons;
             State.StationChanged += UpdatePreview;
             State.Device.StateChanged += (s, e) => UpdatePreview(); // also refreshes the buttons
+            State.Bed.StateChanged += (s, e) => UpdatePreview();
+            State.BedEnabledChanged += () => { ApplyRowStates(); UpdatePreview(); };
 
             // Initial profile: last opened file, else the leaded preset.
             ReflowProfile initial = null;
@@ -283,9 +321,13 @@ namespace ReflowLink.UI.Pages {
                 var src = s ?? DefaultStepAfter(p, i);
                 r.Ramp.Value = src.RampRate;
                 r.Target.Value = src.Target;
+                r.BedTarget.Value = src.BedTarget;
                 r.Hold.Value = src.HoldSeconds;
+                r.WaitForBed.Checked = s?.WaitForBed ?? false;
+                r.WaitForIr.Checked = s?.WaitForIr ?? false;
             }
             _holdback.Value = p.Holdback ?? ReflowProfile.HoldbackDefault;
+            _bedHoldback.Value = p.BedHoldback ?? ReflowProfile.HoldbackDefault;
             _filePath = path ?? "";
             _loading = false;
             ApplyRowStates();
@@ -296,8 +338,10 @@ namespace ReflowLink.UI.Pages {
 
         private ProfileStep DefaultStepAfter(ReflowProfile p, int index) {
             var last = p.Steps.Count > 0 ? p.Steps[p.Steps.Count - 1] : null;
-            double target = last != null ? Math.Min(last.Target + 10 * (index - p.Steps.Count + 1), State.Settings.MaxTemperature) : 150;
-            return new ProfileStep(1.0, target, 20);
+            int ahead = index - p.Steps.Count + 1;
+            double target = last != null ? Math.Min(last.Target + 10 * ahead, State.Settings.MaxTemperature) : 150;
+            double bed = last != null ? Math.Min(last.BedTarget + 10 * ahead, State.Settings.Bed.MaxTemperature) : 150;
+            return new ProfileStep(1.0, target, 20) { BedTarget = bed };
         }
 
         private ReflowProfile BuildProfile(List<string> errors) {
@@ -308,16 +352,26 @@ namespace ReflowLink.UI.Pages {
                 if (!r.Ramp.IsValid) errors?.Add($"Step {i + 1}: ramp rate must be between 0.01 and 10 °C/s.");
                 if (!r.Target.IsValid) errors?.Add($"Step {i + 1}: enter a valid target temperature.");
                 if (!r.Hold.IsValid) errors?.Add($"Step {i + 1}: hold time must be 0–9999 s.");
-                p.Steps.Add(new ProfileStep(r.Ramp.Value ?? 1, r.Target.Value ?? 0, (int)Math.Round(r.Hold.Value ?? 0)));
+                bool bedValid = r.BedTarget.IsValid;
+                if (State.BedEnabled && !bedValid) errors?.Add($"Step {i + 1}: enter a valid bed heat target.");
+                p.Steps.Add(new ProfileStep(r.Ramp.Value ?? 1, r.Target.Value ?? 0, (int)Math.Round(r.Hold.Value ?? 0)) {
+                    BedTarget = bedValid ? r.BedTarget.Value.Value : r.Target.Value ?? 0,
+                    WaitForBed = r.WaitForBed.Checked,
+                    WaitForIr = r.WaitForIr.Checked,
+                });
             }
-            // Always set: every profile write also writes the (global) holdback.
+            // Always set: every profile write also writes the (global) holdbacks.
             if (!_holdback.IsValid) errors?.Add(ReflowProfile.HoldbackRangeMessage);
             p.Holdback = _holdback.Value ?? ReflowProfile.HoldbackDefault;
+            if (State.BedEnabled && !_bedHoldback.IsValid) errors?.Add($"Bed holdback must be between {ReflowProfile.HoldbackMin:0} and {ReflowProfile.HoldbackMax:0} °C.");
+            p.BedHoldback = _bedHoldback.IsValid ? _bedHoldback.Value.Value : ReflowProfile.HoldbackDefault;
             if (errors != null) {
-                foreach (var e in p.Validate(State.Settings.MaxTemperature))
+                foreach (var e in p.Validate(State.Settings.MaxTemperature, State.BedEnabled ? State.Settings.Bed.MaxTemperature : null))
                     if (!errors.Contains(e) && !e.Contains("ramp rate must be greater")) errors.Add(e);
-                // When connected, also check against the controller's own setpoint limits (HS / LS).
+                // When connected, also check against the controllers' own setpoint limits (HS / LS).
                 if (State.Device.IsConnected) errors.AddRange(Pc410Device.CheckTargets(p, State.Device.ControllerLimits));
+                if (State.BedEnabled && State.Bed.IsConnected)
+                    errors.AddRange(Pc410Device.CheckTargets(p.ForBed(), State.Bed.ControllerLimits).Select(e => "Bed: " + e.Replace("target", "bed target")));
             }
             return p;
         }
@@ -339,9 +393,11 @@ namespace ReflowLink.UI.Pages {
                 var r = _rows[i];
                 bool on = r.Use.Checked;
                 r.Ramp.Enabled = r.Target.Enabled = r.Hold.Enabled = on;
+                r.BedTarget.Enabled = r.WaitForBed.Enabled = r.WaitForIr.Enabled = on && State.BedEnabled;
                 r.Number.ForeColor = on ? Theme.Text : Theme.TextFaint;
                 r.Use.Enabled = i > 0;
             }
+            _bedHoldback.Enabled = State.BedEnabled;
         }
 
         private void MarkDirty() {
@@ -367,11 +423,18 @@ namespace ReflowLink.UI.Pages {
             var c = ProfileMath.BuildPlannedCurve(p, start);
             _curve.Points.Clear();
             foreach (var pt in c.Points) _curve.Points.Add(new PointD(pt.Time, pt.Temp));
+            bool bed = State.BedEnabled;
+            var bc = ProfileMath.BuildPlannedCurve(p.ForBed(), start);
+            _bedCurve.Points.Clear();
+            if (bed) foreach (var pt in bc.Points) _bedCurve.Points.Add(new PointD(pt.Time, pt.Temp));
+            _bedCurve.Visible = bed;
+            _chart.ShowLegend = bed;
             _chart.Markers.Clear();
             for (int i = 0; i < c.StepStarts.Count; i++)
                 _chart.Markers.Add(new ChartMarker { X = c.StepStarts[i], Label = "S" + (i + 1) });
             _chart.XMin = 0;
-            _chart.XMax = Math.Max(60, c.TotalSeconds * 1.04);
+            double total = bed ? Math.Max(c.TotalSeconds, bc.TotalSeconds) : c.TotalSeconds;
+            _chart.XMax = Math.Max(60, total * 1.04);
             _chart.MinXSpan = 60;
             _chart.LimitLine = State.Settings.MaxTemperature;
             _chart.LimitLabel = $"Limit {State.Settings.MaxTemperature:0} °C";
@@ -388,8 +451,11 @@ namespace ReflowLink.UI.Pages {
                     r.Time.Text = ProfileMath.FormatDuration(ramp + s.HoldSeconds);
                 } else r.Time.Text = "";
             }
-            _statTotal.Value = ProfileMath.FormatDuration(c.TotalSeconds);
-            _statPeak.Value = $"{c.PeakTemp:0.#} °C";
+            // With the same ramp rates the bed reaches its targets at other times; Wait for Bed / Wait for IR line them up.
+            _statTotal.Value = ProfileMath.FormatDuration(total);
+            _statPeak.Text = "Peak";
+            _statPeak.Value = bed ? $"{c.PeakTemp:0}/{bc.PeakTemp:0}" : $"{c.PeakTemp:0.#} °C";
+            _statPeak.Invalidate();
             _statRamp.Value = ProfileMath.FormatDuration(rampTime);
             _statSteps.Value = $"{p.Steps.Count} of 8";
             _validation.Text = string.Join(Environment.NewLine, errors.Distinct().Take(4));
@@ -398,10 +464,15 @@ namespace ReflowLink.UI.Pages {
 
         private void UpdateButtons() {
             bool conn = State.Device.IsConnected, busy = State.Busy;
-            _read.Enabled = conn && !busy;
-            _write.Enabled = conn && !busy;
+            bool bedConn = State.BedEnabled && State.Bed.IsConnected;
+            // With bed heat control on, patterns are read and written on both controllers.
+            bool pair = conn && (!State.BedEnabled || bedConn);
+            _read.Enabled = pair && !busy;
+            _write.Enabled = pair && !busy;
             _readHoldback.Enabled = conn && !busy;
             _writeHoldback.Enabled = conn && !busy;
+            _readBedHoldback.Enabled = bedConn && !busy;
+            _writeBedHoldback.Enabled = bedConn && !busy;
             _slot.Enabled = !busy;
         }
 
@@ -488,17 +559,29 @@ namespace ReflowLink.UI.Pages {
         private async Task ReadFromController() {
             int slot = _slot.SelectedIndex;
             if (slot < 0 || !ConfirmDiscard()) return;
-            var (ok, p) = await State.RunAsync($"Reading pattern {slot}", (d, progress, ct) => d.DownloadProfile(slot, progress, ct));
+            bool both = State.BedEnabled;
+            var (ok, read) = await State.RunPairAsync(both ? $"Reading pattern {slot} from both controllers" : $"Reading pattern {slot}",
+                (ir, bed, progress, ct) => PatternPair.Read(ir, bed, slot, progress, ct));
             if (!ok) return;
+            var p = read.Profile;
+            // The controllers don't store Wait for Bed / Wait for IR: use what ReflowLink last wrote to this pattern.
+            State.Settings.SyncFor(slot)?.ApplyTo(p);
             var known = State.SlotProfiles[slot];
             if (known != null && SameSteps(known, p)) { p.Name = known.Name; p.Notes = known.Notes; }
             State.SetSlotProfile(slot, p);
             State.Device.NotePattern(slot);
+            if (both) State.Bed.NotePattern(slot);
             if (string.IsNullOrWhiteSpace(p.Name)) p.Name = $"Pattern {slot} profile";
             LoadProfile(p, "");
             _dirty = true;
             UpdateHeader();
-            State.SetStatus($"Read pattern {slot}: {p.Steps.Count} step(s)", StatusKind.Success);
+            if (read.Warnings.Count > 0)
+                DarkDialog.Show(FindForm(), "The two patterns don't match",
+                    $"Pattern {slot} was read, but the bed controller's copy differs from the IR controller's:\n\n" + string.Join("\n", read.Warnings.Take(10))
+                    + "\n\nWrite the profile again to make both controllers run the same steps.",
+                    DialogTone.Warning, ["OK"]);
+            else
+                State.SetStatus($"Read pattern {slot}: {p.Steps.Count} step(s)", StatusKind.Success);
         }
 
         private static bool SameSteps(ReflowProfile a, ReflowProfile b) {
@@ -518,41 +601,51 @@ namespace ReflowLink.UI.Pages {
                 DarkDialog.Error(FindForm(), "Fix the profile first", string.Join(Environment.NewLine, errors.Distinct()));
                 return;
             }
+            bool both = State.BedEnabled;
             var curve = ProfileMath.BuildPlannedCurve(p, State.Settings.PreviewStartTemperature);
+            string where = both ? $"pattern {slot} of both the Top IR and the Bed Heat controller" : $"controller pattern {slot}";
             if (!DarkDialog.Confirm(FindForm(), $"Write to pattern {slot}?",
-                $"\"{p.Name}\" ({p.Steps.Count} step(s), peak {curve.PeakTemp:0.#} °C, about {ProfileMath.FormatDuration(curve.TotalSeconds)}) will replace whatever is stored in controller pattern {slot}.",
+                $"\"{p.Name}\" ({p.Steps.Count} step(s), peak {curve.PeakTemp:0.#} °C, about {ProfileMath.FormatDuration(curve.TotalSeconds)}) will replace whatever is stored in {where}.",
                 "Write", "Cancel"))
                 return;
 
             var mode = State.Settings.UnusedSteps;
             bool verify = State.Settings.VerifyAfterWrite;
-            var (ok, res) = await State.RunAsync($"Writing pattern {slot}", (d, progress, ct) => d.UploadProfile(p, slot, mode, verify, progress, ct));
+            var bedMode = State.Settings.Bed.UnusedSteps;
+            bool bedVerify = State.Settings.Bed.VerifyAfterWrite;
+            var (ok, res) = await State.RunPairAsync($"Writing pattern {slot}",
+                (ir, bed, progress, ct) => PatternPair.Write(ir, bed, p, slot, mode, verify, progress, ct, bedMode, bedVerify));
             if (!ok) return;
             State.UnblockSlot(slot);
             State.SetSlotProfile(slot, p);
+            State.Settings.SetSync(slot, p);
+            State.Settings.Save();
             State.Device.NotePattern(slot);
+            if (both) State.Bed.NotePattern(slot);
             if (res.Warnings.Count > 0)
                 DarkDialog.Show(FindForm(), "Written with warnings",
-                    "The controller accepted the profile but some values read back differently (the controller may round them):\n\n" + string.Join("\n", res.Warnings.Take(12)),
+                    "The controllers accepted the profile but some values read back differently (they may round them):\n\n" + string.Join("\n", res.Warnings.Take(12)),
                     DialogTone.Warning, ["OK"]);
             else
-                State.SetStatus($"Pattern {slot} written" + (verify ? " and verified" : ""), StatusKind.Success);
+                State.SetStatus($"Pattern {slot} written" + (both ? " to both controllers" : "") + (verify && (!both || bedVerify) ? " and verified" : ""), StatusKind.Success);
         }
 
-        private async Task ReadHoldback() {
-            var (ok, value) = await State.RunAsync("Reading holdback", (d, progress, ct) => d.ReadHoldback());
+        private async Task ReadHoldback(ControllerChannel channel) {
+            var box = channel.IsBed ? _bedHoldback : _holdback;
+            var (ok, value) = await State.RunOnAsync(channel, $"Reading {channel.Name} holdback", (d, progress, ct) => d.ReadHoldback());
             if (!ok) return;
-            _holdback.Value = value;
-            State.SetStatus($"Controller holdback is {value:0.#} °C", StatusKind.Success);
+            box.Value = value;
+            State.SetStatus($"{channel.Name} holdback is {value:0.#} °C", StatusKind.Success);
         }
 
-        private async Task WriteHoldback() {
-            if (!_holdback.IsValid || _holdback.Value is not double value) {
+        private async Task WriteHoldback(ControllerChannel channel) {
+            var box = channel.IsBed ? _bedHoldback : _holdback;
+            if (!box.IsValid || box.Value is not double value) {
                 DarkDialog.Error(FindForm(), "Check the holdback", ReflowProfile.HoldbackRangeMessage);
                 return;
             }
-            var (ok, stored) = await State.RunAsync("Writing holdback", (d, progress, ct) => d.WriteHoldback(value));
-            if (ok) State.SetStatus($"Holdback set to {stored:0.#} °C for all patterns", StatusKind.Success);
+            var (ok, stored) = await State.RunOnAsync(channel, $"Writing {channel.Name} holdback", (d, progress, ct) => d.WriteHoldback(value));
+            if (ok) State.SetStatus($"{channel.Name} holdback set to {stored:0.#} °C for all its patterns", StatusKind.Success);
         }
 
         public override bool HandleShortcut(Keys keys) {

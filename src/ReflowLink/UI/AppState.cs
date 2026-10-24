@@ -15,19 +15,60 @@ using ReflowLink.Services;
 namespace ReflowLink.UI {
     public enum StatusKind { Normal, Success, Warning, Error }
 
+    /// <summary>One PC410 (top IR or bed heat) with the state the pages share about it.</summary>
+    public sealed class ControllerChannel(string name, string shortName, DeviceService device, bool isBed) {
+        /// <summary>"Top IR" or "Bed Heat".</summary>
+        public string Name { get; } = name;
+        /// <summary>"IR" or "Bed".</summary>
+        public string ShortName { get; } = shortName;
+        public DeviceService Device { get; } = device;
+        public bool IsBed { get; } = isBed;
+
+        /// <summary>Control settings last read from the controller, or the default values while none have been read.</summary>
+        public TuningSnapshot Tuning { get; private set; } = TuningSnapshot.Factory();
+
+        /// <summary>Raised when <see cref="Tuning"/> is replaced.</summary>
+        public event Action TuningChanged;
+
+        /// <summary>True while the controller's auto-tune runs (kept up to date by its Control Tuning page).</summary>
+        public bool AutoTuneRunning { get; set; }
+
+        public void SetTuning(TuningSnapshot snapshot) {
+            Tuning = snapshot ?? TuningSnapshot.Factory();
+            TuningChanged?.Invoke();
+        }
+    }
+
     /// <summary>Shared application state passed to every page.</summary>
-    public sealed class AppState(AppSettings settings, DeviceService device) {
+    public sealed class AppState {
         private int _busy;
 
-        public AppSettings Settings { get; } = settings;
-        public DeviceService Device { get; } = device;
+        public AppState(AppSettings settings, DeviceService device, DeviceService bed) {
+            Settings = settings;
+            Ir = new ControllerChannel("Top IR", "IR", device, false);
+            BedChannel = new ControllerChannel("Bed Heat", "Bed", bed, true);
+            Sync = new SyncCoordinator(device, bed) { Enabled = settings.Bed.Enabled };
+            _blockedSlots = [.. settings.BlockedPatterns];
+        }
+
+        public AppSettings Settings { get; }
+        public ControllerChannel Ir { get; }
+        public ControllerChannel BedChannel { get; }
+        /// <summary>The top IR controller.</summary>
+        public DeviceService Device => Ir.Device;
+        /// <summary>The bed heat controller (only used when bed heat control is switched on).</summary>
+        public DeviceService Bed => BedChannel.Device;
+        public SyncCoordinator Sync { get; }
         public Form Owner { get; set; }
+
+        /// <summary>"Use Bed Heat Control" is switched on in Settings.</summary>
+        public bool BedEnabled => Settings.Bed.Enabled;
 
         /// <summary>Profiles known to be stored in controller patterns 0..9 (read or written this session).</summary>
         public readonly ReflowProfile[] SlotProfiles = new ReflowProfile[10];
 
         /// <summary>Patterns the controller rejected while being written; they can't be started until rewritten.</summary>
-        private readonly HashSet<int> _blockedSlots = [.. settings.BlockedPatterns];
+        private readonly HashSet<int> _blockedSlots;
 
         public event Action SlotProfilesChanged;
         public event Action<string, StatusKind> StatusChanged;
@@ -37,21 +78,20 @@ namespace ReflowLink.UI {
         public event Action<string> NavigateRequested;
         /// <summary>Raised after the station or its controller units change.</summary>
         public event Action StationChanged;
+        /// <summary>Raised after "Use Bed Heat Control" is switched on or off.</summary>
+        public event Action BedEnabledChanged;
 
         public bool Busy => _busy > 0;
 
-        /// <summary>Control settings last read from the controller, or the factory values while none have been read.</summary>
-        public TuningSnapshot Tuning { get; private set; } = TuningSnapshot.Factory();
+        /// <summary>True while either controller's auto-tune runs.</summary>
+        public bool AutoTuneRunning => Ir.AutoTuneRunning || BedChannel.AutoTuneRunning;
 
-        /// <summary>True while the controller's auto-tune runs (kept up to date by the Control Tuning page).</summary>
-        public bool AutoTuneRunning { get; set; }
-
-        /// <summary>Raised when <see cref="Tuning"/> is replaced.</summary>
-        public event Action TuningChanged;
-
-        public void SetTuning(TuningSnapshot snapshot) {
-            Tuning = snapshot ?? TuningSnapshot.Factory();
-            TuningChanged?.Invoke();
+        public void SetBedEnabled(bool on) {
+            if (Settings.Bed.Enabled == on) return;
+            Settings.Bed.Enabled = on;
+            Sync.Enabled = on;
+            Settings.Save();
+            BedEnabledChanged?.Invoke();
         }
 
         public void SetSlotProfile(int slot, ReflowProfile p) {
@@ -105,24 +145,64 @@ namespace ReflowLink.UI {
             ApplyStation();
         }
 
-        /// <summary>Call after the generic station's units were edited.</summary>
+        /// <summary>Call after the generic station's units (or the bed controller's units) were edited.</summary>
         public void ApplyStation() {
             Device.SetUnits(Settings.Units);
+            Bed.SetUnits(Settings.Bed.Units);
             Settings.Save();
             StationChanged?.Invoke();
         }
 
-        public bool EnsureConnected() {
-            if (Device.IsConnected) return true;
-            int r = DarkDialog.Show(Owner, "Not connected", "Connect to the controller first (use the Connect button in the sidebar).",
-                DialogTone.Info, ["Connect settings", "Close"], 1);
+        public bool EnsureConnected() => EnsureConnected(Ir);
+
+        public bool EnsureConnected(ControllerChannel channel) {
+            if (channel.Device.IsConnected) return true;
+            int r = DarkDialog.Show(Owner, $"{channel.Name} not connected",
+                $"Connect to the {channel.Name} controller first (use its Connect button in the sidebar).",
+                DialogTone.Info, ["Connection settings", "Close"], 1);
             if (r == 0) Navigate("settings");
             return false;
         }
 
-        /// <summary>Runs an exclusive device operation with busy state, progress and error reporting.</summary>
-        public async Task<(bool ok, T result)> RunAsync<T>(string label, Func<Pc410Device, IProgress<OperationProgress>, CancellationToken, T> op) {
-            if (!EnsureConnected()) return (false, default(T));
+        /// <summary>Both controllers needed by a pattern operation are connected (the bed only when it's used).</summary>
+        public bool EnsurePairConnected() => EnsureConnected(Ir) && (!BedEnabled || EnsureConnected(BedChannel));
+
+        /// <summary>Runs an exclusive operation on the top IR controller with busy state, progress and error reporting.</summary>
+        public Task<(bool ok, T result)> RunAsync<T>(string label, Func<Pc410Device, IProgress<OperationProgress>, CancellationToken, T> op) =>
+            RunOnAsync(Ir, label, op);
+
+        /// <summary>Runs an exclusive operation on one controller.</summary>
+        public Task<(bool ok, T result)> RunOnAsync<T>(ControllerChannel channel, string label, Func<Pc410Device, IProgress<OperationProgress>, CancellationToken, T> op) =>
+            RunCoreAsync(label, () => EnsureConnected(channel), progress => channel.Device.RunAsync(d => op(d, progress, CancellationToken.None)));
+
+        public Task<(bool ok, bool result)> RunOnAsync(ControllerChannel channel, string label, Action<Pc410Device> op) =>
+            RunOnAsync(channel, label, (d, p, ct) => { op(d); return true; });
+
+        /// <summary>
+        /// Runs an operation on both controllers at once (both locked, IR first). The bed device is null when bed heat
+        /// control is off.
+        /// </summary>
+        public Task<(bool ok, T result)> RunPairAsync<T>(string label, Func<Pc410Device, Pc410Device, IProgress<OperationProgress>, CancellationToken, T> op) =>
+            RunCoreAsync(label, EnsurePairConnected, progress =>
+                DeviceService.RunBothAsync(Device, BedEnabled ? Bed : null, (ir, bed) => op(ir, bed, progress, CancellationToken.None)));
+
+        /// <summary>
+        /// Stops the program on every connected controller. Unlike <see cref="RunPairAsync{T}"/> it doesn't need both to
+        /// be connected, so Stop still works when one of them is offline.
+        /// </summary>
+        public Task<(bool ok, bool result)> StopAllAsync() =>
+            RunCoreAsync("Stopping the program", () => Device.IsConnected || (BedEnabled && Bed.IsConnected) || EnsureConnected(Ir), async progress => {
+                var errors = new List<string>();
+                foreach (var ch in new[] { Ir, BedChannel }) {
+                    if (!ch.Device.IsConnected || (ch.IsBed && !BedEnabled)) continue;
+                    try { await ch.Device.RunAsync(d => d.Stop()); } catch (Exception ex) { errors.Add($"{ch.Name}: {DeviceService.Describe(ex)}"); }
+                }
+                if (errors.Count > 0) throw new Pc410Exception("Couldn't stop every controller. " + string.Join(" ", errors));
+                return true;
+            });
+
+        private async Task<(bool ok, T result)> RunCoreAsync<T>(string label, Func<bool> ensure, Func<IProgress<OperationProgress>, Task<T>> run) {
+            if (!ensure()) return (false, default(T));
             if (Busy) {
                 SetStatus("Another operation is still running…", StatusKind.Warning);
                 return (false, default(T));
@@ -136,7 +216,7 @@ namespace ReflowLink.UI {
                 if (!string.IsNullOrEmpty(p.Text)) SetStatus(p.Text);
             });
             try {
-                var r = await Device.RunAsync(d => op(d, progress, CancellationToken.None));
+                var r = await run(progress);
                 SetStatus(label + " — done", StatusKind.Success);
                 return (true, r);
             } catch (ProfileRejectedException ex) {
@@ -155,6 +235,7 @@ namespace ReflowLink.UI {
                 ProgressChanged?.Invoke(null);
                 BusyChanged?.Invoke();
                 Device.PollNow();
+                Bed.PollNow();
             }
         }
 

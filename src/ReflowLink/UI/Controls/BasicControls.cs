@@ -394,6 +394,21 @@ namespace ReflowLink.UI.Controls {
         /// <summary>Optional 0..1 bar under the value (e.g. output power).</summary>
         public double? Bar { get => _bar; set { _bar = value; Invalidate(); } }
 
+        // ---- split view: two read-outs side by side (top IR | bed heat)
+        private bool _split;
+        private string _label1 = "Top IR", _label2 = "Bed heat", _value2 = "—", _detail2 = "";
+        private Color _accent2 = Theme.Green;
+        private double? _bar2;
+
+        /// <summary>Shows two read-outs side by side, labelled <see cref="Label1"/> and <see cref="Label2"/>.</summary>
+        public bool Split { get => _split; set { if (_split == value) return; _split = value; Invalidate(); } }
+        public string Label1 { get => _label1; set { _label1 = value; Invalidate(); } }
+        public string Label2 { get => _label2; set { _label2 = value; Invalidate(); } }
+        public string Value2 { get => _value2; set { if (_value2 == value) return; _value2 = value; Invalidate(); } }
+        public string Detail2 { get => _detail2; set { if (_detail2 == value) return; _detail2 = value; Invalidate(); } }
+        public Color Accent2 { get => _accent2; set { _accent2 = value; Invalidate(); } }
+        public double? Bar2 { get => _bar2; set { _bar2 = value; Invalidate(); } }
+
         protected override void OnPaint(PaintEventArgs e) {
             var g = e.Graphics;
             Theme.HighQuality(g);
@@ -401,6 +416,10 @@ namespace ReflowLink.UI.Controls {
             using (var p = Theme.Rounded(r, Theme.Sf(10))) {
                 using (var b = new SolidBrush(Theme.Surface)) g.FillPath(b, p);
                 using var pen = new Pen(Theme.Border); g.DrawPath(pen, p);
+            }
+            if (_split) {
+                PaintSplit(g);
+                return;
             }
             int pad = Theme.S(16);
             float dot = Theme.Sf(8);
@@ -427,6 +446,38 @@ namespace ReflowLink.UI.Controls {
             }
             if (!string.IsNullOrEmpty(_detail))
                 TextRenderer.DrawText(g, _detail, Theme.Small, new Rectangle(pad, by, Width - pad * 2, Theme.S(18)), Theme.TextDim, Theme.LeftMiddle);
+        }
+
+        private void PaintSplit(Graphics g) {
+            int pad = Theme.S(14);
+            TextRenderer.DrawText(g, _caption.ToUpperInvariant(), Theme.SmallBold, new Rectangle(pad, pad - 2, Width - pad * 2, Theme.S(18)), Theme.TextDim, Theme.LeftMiddle);
+            int half = Width / 2;
+            using (var pen = new Pen(Theme.Border)) g.DrawLine(pen, half, pad + Theme.S(22), half, Height - pad);
+            PaintHalf(g, new Rectangle(pad, pad + Theme.S(20), half - pad - Theme.S(8), Height - pad * 2 - Theme.S(20)), _label1, _value, _detail, _accent, _bar);
+            PaintHalf(g, new Rectangle(half + Theme.S(10), pad + Theme.S(20), Width - half - pad - Theme.S(10), Height - pad * 2 - Theme.S(20)), _label2, _value2, _detail2, _accent2, _bar2);
+        }
+
+        private void PaintHalf(Graphics g, Rectangle area, string label, string value, string detail, Color accent, double? bar) {
+            float dot = Theme.Sf(7);
+            using (var b = new SolidBrush(accent)) g.FillEllipse(b, area.X, area.Y + Theme.S(5), dot, dot);
+            TextRenderer.DrawText(g, label, Theme.Small, new Rectangle(area.X + Theme.S(12), area.Y, area.Width - Theme.S(12), Theme.S(18)), Theme.TextDim, Theme.LeftMiddle);
+            int vy = area.Y + Theme.S(18);
+            var vs = TextRenderer.MeasureText(g, value, Theme.Medium, Size.Empty, TextFormatFlags.NoPadding);
+            TextRenderer.DrawText(g, value, Theme.Medium, new Point(area.X - Theme.S(1), vy), Theme.Text, TextFormatFlags.NoPadding);
+            if (!string.IsNullOrEmpty(_unit) && vs.Width + Theme.S(24) < area.Width)
+                TextRenderer.DrawText(g, _unit, Theme.Body, new Point(area.X + vs.Width + Theme.S(3), vy + vs.Height - Theme.Body.Height - Theme.S(2)), Theme.TextDim, TextFormatFlags.NoPadding);
+            int by = area.Bottom - Theme.S(16);
+            if (bar.HasValue) {
+                var track = new RectangleF(area.X, by - Theme.S(7), area.Width, Theme.Sf(4));
+                using (var p = Theme.Rounded(track, track.Height / 2)) using (var b = new SolidBrush(Theme.Input)) g.FillPath(b, p);
+                float w = (float)(Math.Max(0, Math.Min(1, bar.Value)) * track.Width);
+                if (w > 1)
+                    using (var p = Theme.Rounded(new RectangleF(track.X, track.Y, Math.Max(w, track.Height), track.Height), track.Height / 2))
+                    using (var b = new SolidBrush(accent)) g.FillPath(b, p);
+                by += Theme.S(2);
+            }
+            if (!string.IsNullOrEmpty(detail))
+                TextRenderer.DrawText(g, detail, Theme.Small, new Rectangle(area.X, by, area.Width, Theme.S(18)), Theme.TextDim, Theme.LeftMiddle);
         }
     }
 
