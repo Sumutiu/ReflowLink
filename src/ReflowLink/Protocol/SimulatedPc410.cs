@@ -29,6 +29,11 @@ namespace ReflowLink.Protocol {
         private const double Tau = 45.0;    // thermal time constant, s
         private const double MaxTemp = 400;
 
+        // Bed heater for single PC410 control: its own thermocouple on IN2 (P2), heated by a separate on/off controller
+        // (the REX-C100) whose output only reaches the SSR while OUT2 is closed.
+        private const double BedGain = 2.6;  // °C of equilibrium rise at full power, per %
+        private const double BedTau = 120.0; // the plate heats slower than the IR spot
+
         private readonly object _lock = new();
         private readonly Queue<byte> _out = new();
         private readonly Random _rng = new();
@@ -45,6 +50,8 @@ namespace ReflowLink.Protocol {
         private Phase _phase;
         private double _dwellLeft;
         private double _currentRate;
+        private double _bedPv = Ambient;
+        private bool _bedHeating;
 
         public SimulatedPc410(int address, double speed = 1.0, ControllerUnits units = null, double setpointHigh = StationModel.DefaultMaxTemperature) {
             Address = address;
@@ -66,8 +73,38 @@ namespace ReflowLink.Protocol {
             // Control settings: the values of a factory ACHI IR6500.
             foreach (var p in TuningCatalog.All) _misc[p.Mnemonic] = Pc410Protocol.FormatNumber(p.Factory, p.Decimals);
             _misc[TuningCatalog.AutoTune] = ">0000";
+            // Alarm 2 at 500: OUT2 open (the bed off).
+            _misc[Pc410Device.BedAlarm] = Pc410Device.BedOffValue;
             _sp = 25.0;
         }
+
+        /// <summary>Setpoint of the separate bed controller (REX-C100) behind OUT2: the bed's hardware ceiling.</summary>
+        public double BedCeiling { get; set; } = 240;
+
+        /// <summary>Test option: don't answer P2, like a controller without IN2.</summary>
+        public bool HideBedInput { get; set; }
+
+        /// <summary>True while OUT2 is closed (alarm 2 active: PV above the A2 value).</summary>
+        public bool Out2 {
+            get { lock (_lock) return Out2Closed(); }
+        }
+
+        /// <summary>Bed temperature (test access).</summary>
+        public double BedTemperature {
+            get { lock (_lock) return _bedPv; }
+            set { lock (_lock) _bedPv = value; }
+        }
+
+        /// <summary>Runs the simulation forward (tests use it instead of waiting).</summary>
+        public void Advance(double seconds) {
+            lock (_lock) {
+                int steps = (int)Math.Ceiling(seconds / 0.1);
+                for (int i = 0; i < steps; i++) Step(seconds / steps);
+            }
+        }
+
+        // High alarm (AL02 = HIAL): active while PV is above the alarm value; OUT2 is the alarm relay.
+        private bool Out2Closed() => _pv > ParseOr(_misc[Pc410Device.BedAlarm], Pc410Device.BedOffThreshold);
 
         /// <summary>Stores a segment given in °C/s and seconds, converted to the controller's units.</summary>
         private void Set(int p, int s, double rampPerSecond, double level, int dwellSeconds) {
@@ -166,6 +203,7 @@ namespace ReflowLink.Protocol {
                 case "SW": return Pc410Protocol.FormatHexWord(_state == ProgramState.Idle ? 0x0000 : 0x0001);
                 case "SE": return _state == ProgramState.Idle ? "0" : (_segIndex + 1).ToString(CultureInfo.InvariantCulture);
                 case "ch": return _pattern.ToString(CultureInfo.InvariantCulture);
+                case Pc410Device.BedInput: return HideBedInput ? null : F1(Math.Round(_bedPv + (_rng.NextDouble() - 0.5) * 0.3, 1));
             }
             if (mn.Length == 2 && (mn[0] == 'r' || mn[0] == 'l' || mn[0] == 't') && mn[1] >= '1' && mn[1] <= '8') {
                 var s = _patterns[_pattern, mn[1] - '1'];
@@ -183,7 +221,7 @@ namespace ReflowLink.Protocol {
         private bool HandleWrite(string mn, string data) {
             if (RefusedWrites.Contains(mn)) return false;
             switch (mn) {
-                case "PV": case "SP": case "OP": case "SE": return false; // read-only
+                case "PV": case "SP": case "OP": case "SE": case Pc410Device.BedInput: return false; // read-only
                 case "OS":
                     if (!Pc410Protocol.TryParseHexWord(data, out int w)) return false;
                     return SetOs(w);
@@ -340,6 +378,13 @@ namespace ReflowLink.Protocol {
             // Plant: first-order lag towards the equilibrium temperature for the current output.
             double teq = Ambient + Gain * _op;
             _pv += (teq - _pv) * dt / Tau;
+
+            // Bed: the bed controller switches its heater on below its setpoint (1 °C hysteresis), but only while OUT2
+            // passes its output through.
+            if (_bedPv < BedCeiling - 1) _bedHeating = true;
+            else if (_bedPv >= BedCeiling) _bedHeating = false;
+            double bedOp = _bedHeating && Out2Closed() ? 100 : 0;
+            _bedPv += (Ambient + BedGain * bedOp - _bedPv) * dt / BedTau;
         }
 
         private static double Clamp(double v, double lo, double hi) => v < lo ? lo : v > hi ? hi : v;

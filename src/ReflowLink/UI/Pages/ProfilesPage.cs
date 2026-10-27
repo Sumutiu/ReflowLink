@@ -370,7 +370,7 @@ namespace ReflowLink.UI.Pages {
                     if (!errors.Contains(e) && !e.Contains("ramp rate must be greater")) errors.Add(e);
                 // When connected, also check against the controllers' own setpoint limits (HS / LS).
                 if (State.Device.IsConnected) errors.AddRange(Pc410Device.CheckTargets(p, State.Device.ControllerLimits));
-                if (State.BedEnabled && State.Bed.IsConnected)
+                if (State.DualBed && State.Bed.IsConnected)
                     errors.AddRange(Pc410Device.CheckTargets(p.ForBed(), State.Bed.ControllerLimits).Select(e => "Bed: " + e.Replace("target", "bed target")));
             }
             return p;
@@ -393,7 +393,9 @@ namespace ReflowLink.UI.Pages {
                 var r = _rows[i];
                 bool on = r.Use.Checked;
                 r.Ramp.Enabled = r.Target.Enabled = r.Hold.Enabled = on;
-                r.BedTarget.Enabled = r.WaitForBed.Enabled = r.WaitForIr.Enabled = on && State.BedEnabled;
+                r.BedTarget.Enabled = r.WaitForBed.Enabled = on && State.BedEnabled;
+                // A single PC410's bed has no program to hold: it simply follows the IR program.
+                r.WaitForIr.Enabled = on && State.DualBed;
                 r.Number.ForeColor = on ? Theme.Text : Theme.TextFaint;
                 r.Use.Enabled = i > 0;
             }
@@ -424,7 +426,7 @@ namespace ReflowLink.UI.Pages {
             _curve.Points.Clear();
             foreach (var pt in c.Points) _curve.Points.Add(new PointD(pt.Time, pt.Temp));
             bool bed = State.BedEnabled;
-            var bc = ProfileMath.BuildPlannedCurve(p.ForBed(), start);
+            var bc = ProfileMath.BuildBedCurve(p, start, start, State.SingleBed);
             _bedCurve.Points.Clear();
             if (bed) foreach (var pt in bc.Points) _bedCurve.Points.Add(new PointD(pt.Time, pt.Temp));
             _bedCurve.Visible = bed;
@@ -451,7 +453,8 @@ namespace ReflowLink.UI.Pages {
                     r.Time.Text = ProfileMath.FormatDuration(ramp + s.HoldSeconds);
                 } else r.Time.Text = "";
             }
-            // With the same ramp rates the bed reaches its targets at other times; Wait for Bed / Wait for IR line them up.
+            // On a second PC410 the bed runs the same ramp rates and reaches its targets at other times (Wait for Bed / Wait
+            // for IR line them up); with a single PC410 it follows the IR program.
             _statTotal.Value = ProfileMath.FormatDuration(total);
             _statPeak.Text = "Peak";
             _statPeak.Value = bed ? $"{c.PeakTemp:0}/{bc.PeakTemp:0}" : $"{c.PeakTemp:0.#} °C";
@@ -464,9 +467,9 @@ namespace ReflowLink.UI.Pages {
 
         private void UpdateButtons() {
             bool conn = State.Device.IsConnected, busy = State.Busy;
-            bool bedConn = State.BedEnabled && State.Bed.IsConnected;
-            // With bed heat control on, patterns are read and written on both controllers.
-            bool pair = conn && (!State.BedEnabled || bedConn);
+            bool bedConn = State.DualBed && State.Bed.IsConnected;
+            // With a second PC410, patterns are read and written on both controllers.
+            bool pair = conn && (!State.DualBed || bedConn);
             _read.Enabled = pair && !busy;
             _write.Enabled = pair && !busy;
             _readHoldback.Enabled = conn && !busy;
@@ -559,13 +562,16 @@ namespace ReflowLink.UI.Pages {
         private async Task ReadFromController() {
             int slot = _slot.SelectedIndex;
             if (slot < 0 || !ConfirmDiscard()) return;
-            bool both = State.BedEnabled;
+            bool both = State.DualBed, single = State.SingleBed;
             var (ok, read) = await State.RunPairAsync(both ? $"Reading pattern {slot} from both controllers" : $"Reading pattern {slot}",
                 (ir, bed, progress, ct) => PatternPair.Read(ir, bed, slot, progress, ct));
             if (!ok) return;
             var p = read.Profile;
-            // The controllers don't store Wait for Bed / Wait for IR: use what ReflowLink last wrote to this pattern.
-            State.Settings.SyncFor(slot)?.ApplyTo(p);
+            // The controllers don't store Wait for Bed / Wait for IR (nor, with a single PC410, the bed targets): use what
+            // ReflowLink last wrote to this pattern.
+            var sync = State.Settings.SyncFor(slot);
+            bool bedRestored = sync?.ApplyTo(p, single) == true;
+            if (single && !bedRestored) sync?.ApplyTo(p);
             var known = State.SlotProfiles[slot];
             if (known != null && SameSteps(known, p)) { p.Name = known.Name; p.Notes = known.Notes; }
             State.SetSlotProfile(slot, p);
@@ -580,8 +586,10 @@ namespace ReflowLink.UI.Pages {
                     $"Pattern {slot} was read, but the bed controller's copy differs from the IR controller's:\n\n" + string.Join("\n", read.Warnings.Take(10))
                     + "\n\nWrite the profile again to make both controllers run the same steps.",
                     DialogTone.Warning, ["OK"]);
+            else if (single && !bedRestored)
+                State.SetStatus($"Read pattern {slot}: {p.Steps.Count} step(s). No bed targets saved for it: they're set to the IR targets, so check them and write the profile again.", StatusKind.Warning);
             else
-                State.SetStatus($"Read pattern {slot}: {p.Steps.Count} step(s)", StatusKind.Success);
+                State.SetStatus($"Read pattern {slot}: {p.Steps.Count} step(s)" + (single ? ", bed targets from ReflowLink" : ""), StatusKind.Success);
         }
 
         private static bool SameSteps(ReflowProfile a, ReflowProfile b) {
@@ -601,9 +609,11 @@ namespace ReflowLink.UI.Pages {
                 DarkDialog.Error(FindForm(), "Fix the profile first", string.Join(Environment.NewLine, errors.Distinct()));
                 return;
             }
-            bool both = State.BedEnabled;
+            bool both = State.DualBed, single = State.SingleBed;
             var curve = ProfileMath.BuildPlannedCurve(p, State.Settings.PreviewStartTemperature);
-            string where = both ? $"pattern {slot} of both the Top IR and the Bed Heat controller" : $"controller pattern {slot}";
+            string where = both ? $"pattern {slot} of both the Top IR and the Bed Heat controller"
+                : single ? $"controller pattern {slot} (ReflowLink keeps the bed targets for it)"
+                : $"controller pattern {slot}";
             if (!DarkDialog.Confirm(FindForm(), $"Write to pattern {slot}?",
                 $"\"{p.Name}\" ({p.Steps.Count} step(s), peak {curve.PeakTemp:0.#} °C, about {ProfileMath.FormatDuration(curve.TotalSeconds)}) will replace whatever is stored in {where}.",
                 "Write", "Cancel"))
@@ -618,7 +628,7 @@ namespace ReflowLink.UI.Pages {
             if (!ok) return;
             State.UnblockSlot(slot);
             State.SetSlotProfile(slot, p);
-            State.Settings.SetSync(slot, p);
+            State.Settings.SetSync(slot, p, State.BedEnabled);
             State.Settings.Save();
             State.Device.NotePattern(slot);
             if (both) State.Bed.NotePattern(slot);
@@ -627,7 +637,8 @@ namespace ReflowLink.UI.Pages {
                     "The controllers accepted the profile but some values read back differently (they may round them):\n\n" + string.Join("\n", res.Warnings.Take(12)),
                     DialogTone.Warning, ["OK"]);
             else
-                State.SetStatus($"Pattern {slot} written" + (both ? " to both controllers" : "") + (verify && (!both || bedVerify) ? " and verified" : ""), StatusKind.Success);
+                State.SetStatus($"Pattern {slot} written" + (both ? " to both controllers" : "") + (verify && (!both || bedVerify) ? " and verified" : "")
+                    + (single ? "; bed targets saved in ReflowLink" : ""), StatusKind.Success);
         }
 
         private async Task ReadHoldback(ControllerChannel channel) {

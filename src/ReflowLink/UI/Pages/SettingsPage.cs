@@ -34,9 +34,9 @@ namespace ReflowLink.UI.Pages {
             public bool Committing;
         }
 
-        private readonly ModernDropDown _unused, _bedUnused, _station, _rampUnit, _dwellUnit, _bedRamp, _bedDwell;
+        private readonly ModernDropDown _unused, _bedUnused, _station, _rampUnit, _dwellUnit, _bedRamp, _bedDwell, _bedMode;
         private readonly ThemedLabel _stationControls, _stationNotes;
-        private readonly ToggleSwitch _useBed, _verify, _bedVerify, _autoRecord;
+        private readonly ToggleSwitch _verify, _bedVerify, _autoRecord, _irIn2, _bedIn2;
         private readonly NumberBox _afterRun;
         private readonly ModernTextBox _folder;
         private readonly ConnectionCard _irConn, _bedConn;
@@ -72,20 +72,20 @@ namespace ReflowLink.UI.Pages {
                 s.GenericDwellUnit = _dwellUnit.SelectedIndex == 1 ? DwellUnit.Minutes : DwellUnit.Seconds;
                 State.ApplyStation();
             };
-            _useBed = new ToggleSwitch("Use Bed Heat Control") { Checked = s.Bed.Enabled, Margin = Padding.Empty };
-            _useBed.CheckedChanged += (o, e) => {
-                if (_loading) return;
-                bool bedRunning = State.Bed.IsConnected && State.Bed.Last?.State is ProgramState.Running or ProgramState.Hold;
-                if (!_useBed.Checked && bedRunning &&
-                    !DarkDialog.Confirm(FindForm(), "Switch off bed heat control?",
-                        "The bed controller is running a program. Switching off disconnects it: it keeps running on its own, but ReflowLink can no longer keep the heaters in step or stop it.",
-                        "Switch off", "Cancel", danger: true)) {
-                    _loading = true;
-                    _useBed.Checked = true;
-                    _loading = false;
+            _bedMode = new ModernDropDown { Width = Theme.S(280) };
+            _bedMode.SetItems(BedModeNames, (int)s.Bed.Mode);
+            _bedMode.SelectedIndexChanged += (o, e) => {
+                if (_loading || _bedMode.SelectedIndex < 0) return;
+                var mode = (BedMode)_bedMode.SelectedIndex;
+                if (!ConfirmBedMode(mode)) {
+                    ShowBedEnabled();
                     return;
                 }
-                State.SetBedEnabled(_useBed.Checked);
+                if (!State.SetBedMode(mode) && !(DarkDialog.Confirm(FindForm(), "Bed not confirmed off",
+                        "The Top IR controller didn't confirm that OUT2 was switched off (A2 = 500). After this change ReflowLink no longer "
+                        + "regulates the bed, so check it on the station.", "Change anyway", "Cancel", danger: true)
+                        && State.SetBedMode(mode, force: true)))
+                    ShowBedEnabled();
             };
 
             var station = Card("Station", "Which reflow / rework station the PC410 is in");
@@ -95,11 +95,16 @@ namespace ReflowLink.UI.Pages {
             Row(stf, "Ramp rate unit", _rampUnit, "Profiles are always edited in °C/s.");
             Row(stf, "Hold time unit", _dwellUnit, "Profiles are always edited in seconds.");
             Row(stf, "", _stationNotes, null);
-            Row(stf, "Bed heat", _useBed, "A second PC410 controls the bottom heater. Switches on the Bed Heat connection, profile columns, console and control tuning.");
+            Row(stf, "Bed heat", _bedMode, "Single PC410: the bed thermocouple on IN2 and the bed controller's output through OUT2, regulated by ReflowLink. "
+                + "Second PC410: a controller of its own, with its own serial port.");
             FitCard(station, stf);
 
             // ---------------------------------------------------------------- connections
-            _irConn = BuildConnection("Top IR Connection", "Serial link to the PC410 that controls the top IR heater", s, State.Ir);
+            _irIn2 = Toggle("Read IN2 (P2)", s.ReadIn2, v => State.SetIn2Reading(false, v));
+            _irConn = BuildConnection("Top IR Connection", "Serial link to the PC410 that controls the top IR heater", s, State.Ir,
+                ("IN2 reading", _irIn2, "Shows this controller's second input (IN2, terminals 16 + / 17 −) as “IN2 (Top IR)” on the Dashboard, chart and CSV, "
+                    + "for information only. With single PC410 bed control IN2 is the bed temperature, so it's always read. A thermocouple shared with "
+                    + "another controller can read a few degrees off: compare it once with that controller's display."));
             _bedRamp = new ModernDropDown { Width = Theme.S(180) };
             _bedRamp.SetItems(["°C per second", "°C per minute"], s.Bed.RampUnit == RampUnit.PerMinute ? 1 : 0);
             _bedRamp.SelectedIndexChanged += (o, e) => {
@@ -114,9 +119,11 @@ namespace ReflowLink.UI.Pages {
                 s.Bed.DwellUnit = _bedDwell.SelectedIndex == 1 ? DwellUnit.Minutes : DwellUnit.Seconds;
                 State.ApplyStation();
             };
+            _bedIn2 = Toggle("Read IN2 (P2)", s.Bed.ReadIn2, v => State.SetIn2Reading(true, v));
             _bedConn = BuildConnection("Bed Heat Connection", "Serial link to the second PC410 that controls the bottom heater", s.Bed, State.BedChannel,
                 ("Ramp rate unit", _bedRamp, "How the bed PC410 reads ramp rates. ACHI-style controllers use °C per second."),
-                ("Hold time unit", _bedDwell, "How the bed PC410 reads hold times."));
+                ("Hold time unit", _bedDwell, "How the bed PC410 reads hold times."),
+                ("IN2 reading", _bedIn2, "Shows the second PC410's second input as “IN2 (Bed Heat)” on the Dashboard, chart and CSV, for information only."));
 
             // ---------------------------------------------------------------- profile limits
             _irLimit = BuildLimit("Top IR Profiles", "Limits and how profiles are written", State.Ir, s.MaxTemperature);
@@ -128,13 +135,13 @@ namespace ReflowLink.UI.Pages {
             Row(_irLimit.Form, "Verify after write", _verify, null);
             FitCard(_irLimit.Card, _irLimit.Form);
 
-            _bedLimit = BuildLimit("Bed Heat Profiles", "Limits and how bed profiles are written", State.BedChannel, s.Bed.MaxTemperature);
+            _bedLimit = BuildLimit("Bed Heat Profiles", "Bed limit, and how a second PC410's patterns are written", State.BedChannel, s.Bed.MaxTemperature);
             _bedUnused = new ModernDropDown { Width = Theme.S(260) };
             _bedUnused.SetItems(["Write zeros (recommended)", "Write END marker"], s.Bed.UnusedSteps == UnusedStepMode.EndMarker ? 1 : 0);
             _bedUnused.SelectedIndexChanged += (o, e) => { s.Bed.UnusedSteps = _bedUnused.SelectedIndex == 1 ? UnusedStepMode.EndMarker : UnusedStepMode.Zeros; Changed(); };
             _bedVerify = Toggle("Read back and compare", s.Bed.VerifyAfterWrite, v => s.Bed.VerifyAfterWrite = v);
-            Row(_bedLimit.Form, "Unused steps", _bedUnused, "How segments after the last step are cleared on the bed controller.");
-            Row(_bedLimit.Form, "Verify after write", _bedVerify, null);
+            Row(_bedLimit.Form, "Unused steps", _bedUnused, "How segments after the last step are cleared on the bed controller (second PC410).");
+            Row(_bedLimit.Form, "Verify after write", _bedVerify, "Second PC410 only. With a single PC410 the bed targets are kept by ReflowLink.");
             FitCard(_bedLimit.Card, _bedLimit.Form);
 
             // ---------------------------------------------------------------- logging
@@ -399,16 +406,47 @@ namespace ReflowLink.UI.Pages {
             UpdateHints();
         }
 
-        /// <summary>Greys out the bed heat cards while "Use Bed Heat Control" is off.</summary>
+        private static readonly string[] BedModeNames = ["Off (top IR only)", "Single PC410 (IN2 + OUT2)", "Second PC410"];
+
+        /// <summary>Asks before changing the bed hardware when it matters. False keeps the current choice.</summary>
+        private bool ConfirmBedMode(BedMode mode) {
+            var form = FindForm();
+            bool bedRunning = State.DualBed && State.Bed.IsConnected && State.Bed.Last?.State is ProgramState.Running or ProgramState.Hold;
+            bool running = bedRunning || (State.Device.IsConnected && State.Device.Last?.State is ProgramState.Running or ProgramState.Hold);
+            if (running && !DarkDialog.Confirm(form, "Change the bed heat hardware during a run?",
+                    bedRunning
+                        ? "The bed controller is running a program. Changing this disconnects it: it keeps running on its own, but ReflowLink can no longer keep the heaters in step or stop it."
+                        : State.SingleBed
+                            ? "ReflowLink regulates the bed during this run. Changing this switches the bed off (OUT2)."
+                            : "A program is running. The new bed setup applies from the next run.",
+                    "Change", "Cancel", danger: true))
+                return false;
+            if (mode != BedMode.SinglePc410) return true;
+            return DarkDialog.Confirm(form, "Single PC410 bed control",
+                "ReflowLink regulates the bed through the Top IR PC410:\n\n"
+                + "• The bed thermocouple is wired to IN2 (terminals 16 + / 17 −) and read as P2.\n"
+                + "• OUT2 (terminals 6–7) is wired in series with the bed controller's output to the bed SSR.\n"
+                + "• On the PC410 (LOC 808): 0P2 = AL02 and AL02 = HIAL. ReflowLink then switches OUT2 by writing A2 = 001 (on) and A2 = 500 (off).\n\n"
+                + "The bed controller behind OUT2 (or a thermostat) must stay as a hardware limit: if ReflowLink closes or the cable is pulled "
+                + "while OUT2 is on, nothing else stops the bed.",
+                "Use single PC410", "Cancel", danger: true);
+        }
+
+        /// <summary>Shows the bed hardware and greys out the bed cards that don't apply to it.</summary>
         private void ShowBedEnabled() {
-            bool on = State.BedEnabled;
+            bool on = State.BedEnabled, dual = State.DualBed;
             bool wasLoading = _loading;
             _loading = true;
-            _useBed.Checked = on;
+            _bedMode.SelectedIndex = (int)State.BedMode;
+            // Single PC410: IN2 is the bed temperature, so it's read whatever the setting says.
+            _irIn2.Checked = State.SingleBed || State.Settings.ReadIn2;
+            _irIn2.Enabled = !State.SingleBed;
+            _bedIn2.Checked = State.Settings.Bed.ReadIn2;
             _loading = wasLoading;
-            _bedConn.Form.Enabled = on;
-            _bedConn.SimSpeed.Enabled = on && State.Settings.Bed.UseSimulator;
+            _bedConn.Form.Enabled = dual;
+            _bedConn.SimSpeed.Enabled = dual && State.Settings.Bed.UseSimulator;
             _bedLimit.Form.Enabled = on;
+            _bedUnused.Enabled = _bedVerify.Enabled = dual;
             _bedConn.Card.Invalidate(true);
             _bedLimit.Card.Invalidate(true);
             UpdateLimitInfo(_bedLimit);
@@ -464,7 +502,8 @@ namespace ReflowLink.UI.Pages {
             if (Math.Abs(value - current) < 0.01) return;
 
             double factory = l.Channel.IsBed ? StationModel.DefaultMaxTemperature : State.Settings.Station.MaxTemperature;
-            if (value > factory && value > current) {
+            // With a single PC410 the bed limit is only ReflowLink's own cut-off: no controller setpoint limit applies to it.
+            if (value > factory && value > current && !(l.Channel.IsBed && State.SingleBed)) {
                 string hs = l.Channel.Device.ControllerLimits.High is double h
                     ? $"\n\nThis controller currently reports HS = {h:0.#} °C."
                     : "";
@@ -499,6 +538,8 @@ namespace ReflowLink.UI.Pages {
             var limits = device.ControllerLimits;
             if (l.Channel.IsBed && !State.BedEnabled) {
                 l.ControllerLimit.Text = "Bed heat control is off.";
+            } else if (l.Channel.IsBed && State.SingleBed) {
+                l.ControllerLimit.Text = "Single PC410: the bed is switched off above it.";
             } else if (!device.IsConnected) {
                 l.ControllerLimit.Text = "Read from the controller when you connect.";
             } else if (limits.High is double high) {

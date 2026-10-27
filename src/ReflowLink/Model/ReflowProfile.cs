@@ -184,6 +184,35 @@ namespace ReflowLink.Model {
             return c;
         }
 
+        /// <summary>
+        /// Bed setpoint path with a single PC410: the bed has no program, it follows the IR program and reaches each step's
+        /// bed target when the IR reaches its target (see <c>BedPlan</c>).
+        /// </summary>
+        public static PlannedCurve BuildFollowingCurve(ReflowProfile profile, double irStart, double bedStart) {
+            var c = new PlannedCurve();
+            double t = 0, temp = irStart;
+            c.Points.Add(new CurvePoint(0, bedStart));
+            c.PeakTemp = bedStart;
+            foreach (var s in profile.Steps) {
+                c.StepStarts.Add(t);
+                double rate = s.RampRate > 0 ? s.RampRate : 1e9;
+                t += Math.Abs(s.Target - temp) / rate;
+                temp = s.Target;
+                c.Points.Add(new CurvePoint(t, s.BedTarget));
+                if (s.HoldSeconds > 0) {
+                    t += s.HoldSeconds;
+                    c.Points.Add(new CurvePoint(t, s.BedTarget));
+                }
+                c.PeakTemp = Math.Max(c.PeakTemp, s.BedTarget);
+            }
+            c.TotalSeconds = t;
+            return c;
+        }
+
+        /// <summary>The bed's planned path: its own program on a second PC410, or following the IR with a single PC410.</summary>
+        public static PlannedCurve BuildBedCurve(ReflowProfile profile, double irStart, double bedStart, bool followsIr) =>
+            followsIr ? BuildFollowingCurve(profile, irStart, bedStart) : BuildPlannedCurve(profile.ForBed(), bedStart);
+
         public static string FormatDuration(double seconds) {
             if (double.IsNaN(seconds) || seconds < 0) seconds = 0;
             var ts = TimeSpan.FromSeconds(Math.Round(seconds));

@@ -238,6 +238,22 @@ namespace ReflowLink.UI.Controls {
         public Glyph Glyph { get; }
         public bool Selected { get => _selected; set { _selected = value; Invalidate(); } }
 
+        private bool _available = true;
+
+        /// <summary>
+        /// False when the page doesn't apply to the current setup: drawn faded, but still clickable (and showing a
+        /// tooltip), so the click can explain how to switch it on. A disabled control would do neither.
+        /// </summary>
+        public bool Available {
+            get => _available;
+            set {
+                if (_available == value) return;
+                _available = value;
+                Cursor = value ? Cursors.Hand : Cursors.Default;
+                Invalidate();
+            }
+        }
+
         protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); _hover = true; Invalidate(); }
         protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); _hover = false; Invalidate(); }
 
@@ -245,7 +261,8 @@ namespace ReflowLink.UI.Controls {
             var g = e.Graphics;
             Theme.HighQuality(g);
             var r = new RectangleF(Theme.S(10), 1, Width - Theme.S(20), Height - 2);
-            if (_selected || _hover)
+            bool hover = _hover && _available;
+            if (_selected || hover)
                 using (var p = Theme.Rounded(r, Theme.Sf(8)))
                 using (var b = new SolidBrush(_selected ? Theme.SurfaceRaised : Theme.Surface))
                     g.FillPath(b, p);
@@ -253,11 +270,25 @@ namespace ReflowLink.UI.Controls {
                 using (var p = Theme.Rounded(new RectangleF(r.X, r.Y + r.Height * 0.28f, Theme.Sf(3), r.Height * 0.44f), Theme.Sf(1.5f)))
                 using (var b = new SolidBrush(Theme.Accent))
                     g.FillPath(b, p);
-            var fg = _selected ? Theme.Text : _hover ? Theme.Text : Theme.TextDim;
+            var fg = !_available ? Theme.TextFaint : _selected ? Theme.Text : hover ? Theme.Text : Theme.TextDim;
             int icon = Theme.S(18);
             IconPainter.Draw(g, Glyph, new RectangleF(r.X + Theme.S(14), (Height - icon) / 2f, icon, icon), _selected ? Theme.Accent : fg);
             TextRenderer.DrawText(g, Text, _selected ? Theme.BodyBold : Theme.Body,
                 new Rectangle((int)r.X + Theme.S(44), 0, (int)r.Width - Theme.S(48), Height), fg, Theme.LeftMiddle);
+        }
+    }
+
+    /// <summary>Small caption above a group of sidebar items ("TOP IR", "BED HEAT").</summary>
+    [System.ComponentModel.DesignerCategory("Code")]
+    public class NavHeader : ThemedControl {
+        public NavHeader(string text) {
+            Text = text.ToUpperInvariant();
+            Height = Theme.S(30);
+        }
+
+        protected override void OnPaint(PaintEventArgs e) {
+            TextRenderer.DrawText(e.Graphics, Text, Theme.SmallBold, new Rectangle(Theme.S(24), Theme.S(10), Width - Theme.S(30), Height - Theme.S(12)),
+                Theme.TextFaint, Theme.LeftMiddle);
         }
     }
 

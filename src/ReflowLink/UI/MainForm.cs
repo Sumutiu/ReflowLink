@@ -19,6 +19,7 @@ namespace ReflowLink.UI {
         private readonly PageHeader _header;
         private readonly Dictionary<string, PageBase> _pages = [];
         private readonly Dictionary<string, NavButton> _nav = [];
+        private readonly ToolTip _navTip = Theme.CreateToolTip();
         private readonly DashboardPage _dashboard;
         private readonly ProfilesPage _profiles;
         private readonly ConnectionBox _irBox, _bedBox;
@@ -57,7 +58,7 @@ namespace ReflowLink.UI {
                 AutoScroll = true,
                 FlowDirection = FlowDirection.TopDown,
                 WrapContents = false,
-                Height = Theme.S(7 * 44 + 12),
+                Height = Theme.S(8 * 44 + 4 * 30 + 12),
                 BackColor = Theme.Sidebar,
                 Padding = new Padding(0, Theme.S(4), 0, 0),
             };
@@ -67,12 +68,18 @@ namespace ReflowLink.UI {
                 navStack.Controls.Add(b);
                 _nav[key] = b;
             }
+            void AddHeader(string text) => navStack.Controls.Add(new NavHeader(text) { Width = Theme.S(236), Margin = Padding.Empty });
+            AddHeader("Overview");
             AddNav("dashboard", "Dashboard", Glyph.Dashboard);
             AddNav("profiles", "Profiles", Glyph.Profile);
-            AddNav("tuning", "Top IR Control Tuning", Glyph.Tune);
-            AddNav("bedtuning", "Bed Heat Control Tuning", Glyph.Tune);
-            AddNav("console", "Top IR Console", Glyph.Console);
-            AddNav("bedconsole", "Bed Heat Console", Glyph.Console);
+            AddHeader("Top IR");
+            AddNav("tuning", "Control Tuning", Glyph.Tune);
+            AddNav("console", "Console", Glyph.Console);
+            AddHeader("Bed Heat");
+            AddNav("bedswitch", "Switching", Glyph.Spark);
+            AddNav("bedtuning", "Control Tuning", Glyph.Tune);
+            AddNav("bedconsole", "Console", Glyph.Console);
+            AddHeader("ReflowLink");
             AddNav("settings", "Settings", Glyph.Settings);
 
             // Connection blocks at the bottom of the sidebar: top IR, then bed heat
@@ -121,6 +128,7 @@ namespace ReflowLink.UI {
             AddPage("dashboard", _dashboard);
             AddPage("profiles", _profiles);
             AddPage("tuning", new TuningPage(_state, _state.Ir));
+            AddPage("bedswitch", new BedSwitchPage(_state));
             AddPage("bedtuning", new TuningPage(_state, _state.BedChannel));
             AddPage("console", new ConsolePage(_state, _state.Ir));
             AddPage("bedconsole", new ConsolePage(_state, _state.BedChannel));
@@ -139,14 +147,40 @@ namespace ReflowLink.UI {
             _device.StateChanged += (s, e) => UpdateConnectionUi();
             _bedDevice.StateChanged += (s, e) => UpdateConnectionUi();
             _state.BedEnabledChanged += () => {
-                if (!_state.BedEnabled && _bedDevice.IsConnected) _bedDevice.Disconnect();
+                if (!_state.DualBed && _bedDevice.IsConnected) _bedDevice.Disconnect();
                 UpdateConnectionUi();
+                UpdateNav();
             };
+            _state.BedSwitch.CommandFailed += msg => SetStatus(msg, StatusKind.Error);
             _statusFade.Tick += (s, e) => { _statusFade.Stop(); _statusText.ForeColor = Theme.TextFaint; };
 
             ApplySavedBounds(settings);
             UpdateConnectionUi();
+            UpdateNav();
             ShowPage("dashboard");
+        }
+
+        /// <summary>Sidebar pages that need bed hardware are faded out unless that hardware is selected.</summary>
+        private void UpdateNav() {
+            SetAvailable("bedswitch", _state.SingleBed, "Choose \"Single PC410 (IN2 + OUT2)\" under Settings → Station → Bed heat to use this page.");
+            SetAvailable("bedtuning", _state.DualBed, "Choose \"Second PC410\" under Settings → Station → Bed heat to use this page.");
+            SetAvailable("bedconsole", _state.DualBed, _state.SingleBed
+                ? "With a single PC410 the bed is on the Top IR controller: use the Top IR Console (P2 reads IN2)."
+                : "Choose \"Second PC410\" under Settings → Station → Bed heat to use this page.");
+            if (_current != null && _nav.TryGetValue(KeyOf(_current), out var nav) && !nav.Available) ShowPage("dashboard");
+        }
+
+        private void SetAvailable(string key, bool available, string hint) {
+            var b = _nav[key];
+            b.Available = available;
+            _navTip.SetToolTip(b, available ? "" : hint);
+            b.Tag = available ? null : hint;
+        }
+
+        private string KeyOf(PageBase page) {
+            foreach (var kv in _pages)
+                if (kv.Value == page) return kv.Key;
+            return "";
         }
 
         private void AddPage(string key, PageBase page) {
@@ -158,6 +192,10 @@ namespace ReflowLink.UI {
 
         private void ShowPage(string key) {
             if (!_pages.TryGetValue(key, out var page)) return;
+            if (_nav.TryGetValue(key, out var nav) && !nav.Available) {
+                SetStatus(nav.Tag as string ?? "This page doesn't apply to the current setup.", StatusKind.Warning);
+                return;
+            }
             SuspendLayout();
             foreach (var kv in _pages) kv.Value.Visible = kv.Value == page;
             foreach (var kv in _nav) kv.Value.Selected = kv.Key == key;
@@ -181,7 +219,8 @@ namespace ReflowLink.UI {
             var set = _state.Settings;
             _irBox.Show(_device, true, !_state.Busy, set.UseSimulator, set.PortName, set.BaudRate);
             var bed = set.Bed;
-            _bedBox.Show(_bedDevice, _state.BedEnabled, !_state.Busy, bed.UseSimulator, bed.PortName, bed.BaudRate);
+            if (_state.SingleBed && !_bedDevice.IsConnected) _bedBox.ShowShared(_device.IsConnected);
+            else _bedBox.Show(_bedDevice, _state.DualBed, !_state.Busy, bed.UseSimulator, bed.PortName, bed.BaudRate);
         }
 
         private async System.Threading.Tasks.Task ToggleConnection() {
@@ -191,6 +230,10 @@ namespace ReflowLink.UI {
                     return;
                 if (_state.Ir.AutoTuneRunning &&
                     !DarkDialog.Confirm(this, "Disconnect during auto-tune?", AutoTuneWarning, "Disconnect", "Cancel", danger: true))
+                    return;
+                // ReflowLink regulates a single PC410's bed: switch OUT2 off while it still can.
+                if (_state.SingleBed && !_state.BedSwitch.SwitchOffNow() &&
+                    !DarkDialog.Confirm(this, "Bed not confirmed off", BedOffWarning, "Disconnect anyway", "Cancel", danger: true))
                     return;
                 _dashboard.Shutdown();
                 _device.Disconnect();
@@ -228,7 +271,7 @@ namespace ReflowLink.UI {
                 SetStatus("Bed heat controller disconnected", StatusKind.Normal);
                 return;
             }
-            if (!_state.BedEnabled) return;
+            if (!_state.DualBed) return;
             var bed = _state.Settings.Bed;
             if (!bed.UseSimulator && _device.IsConnected && !_device.IsSimulator && string.Equals(bed.PortName, _state.Settings.PortName, StringComparison.OrdinalIgnoreCase)) {
                 DarkDialog.Error(this, "Same serial port", $"{bed.PortName} is already used by the Top IR controller. Each PC410 needs its own serial port; choose another one under Bed Heat Connection in Settings.");
@@ -245,6 +288,10 @@ namespace ReflowLink.UI {
                 if (r == 0) ShowPage("settings");
             }
         }
+
+        private const string BedOffWarning =
+            "The Top IR controller didn't confirm that OUT2 was switched off (A2 = 500). Once disconnected, ReflowLink can't switch the bed off: "
+            + "the bed controller behind OUT2 keeps heating to its own setpoint. Check the bed on the station.";
 
         private const string AutoTuneWarning =
             "The controller keeps tuning on its own, and ReflowLink can't stop it once it's disconnected. "
@@ -292,7 +339,10 @@ namespace ReflowLink.UI {
                         DialogTone.Warning, ["Exit anyway", "Cancel"], 1, ButtonKind.Danger) != 0) { e.Cancel = true; return; }
 
                 if (_dashboard.IsProgramActive && (_device.IsConnected || _bedDevice.IsConnected)) {
-                    int r = DarkDialog.Show(this, "A program is running", "The controller keeps running the program after ReflowLink closes.",
+                    string text = _state.SingleBed
+                        ? "The Top IR controller keeps running the program after ReflowLink closes. The bed is switched off (OUT2), since only ReflowLink regulates it."
+                        : "The controller keeps running the program after ReflowLink closes.";
+                    int r = DarkDialog.Show(this, "A program is running", text,
                         DialogTone.Warning, ["Stop program and exit", "Exit, keep running", "Cancel"], 2);
                     if (r is 2 or < 0) { e.Cancel = true; return; }
                     if (r == 0 && !TryStopBeforeExit()) {
@@ -305,6 +355,11 @@ namespace ReflowLink.UI {
                 if (_state.AutoTuneRunning && (_device.IsConnected || _bedDevice.IsConnected) &&
                     !DarkDialog.Confirm(this, "Auto-tune is running", AutoTuneWarning, "Exit anyway", "Cancel", danger: true)) { e.Cancel = true; return; }
                 if (!_profiles.ConfirmClose()) { e.Cancel = true; return; }
+                if (_state.SingleBed && _device.IsConnected && !_state.BedSwitch.SwitchOffNow() &&
+                    !DarkDialog.Confirm(this, "Bed not confirmed off", BedOffWarning, "Exit anyway", "Cancel", danger: true)) { e.Cancel = true; return; }
+            } else if (_state.SingleBed && _device.IsConnected) {
+                // Windows shutting down or logging off: no questions, but still switch the bed off.
+                _state.BedSwitch.SwitchOffNow(2000);
             }
             var s = _state.Settings;
             s.WindowMaximized = WindowState == FormWindowState.Maximized;
@@ -372,6 +427,14 @@ namespace ReflowLink.UI {
             }
 
             public ModernButton Button { get; }
+
+            /// <summary>Single PC410: the bed has no connection of its own.</summary>
+            public void ShowShared(bool irConnected) {
+                _pill.Set("Via Top IR", irConnected ? Theme.Green : Theme.TextFaint, irConnected);
+                _name.Text = "IN2 + OUT2 on the Top IR PC410";
+                SetButton("Connect", Glyph.Plug, ButtonKind.Primary);
+                Button.Enabled = false;
+            }
 
             public void Show(DeviceService device, bool enabled, bool idle, bool simulator, string port, int baud) {
                 var st = device.State;

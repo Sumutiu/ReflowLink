@@ -40,14 +40,16 @@ namespace ReflowLink.UI.Pages {
         private static readonly Color BedPvColor = Theme.Green;
         private static readonly Color BedSpColor = Color.FromArgb(45, 212, 191);
         private static readonly Color BedOpColor = Color.FromArgb(120, 200, 140);
+        private static readonly Color IrIn2Color = Color.FromArgb(250, 204, 21);
+        private static readonly Color BedIn2Color = Color.FromArgb(244, 114, 182);
 
         private readonly StatCard _pvCard, _spCard, _opCard, _stateCard;
         private readonly ChartView _chart;
-        private readonly ChartSeries _pv, _sp, _op, _plan, _bedPv, _bedSp, _bedOp, _bedPlan;
+        private readonly ChartSeries _pv, _sp, _op, _plan, _bedPv, _bedSp, _bedOp, _bedPlan, _irIn2, _bedIn2;
         private readonly ModernDropDown _window, _slot;
         private readonly ModernButton _run, _hold, _stop, _openLogs;
         private readonly ToggleSwitch _record;
-        private readonly InfoRow _rowState, _rowStep, _rowIr, _rowBed, _rowElapsed, _rowPlanned, _rowRemaining;
+        private readonly InfoRow _rowState, _rowStep, _rowIr, _rowBed, _rowIrIn2, _rowBedIn2, _rowElapsed, _rowPlanned, _rowRemaining;
         private readonly ThemedLabel _recordInfo;
         private readonly CardHeader _chartHeader;
 
@@ -89,9 +91,12 @@ namespace ReflowLink.UI.Pages {
             _bedSp = new ChartSeries { Name = "Bed setpoint", Color = BedSpColor, Width = 1.4f };
             _bedOp = new ChartSeries { Name = "Bed output", Color = BedOpColor, Width = 1.1f, Secondary = true, Unit = "%", Format = "0" };
             _bedPlan = new ChartSeries { Name = "Planned bed", Color = Theme.WithAlpha(BedPvColor, 150), Width = 1.2f, Dashed = true, ShowInLegend = false };
+            // Informative second inputs: shown, never used for control.
+            _irIn2 = new ChartSeries { Name = "IN2 (Top IR)", Color = IrIn2Color, Width = 1.5f };
+            _bedIn2 = new ChartSeries { Name = "IN2 (Bed Heat)", Color = BedIn2Color, Width = 1.5f };
             _chart = new ChartView { Dock = DockStyle.Fill, EmptyText = "Connect to the controller to see live data" };
             // Drawn first to last; the legend lists them last to first (IR before bed).
-            _chart.Series.AddRange([_bedOp, _op, _bedPlan, _plan, _bedSp, _sp, _bedPv, _pv]);
+            _chart.Series.AddRange([_bedOp, _op, _bedPlan, _plan, _bedSp, _sp, _bedIn2, _irIn2, _bedPv, _pv]);
 
             _window = new ModernDropDown { Width = Theme.S(150), Margin = new Padding(0, 0, Theme.S(8), 0) };
             _window.SetItems(WindowNames, 2);
@@ -157,6 +162,8 @@ namespace ReflowLink.UI.Pages {
             _rowStep = new InfoRow("Segment");
             _rowIr = new InfoRow("Top IR");
             _rowBed = new InfoRow("Bed heat");
+            _rowIrIn2 = new InfoRow("IN2 (Top IR)");
+            _rowBedIn2 = new InfoRow("IN2 (Bed Heat)");
             _rowElapsed = new InfoRow("Elapsed");
             _rowPlanned = new InfoRow("Planned duration");
             _rowRemaining = new InfoRow("Remaining (est.)");
@@ -164,6 +171,8 @@ namespace ReflowLink.UI.Pages {
             Add(_rowStep);
             Add(_rowIr);
             Add(_rowBed);
+            Add(_rowIrIn2);
+            Add(_rowBedIn2);
             Add(_rowElapsed);
             Add(_rowPlanned);
             Add(_rowRemaining);
@@ -210,7 +219,9 @@ namespace ReflowLink.UI.Pages {
             State.Device.TelemetryReceived += OnTelemetry;
             State.Device.StateChanged += (s, e) => OnLinkChanged();
             State.Device.ProgramStateChanged += OnProgramStateChanged;
-            State.Bed.TelemetryReceived += OnBedTelemetry;
+            State.Bed.TelemetryReceived += t => { if (Dual) OnBedTelemetry(t); };
+            State.BedSwitch.TelemetryReady += t => { if (State.SingleBed) OnBedTelemetry(t); };
+            State.BedSwitch.SensorLost += async () => await OnBedSensorLost();
             State.Bed.StateChanged += (s, e) => OnBedLinkChanged();
             State.Bed.ProgramStateChanged += (prev, now) => { _bedState = now; OnCombinedStateChanged(); UpdateProgramInfo(State.Device.Last); UpdateButtons(); };
             State.BedEnabledChanged += ApplyBedMode;
@@ -219,9 +230,12 @@ namespace ReflowLink.UI.Pages {
             State.Sync.BedLost += async () => await OnBedLost();
             State.Sync.IrLost += () => {
                 State.SetStatus("Top IR controller stopped answering", StatusKind.Error);
-                DarkDialog.Error(FindForm(), "Top IR controller not answering",
-                    "The Top IR controller stopped answering during the run. It keeps running its program on its own, and the bed carries on with its program too. "
-                    + "Check the cable, or stop both programs on the station's front panels.");
+                DarkDialog.Error(FindForm(), "Top IR controller not answering", State.SingleBed
+                    ? "The Top IR controller stopped answering during the run. It keeps running its program on its own, but ReflowLink can no longer "
+                        + "switch the bed: OUT2 stays as it was, and only the bed controller behind it (or the thermostat) limits the bed. "
+                        + "Check the cable, or stop the program on the front panel and switch the station off."
+                    : "The Top IR controller stopped answering during the run. It keeps running its program on its own, and the bed carries on with its program too. "
+                        + "Check the cable, or stop both programs on the station's front panels.");
             };
             State.SlotProfilesChanged += () => { _slot.SetItems(State.SlotLabels(), _slot.SelectedIndex); ShowPlannedPreview(); };
             State.BusyChanged += UpdateButtons;
@@ -230,7 +244,11 @@ namespace ReflowLink.UI.Pages {
             ShowPlannedPreview();
         }
 
+        /// <summary>A bed heater is shown (second PC410 or single PC410).</summary>
         private bool Bed => State.BedEnabled;
+
+        /// <summary>The bed is a second PC410 with a program of its own.</summary>
+        private bool Dual => State.DualBed;
 
         /// <summary>Shows or hides everything about the bed heat controller.</summary>
         private void ApplyBedMode() {
@@ -242,6 +260,20 @@ namespace ReflowLink.UI.Pages {
             _sp.Name = bed ? "IR setpoint" : "Setpoint (SP)";
             _op.Name = bed ? "IR output" : "Output";
             _plan.Name = bed ? "Planned IR" : "Planned";
+            _bedOp.Name = State.SingleBed ? "Bed demand" : "Bed output";
+            // With a single PC410 the bed temperature is the Top IR controller's IN2; on a second PC410 it's its main input.
+            _bedPv.Name = State.SingleBed ? "Bed temp (IN2)" : "Bed temp";
+            bool irIn2 = State.IrIn2Shown, bedIn2 = State.BedIn2Shown;
+            _irIn2.Visible = _irIn2.ShowInLegend = irIn2;
+            _bedIn2.Visible = _bedIn2.ShowInLegend = bedIn2;
+            // Top IR only: IN2 takes the second half of the Temperature tile. With a bed, it gets a row of its own.
+            _pvCard.Split = bed || irIn2;
+            _pvCard.Label2 = bed ? "Bed heat" : "IN2 (Top IR)";
+            _pvCard.Accent2 = bed ? BedPvColor : IrIn2Color;
+            _rowIrIn2.Visible = irIn2 && bed;
+            _rowBedIn2.Visible = bedIn2;
+            if (!irIn2) _irIn2.Points.Clear();
+            if (!bedIn2) _bedIn2.Points.Clear();
             _chartHeader.Subtitle = bed ? "Top IR and bed heat: temperature, setpoint and heater output" : "Board temperature, setpoint and heater output";
             _rowStep.Visible = !bed;
             _rowIr.Visible = _rowBed.Visible = bed;
@@ -264,6 +296,7 @@ namespace ReflowLink.UI.Pages {
             }
             if (ls == LinkStatus.Disconnected) {
                 _state = ProgramState.Unknown;
+                _rowIrIn2.Value = "—";
                 _pvCard.Value = _spCard.Value = _opCard.Value = "—";
                 _pvCard.Detail = _spCard.Detail = _opCard.Detail = "Not connected";
                 _opCard.Bar = null;
@@ -280,17 +313,21 @@ namespace ReflowLink.UI.Pages {
                 _chart.EmptyText = "Waiting for data…";
             }
             _lastLink = ls;
+            if (State.SingleBed) OnBedLinkChanged();
             UpdateButtons();
             _chart.Invalidate();
         }
 
         private void OnBedLinkChanged() {
-            var ls = State.Bed.State;
+            // A single PC410's bed is read over the Top IR link.
+            var ls = Dual ? State.Bed.State : State.Device.State;
             if (ls == LinkStatus.Disconnected || !Bed) {
                 _bedState = ProgramState.Unknown;
                 _pvCard.Value2 = _spCard.Value2 = _opCard.Value2 = "—";
                 _pvCard.Detail2 = _spCard.Detail2 = _opCard.Detail2 = Bed ? "Not connected" : "Off";
                 _opCard.Bar2 = null;
+                _rowBedIn2.Value = "—";
+                if (!Bed && State.IrIn2Shown) _pvCard.Detail2 = State.Device.IsConnected ? "Information only" : "Not connected";
             } else if (ls == LinkStatus.NoResponse) {
                 _pvCard.Detail2 = "No response";
             }
@@ -306,7 +343,17 @@ namespace ReflowLink.UI.Pages {
             if (t.Pv.HasValue) _pv.Points.Add(new PointD(x, t.Pv.Value));
             if (t.Sp.HasValue) _sp.Points.Add(new PointD(x, t.Sp.Value));
             if (t.Op.HasValue) _op.Points.Add(new PointD(x, t.Op.Value));
-            Trim(_pv, _sp, _op);
+            if (State.IrIn2Shown) {
+                if (t.Pv2.HasValue) _irIn2.Points.Add(new PointD(x, t.Pv2.Value));
+                string in2 = t.Pv2.HasValue ? t.Pv2.Value.ToString("0.0") : "—";
+                if (!Bed) {
+                    _pvCard.Value2 = in2;
+                    _pvCard.Detail2 = "Information only";
+                } else {
+                    _rowIrIn2.Value = t.Pv2.HasValue ? in2 + " °C" : "—";
+                }
+            }
+            Trim(_pv, _sp, _op, _irIn2);
 
             if (t.State != ProgramState.Unknown) _state = t.State;
 
@@ -324,7 +371,13 @@ namespace ReflowLink.UI.Pages {
             UpdateProgramInfo(t);
 
             if (_recorder != null) {
-                try { _recorder.Write(t, Bed ? State.Bed.Last : null, State.Sync.WaitingText); } catch (Exception ex) { State.SetStatus("Recording stopped: " + ex.Message, StatusKind.Error); StopRecording(); }
+                try {
+                    var bedReading = Dual ? State.Bed.Last : State.SingleBed ? State.BedSwitch.Last : null;
+                    _recorder.Write(t, bedReading, State.Sync.WaitingText, State.SingleBed ? State.BedSwitch.Out2 : null);
+                } catch (Exception ex) {
+                    State.SetStatus("Recording stopped: " + ex.Message, StatusKind.Error);
+                    StopRecording();
+                }
                 if (_autoStopAt.HasValue && DateTime.Now >= _autoStopAt.Value) StopRecording();
                 else if (_recorder != null) _recordInfo.Text = $"Recording · {_recorder.Rows} rows\n{Path.GetFileName(_recorder.FilePath)}";
             }
@@ -335,11 +388,15 @@ namespace ReflowLink.UI.Pages {
 
         private void OnBedTelemetry(Telemetry t) {
             if (!Bed) return;
-            double x = X(t.Time, State.Bed);
+            double x = X(t.Time, Dual ? State.Bed : State.Device);
             if (t.Pv.HasValue) _bedPv.Points.Add(new PointD(x, t.Pv.Value));
             if (t.Sp.HasValue) _bedSp.Points.Add(new PointD(x, t.Sp.Value));
             if (t.Op.HasValue) _bedOp.Points.Add(new PointD(x, t.Op.Value));
-            Trim(_bedPv, _bedSp, _bedOp);
+            if (Dual && State.BedIn2Shown) {
+                if (t.Pv2.HasValue) _bedIn2.Points.Add(new PointD(x, t.Pv2.Value));
+                _rowBedIn2.Value = t.Pv2.HasValue ? t.Pv2.Value.ToString("0.0") + " °C" : "—";
+            }
+            Trim(_bedPv, _bedSp, _bedOp, _bedIn2);
             if (t.State != ProgramState.Unknown) _bedState = t.State;
 
             _pvCard.Value2 = t.Pv.HasValue ? t.Pv.Value.ToString("0.0") : "—";
@@ -349,7 +406,9 @@ namespace ReflowLink.UI.Pages {
             _spCard.Detail2 = Deviation(t, _bedState);
             _opCard.Value2 = t.Op.HasValue ? t.Op.Value.ToString("0") : "—";
             _opCard.Bar2 = t.Op.HasValue ? t.Op.Value / 100.0 : (double?)null;
-            _opCard.Detail2 = "Heater power";
+            _opCard.Detail2 = State.SingleBed
+                ? State.BedSwitch.Out2 switch { true => "OUT2 on", false => "OUT2 off", _ => "OUT2 unknown" }
+                : "Heater power";
             if (!State.Device.IsConnected) UpdateWindow();
         }
 
@@ -387,7 +446,7 @@ namespace ReflowLink.UI.Pages {
 
         /// <summary>State of the whole program: either controller running counts as running.</summary>
         private ProgramState Combined() {
-            if (!Bed || !State.Bed.IsConnected) return _state;
+            if (!Dual || !State.Bed.IsConnected) return _state;
             if (_state == ProgramState.Running || _bedState == ProgramState.Running) return ProgramState.Running;
             if (_state == ProgramState.Hold || _bedState == ProgramState.Hold) return ProgramState.Hold;
             if (_state == ProgramState.Idle && _bedState == ProgramState.Idle) return ProgramState.Idle;
@@ -406,7 +465,7 @@ namespace ReflowLink.UI.Pages {
             string waiting = Bed ? State.Sync.WaitingText : "";
             if (State.Sync.UserHold && combined != ProgramState.Idle) (st, c) = ("On hold", Theme.Yellow);
             else if (waiting.Length > 0) (st, c) = (waiting, Theme.Yellow);
-            if (State.Device.State == LinkStatus.NoResponse || (Bed && State.Bed.State == LinkStatus.NoResponse)) c = Theme.Red;
+            if (State.Device.State == LinkStatus.NoResponse || (Dual && State.Bed.State == LinkStatus.NoResponse)) c = Theme.Red;
             _stateCard.Value = waiting.Length > 0 && !State.Sync.UserHold ? "Waiting" : Describe(combined).Text;
             _stateCard.Accent = c;
             _rowState.Value = st;
@@ -421,9 +480,11 @@ namespace ReflowLink.UI.Pages {
             _rowStep.Value = active ? seg : "—";
             if (Bed) {
                 var (irText, irColor) = State.Device.IsConnected ? Describe(_state) : ("Offline", Theme.TextFaint);
-                var (bedText, bedColor) = State.Bed.IsConnected ? Describe(_bedState) : ("Offline", Theme.TextFaint);
+                var (bedText, bedColor) = Dual
+                    ? State.Bed.IsConnected ? Describe(_bedState) : ("Offline", Theme.TextFaint)
+                    : State.Device.IsConnected ? DescribeSwitch() : ("Offline", Theme.TextFaint);
                 string irStep = active && _state != ProgramState.Idle ? StepText(t?.Segment, steps) : "";
-                string bedStep = active && _bedState != ProgramState.Idle ? StepText(State.Bed.Last?.Segment, steps) : "";
+                string bedStep = !Dual ? "" : active && _bedState != ProgramState.Idle ? StepText(State.Bed.Last?.Segment, steps) : "";
                 if (State.Sync.IrWaiting) (irText, irColor) = ("Waiting for bed", Theme.Yellow);
                 if (State.Sync.BedWaiting) (bedText, bedColor) = ("Waiting for IR", Theme.Yellow);
                 _rowIr.Value = irStep.Length > 0 ? $"{irText} · {irStep}" : irText;
@@ -446,6 +507,15 @@ namespace ReflowLink.UI.Pages {
                 _stateCard.Detail = State.Device.State == LinkStatus.NoResponse ? "No response from controller"
                     : pattern.HasValue ? $"Active pattern {pattern}" : "Ready";
             }
+        }
+
+        /// <summary>What the single PC410 bed control is doing, for the Bed row.</summary>
+        private (string Text, Color Color) DescribeSwitch() {
+            var b = State.BedSwitch;
+            string out2 = b.Out2 switch { true => "OUT2 on", false => "OUT2 off", _ => "OUT2 ?" };
+            if (b.Reason is "Heating" or "Regulating") return ($"{b.Demand:0}% · {out2}", b.WantOn ? Theme.Green : Theme.TextDim);
+            bool problem = _state is ProgramState.Running or ProgramState.Hold && b.Reason != "Stopped";
+            return ($"{b.Reason} · {out2}", problem ? Theme.Yellow : Theme.TextDim);
         }
 
         /// <summary>Planned duration of the run, ignoring waits (the longer of the two controllers).</summary>
@@ -477,7 +547,7 @@ namespace ReflowLink.UI.Pages {
                     foreach (var p in _runPlan.Points) _plan.Points.Add(new PointD(_runStart.Value + p.Time, p.Temp));
                     if (Bed) {
                         double bedStart = _bedPv.Points.Count > 0 ? _bedPv.Points[_bedPv.Points.Count - 1].Y : start;
-                        _runBedPlan = ProfileMath.BuildPlannedCurve(prof.ForBed(), bedStart);
+                        _runBedPlan = ProfileMath.BuildBedCurve(prof, start, bedStart, State.SingleBed);
                         foreach (var p in _runBedPlan.Points) _bedPlan.Points.Add(new PointD(_runStart.Value + p.Time, p.Temp));
                     }
                     for (int i = 0; i < _runPlan.StepStarts.Count; i++)
@@ -492,7 +562,7 @@ namespace ReflowLink.UI.Pages {
                 if (State.Settings.AutoRecordRuns && _recorder == null) StartRecording(true);
                 else if (_autoRecording) _autoStopAt = null;
             } else if (now == ProgramState.Idle && wasActive) {
-                bool bedStillRunning = Bed && State.Bed.IsConnected && _bedState is ProgramState.Running or ProgramState.Hold && !_userStopped;
+                bool bedStillRunning = Dual && State.Bed.IsConnected && _bedState is ProgramState.Running or ProgramState.Hold && !_userStopped;
                 _chart.Markers.Add(new ChartMarker { X = _lastX, Label = bedStillRunning ? "IR end" : "End", Color = Theme.Green });
                 if (bedStillRunning) State.SetStatus("Top IR program finished; bed still running", StatusKind.Success);
             }
@@ -530,7 +600,7 @@ namespace ReflowLink.UI.Pages {
             }
             double start = State.Settings.PreviewStartTemperature;
             double total = ProfileMath.BuildPlannedCurve(p, start).TotalSeconds;
-            if (Bed) total = Math.Max(total, ProfileMath.BuildPlannedCurve(p.ForBed(), start).TotalSeconds);
+            if (Bed) total = Math.Max(total, ProfileMath.BuildBedCurve(p, start, start, State.SingleBed).TotalSeconds);
             _rowPlanned.Value = ProfileMath.FormatDuration(total);
         }
 
@@ -583,8 +653,8 @@ namespace ReflowLink.UI.Pages {
         // ==================================================================== program control
 
         private void UpdateButtons() {
-            bool conn = State.Device.IsConnected && (!Bed || State.Bed.IsConnected);
-            bool any = State.Device.IsConnected || (Bed && State.Bed.IsConnected);
+            bool conn = State.Device.IsConnected && (!Dual || State.Bed.IsConnected);
+            bool any = State.Device.IsConnected || (Dual && State.Bed.IsConnected);
             bool busy = State.Busy;
             var combined = Combined();
             bool active = combined is ProgramState.Running or ProgramState.Hold;
@@ -611,16 +681,24 @@ namespace ReflowLink.UI.Pages {
             // Read the pattern back and check it against ReflowLink's limits and the controllers' setpoint limits right
             // before starting, so a pattern changed elsewhere (front panel, other software) can't run out of range.
             double limit = State.Settings.MaxTemperature, bedLimit = State.Settings.Bed.MaxTemperature;
-            bool both = Bed;
-            var sync = both ? State.Settings.SyncFor(slot) : null;
+            bool both = Dual, single = State.SingleBed;
+            var sync = Bed ? State.Settings.SyncFor(slot) : null;
+            if (single && !CanStartSingleBed(slot, sync)) return;
             State.Sync.Reset();
             State.Sync.Sync = null; // set once the pattern has been checked
             var (ok, prof) = await State.RunPairAsync(both ? $"Starting pattern {slot} on both controllers" : $"Starting pattern {slot}", (ir, bed, progress, ct) => {
                 var p = PatternPair.Check(ir, bed, slot, limit, bedLimit, progress, ct);
+                // The bed targets kept by ReflowLink must belong to the profile the pattern holds now.
+                if (single && !sync.Matches(p))
+                    throw new ProfileRejectedException(slot, [$"Pattern {slot} was changed since ReflowLink saved its bed targets. Write the profile to it again."], false, false);
                 PatternPair.Start(ir, bed, slot);
                 return p;
             });
             if (!ok) return;
+            if (single) {
+                State.BedSwitch.Begin(BedPlan.From(sync, State.Device.Last?.Pv ?? sync.IrTargets[0], State.BedSwitch.BedTemperature ?? sync.BedTargets[0]));
+                sync.ApplyTo(prof, true);
+            }
             var known = State.SlotProfiles[slot];
             if (known != null && known.Steps.Count == prof.Steps.Count) {
                 prof.Name = known.Name;
@@ -634,6 +712,27 @@ namespace ReflowLink.UI.Pages {
             State.SetSlotProfile(slot, prof);
             State.Device.NotePattern(slot);
             if (both) State.Bed.NotePattern(slot);
+        }
+
+        /// <summary>Single PC410: the pattern needs saved bed targets and the bed has to be readable before a start.</summary>
+        private bool CanStartSingleBed(int slot, PatternSync sync) {
+            if (sync == null || !sync.HasTargets) {
+                DarkDialog.Error(FindForm(), $"No bed targets for pattern {slot}",
+                    $"ReflowLink keeps the bed targets of each pattern, and has none for pattern {slot}. Write the profile to pattern {slot} on the Profiles page first.");
+                return false;
+            }
+            double bedLimit = State.Settings.Bed.MaxTemperature;
+            if (sync.BedTargets.Any(b => b > bedLimit)) {
+                DarkDialog.Error(FindForm(), $"Bed target above the limit in pattern {slot}",
+                    $"A bed target saved for pattern {slot} is above the {bedLimit:0} °C bed limit. Correct it and write the profile again.");
+                return false;
+            }
+            if (State.BedSwitch.BedTemperature == null) {
+                DarkDialog.Error(FindForm(), "No bed temperature",
+                    "The Top IR controller doesn't report a bed temperature on IN2 (P2). Check the bed thermocouple wiring to terminals 16 (+) and 17 (−).");
+                return false;
+            }
+            return true;
         }
 
         private async Task HoldOrResume() {
@@ -656,6 +755,7 @@ namespace ReflowLink.UI.Pages {
 
         private async Task StopProgram() {
             _userStopped = true;
+            if (State.SingleBed) State.BedSwitch.Stop(); // the bed goes off first, whatever happens to the stop
             if (!Bed) {
                 var (stopped, _) = await State.RunAsync("Stopping program", d => d.Stop());
                 if (!stopped) _userStopped = false;
@@ -680,6 +780,21 @@ namespace ReflowLink.UI.Pages {
             DarkDialog.Error(FindForm(), "Bed Heat controller not answering", "The Bed Heat controller stopped answering during the run.\n\n" + result);
         }
 
+        /// <summary>Single PC410: the bed reading (P2) was lost during the run. The bed is already off; stop the IR too.</summary>
+        private async Task OnBedSensorLost() {
+            string result;
+            try {
+                await State.Device.RunAsync(d => d.Stop());
+                result = "The bed was switched off (OUT2) and the Top IR program was stopped.";
+            } catch (Exception ex) {
+                result = $"The bed was switched off (OUT2), but the Top IR program couldn't be stopped ({ex.Message}). Stop it on the front panel.";
+            }
+            State.SetStatus("Bed temperature lost: program stopped", StatusKind.Error);
+            DarkDialog.Error(FindForm(), "Bed temperature lost",
+                "The Top IR controller stopped reporting the bed temperature on IN2 (P2) during the run.\n\n" + result
+                + "\n\nCheck the bed thermocouple wiring to terminals 16 (+) and 17 (−).");
+        }
+
         // ==================================================================== recording
 
         private void StartRecording(bool auto) {
@@ -689,7 +804,7 @@ namespace ReflowLink.UI.Pages {
                 var prof = pattern.HasValue ? State.SlotProfiles[pattern.Value] : null;
                 string label = prof != null && !string.IsNullOrWhiteSpace(prof.Name) ? prof.Name
                     : pattern.HasValue ? "pattern" + pattern.Value : "session";
-                _recorder = new CsvRecorder(State.Settings.EffectiveLogFolder, label, Bed);
+                _recorder = new CsvRecorder(State.Settings.EffectiveLogFolder, label, Bed, State.SingleBed, State.IrIn2Shown, State.BedIn2Shown);
                 _autoRecording = auto;
                 _autoStopAt = null;
                 _recordInfo.Text = "Recording · 0 rows\n" + Path.GetFileName(_recorder.FilePath);

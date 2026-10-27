@@ -426,7 +426,7 @@ namespace ReflowLink.UI.Pages {
                 : fresh ? $"Read from the controller at {when}" + (missing > 0 ? $"  ·  {missing} not reported" : "")
                 : conn ? $"Showing values read at {when} on an earlier connection"
                 : $"Disconnected  ·  values read at {when}";
-            _lockNote.Text = !conn && _ch.IsBed && !State.BedEnabled ? "Bed heat control is switched off in Settings. You can still try changes in the graph."
+            _lockNote.Text = !conn && _ch.IsBed && !State.DualBed ? "This page is for a second PC410 on the bed (Settings → Bed heat). You can still try changes in the graph."
                 : !conn ? $"Try changes in the graph. Connect the {_ch.Name} controller to read and write it."
                 : !fresh ? "Read the controller before writing (Read from controller)."
                 : ProgramActive ? "A program is running: settings can't be changed until it stops."

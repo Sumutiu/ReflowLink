@@ -525,6 +525,235 @@ namespace ReflowLink.Tests {
                 False(s.Bed.Enabled, "off by default");
             });
 
+            Run("Single PC410: A2 and P2 frames are byte for byte as expected", () => {
+                // EOT "0011" STX "A2001" ETX 'A' switches the bed on, and "A2500" ETX 'E' switches it off.
+                Eq("04 30 30 31 31 02 41 32 30 30 31 03 41", Hex(Pc410Protocol.BuildWriteFrame(1, Pc410Device.BedAlarm, Pc410Device.BedOnValue)));
+                Eq("04 30 30 31 31 02 41 32 35 30 30 03 45", Hex(Pc410Protocol.BuildWriteFrame(1, Pc410Device.BedAlarm, Pc410Device.BedOffValue)));
+                Eq("04 30 30 31 31 50 32 05", Hex(Pc410Protocol.BuildReadFrame(1, Pc410Device.BedInput)));
+            });
+
+            Run("Single PC410: bed settings migrate from 2.0.0 and keep the old flag in step", () => {
+                var s = new AppSettings();
+                s.Bed.Enabled = true; // a 2.0.0 file with "Use Bed Heat Control" on
+                s.Sanitize();
+                Eq(BedMode.SecondPc410, s.Bed.Mode);
+                var t = new AppSettings();
+                t.Bed.Mode = BedMode.SinglePc410;
+                t.Bed.Switching.CycleSeconds = 1;
+                t.Sanitize();
+                Eq(BedMode.SinglePc410, t.Bed.Mode);
+                False(t.Bed.Enabled, "2.0.0 must not mistake a single PC410 for a second one");
+                Eq(4.0, t.Bed.Switching.CycleSeconds);
+                Eq(BedMode.None, new AppSettings().Sanitize().Bed.Mode);
+            });
+
+            Run("Single PC410: bed targets are kept per pattern and only restored onto the same profile", () => {
+                var p = new ReflowProfile { BedHoldback = 7 };
+                p.Steps.Add(new ProfileStep(1.0, 120, 30) { BedTarget = 100, WaitForBed = true });
+                p.Steps.Add(new ProfileStep(0.5, 160, 40) { BedTarget = 135.5 });
+                var sync = PatternSync.From(3, p);
+                True(sync.HasTargets, "targets saved");
+                Eq("120;160", sync.IrTargetList);
+                Eq("100;135.5", sync.BedTargetList);
+                // Read back from the controller: no bed targets there.
+                var read = new ReflowProfile();
+                read.Steps.Add(new ProfileStep(1.0, 120, 30));
+                read.Steps.Add(new ProfileStep(0.5, 160, 40));
+                True(sync.ApplyTo(read, true), "restored");
+                Eq(135.5, read.Steps[1].BedTarget);
+                Eq(7.0, read.BedHoldback);
+                True(read.Steps[0].WaitForBed, "wait restored");
+                // Pattern changed on the front panel: the bed targets don't belong to it any more.
+                read.Steps[1].Target = 170;
+                False(sync.Matches(read), "changed pattern");
+                False(sync.ApplyTo(read, true), "not restored onto a changed pattern");
+                False(new PatternSync { Steps = 2 }.HasTargets, "saved before 2.1: no targets");
+            });
+
+            Run("Single PC410: the bed setpoint follows the IR program step by step", () => {
+                var plan = new BedPlan([120, 160, 205], [100, 130, 150], irStart: 25, bedStart: 25);
+                Eq(25.0, plan.SetpointAt(1, 25));
+                Eq(62.5, plan.SetpointAt(1, 72.5));   // halfway up the IR ramp, halfway to the bed target
+                Eq(100.0, plan.SetpointAt(1, 120));   // IR holding: bed holds its target
+                Eq(115.0, plan.SetpointAt(2, 140));
+                Eq(150.0, plan.SetpointAt(3, null));  // no IR setpoint reported: the step's bed target
+                Eq(100.0, plan.SetpointAt(1, 400));   // never beyond the step's target
+                var flat = new BedPlan([120, 120], [100, 140], 25, 25);
+                Eq(140.0, flat.SetpointAt(2, 120));   // IR doesn't move in step 2: the bed goes straight to its target
+            });
+
+            Run("Single PC410: regulator and time proportioning", () => {
+                var r = new BedRegulator { Band = 10, IntegralSeconds = 0 };
+                Eq(50.0, r.Update(100, 95, 1));
+                Eq(0.0, r.Update(100, 101, 1));
+                Eq(100.0, r.Update(100, 70, 1));
+                var pi = new BedRegulator { Band = 10, IntegralSeconds = 100 };
+                double first = pi.Update(100, 99, 10), later = 0;
+                for (int i = 0; i < 20; i++) later = pi.Update(100, 99, 10);
+                True(later > first, "the integral builds up a remaining offset");
+                var tp = new TimeProportioner { CycleSeconds = 10, MinSwitchSeconds = 1 };
+                True(tp.On(0, 40) && tp.On(3.9, 40), "on for the first 40 % of the cycle");
+                False(tp.On(4.1, 40) || tp.On(9.9, 40), "off for the rest");
+                True(tp.On(10.2, 40), "next cycle starts on");
+                var tp2 = new TimeProportioner { CycleSeconds = 10, MinSwitchSeconds = 1 };
+                False(tp2.On(0, 5), "a pulse shorter than the minimum is dropped");
+                var tp3 = new TimeProportioner { CycleSeconds = 10, MinSwitchSeconds = 1 };
+                True(tp3.On(0, 95) && tp3.On(9.6, 95), "a gap shorter than the minimum is filled");
+            });
+
+            Run("Single PC410: the bed stays off whenever it can't be regulated", () => {
+                var plan = new BedPlan([150], [120], 25, 25);
+                Eq("Not connected", BedSwitchController.Decide(false, true, false, plan, 1, 80, 260));
+                Eq("Stopped", BedSwitchController.Decide(true, true, true, plan, 1, 80, 260));
+                Eq("Idle", BedSwitchController.Decide(true, false, false, plan, 1, 80, 260));
+                Eq("No bed targets", BedSwitchController.Decide(true, true, false, null, 1, 80, 260));
+                Eq("No bed reading (P2)", BedSwitchController.Decide(true, true, false, plan, 1, null, 260));
+                Eq("Step not reported", BedSwitchController.Decide(true, true, false, plan, null, 80, 260));
+                Eq("Above 260 °C limit", BedSwitchController.Decide(true, true, false, plan, 1, 261, 260));
+                Eq(null, BedSwitchController.Decide(true, true, false, plan, 1, 80, 260));
+            });
+
+            Run("Single PC410: simulator gates the bed through OUT2 like a high alarm", () => {
+                using var c = NewSim(out var sim);
+                sim.BedCeiling = 150;
+                False(sim.Out2, "A2 = 500 at power-up: OUT2 open");
+                double start = sim.BedTemperature;
+                sim.Advance(60);
+                True(Math.Abs(sim.BedTemperature - start) < 0.5, "no heat while OUT2 is open");
+                c.Write(Pc410Device.BedAlarm, Pc410Device.BedOnValue);
+                True(sim.Out2, "A2 = 001: PV above the alarm, OUT2 closed");
+                sim.Advance(120);
+                True(sim.BedTemperature > start + 40, "bed heats through OUT2");
+                sim.Advance(1200);
+                True(sim.BedTemperature < 152, "the bed controller behind OUT2 still limits it");
+                c.Write(Pc410Device.BedAlarm, Pc410Device.BedOffValue);
+                False(sim.Out2, "A2 = 500: OUT2 open again");
+                Eq(500.0, c.ReadNumber(Pc410Device.BedAlarm));
+                True(c.ReadNumber(Pc410Device.BedInput) > 100, "P2 reads the bed");
+            });
+
+            Run("Single PC410: P2 and A2 are polled, and a missing IN2 stops costing time", () => {
+                using var c = NewSim(out var sim);
+                var dev = new Pc410Device(c);
+                var t0 = dev.ReadTelemetry(in2: true, alarm2: true);
+                True(t0.Pv2.HasValue && t0.Alarm2 == 500, "P2 and A2 on the first poll");
+                var t1 = dev.ReadTelemetry(in2: true, alarm2: true);
+                True(t1.Pv2.HasValue && !t1.Alarm2.HasValue, "A2 only every other poll");
+                False(dev.ReadTelemetry().Pv2.HasValue, "not read unless asked for");
+                sim.HideBedInput = true;
+                for (int i = 0; i < 4; i++) dev.ReadTelemetry(in2: true, alarm2: true);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var t = dev.ReadTelemetry(in2: true, alarm2: true);
+                False(t.Pv2.HasValue, "no bed reading");
+                True(sw.ElapsedMilliseconds < 150, "given up after repeated misses");
+            });
+
+            Run("Single PC410: ReflowLink switches the bed through OUT2 during a run and off at the end", () => {
+                var settings = new AppSettings();
+                settings.Bed.Mode = BedMode.SinglePc410;
+                settings.Bed.Switching.CycleSeconds = 4;
+                var prof = new ReflowProfile();
+                prof.Steps.Add(new ProfileStep(1.5, 120, 20) { BedTarget = 110 });
+                prof.Steps.Add(new ProfileStep(0.8, 160, 40) { BedTarget = 120 });
+                prof.Steps.Add(new ProfileStep(1.0, 205, 20) { BedTarget = 130 });
+                settings.SetSync(0, prof); // the simulator's demo pattern 0 has the same IR steps
+                var device = new DeviceService();
+                try {
+                    device.ConnectAsync(new ConnectionOptions { UseSimulator = true, SimulatorSpeed = 10, PollIntervalMs = 200 }).Wait();
+                    var sim = (SimulatedPc410)device.RunAsync(d => d.Client.Transport).Result;
+                    device.ReadIn2 = device.ReadAlarm2 = true;
+                    // A bed left switched on (another program, a crash) is switched off while no program runs.
+                    device.RunAsync(d => d.SetBedSwitch(true)).Wait();
+                    True(sim.Out2, "left on");
+                    var ctl = new BedSwitchController(device, settings) { Enabled = true, KnownPattern = slot => slot == 0 ? prof : null };
+                    True(WaitFor(() => !sim.Out2, 5000), "switched off while idle");
+                    int writesIdle = ctl.SessionWrites;
+
+                    device.RunAsync(d => d.Start(0)).Wait();
+                    True(WaitFor(() => ctl.Plan != null, 5000), "the plan saved with pattern 0 is used for a front-panel style start of a checked pattern");
+                    True(WaitFor(() => sim.Out2, 8000), "bed switched on while it's below its setpoint");
+                    True(WaitFor(() => ctl.Setpoint.HasValue && ctl.BedTemperature.HasValue, 2000), "regulating");
+                    Thread.Sleep(1500);
+                    True(ctl.SessionWrites - writesIdle < 30, "only state changes are written");
+
+                    ctl.Stop();
+                    device.RunAsync(d => d.Stop()).Wait();
+                    True(WaitFor(() => !sim.Out2, 5000), "Stop switches the bed off");
+                    Thread.Sleep(800);
+                    False(sim.Out2, "and it stays off");
+                    True(ctl.Reason is "Stopped" or "Idle", "reason: " + ctl.Reason);
+                } finally {
+                    device.Dispose();
+                }
+            });
+
+            Run("Single PC410: an unchecked front-panel start and a run already going don't heat the bed", () => {
+                var settings = new AppSettings();
+                settings.Bed.Mode = BedMode.SinglePc410;
+                var prof = new ReflowProfile();
+                prof.Steps.Add(new ProfileStep(1.5, 120, 20) { BedTarget = 110 });
+                prof.Steps.Add(new ProfileStep(0.8, 160, 40) { BedTarget = 120 });
+                prof.Steps.Add(new ProfileStep(1.0, 205, 20) { BedTarget = 130 });
+                settings.SetSync(0, prof);
+                var device = new DeviceService();
+                try {
+                    device.ConnectAsync(new ConnectionOptions { UseSimulator = true, SimulatorSpeed = 10, PollIntervalMs = 200 }).Wait();
+                    var sim = (SimulatedPc410)device.RunAsync(d => d.Client.Transport).Result;
+                    device.ReadIn2 = device.ReadAlarm2 = true;
+                    // The pattern wasn't read or written this session: its saved bed targets can't be trusted.
+                    var ctl = new BedSwitchController(device, settings) { Enabled = true, KnownPattern = slot => null };
+                    Thread.Sleep(600);
+                    device.RunAsync(d => d.Start(0)).Wait();
+                    True(WaitFor(() => ctl.Reason == "Pattern not checked", 5000), "reason: " + ctl.Reason);
+                    Thread.Sleep(1000);
+                    False(sim.Out2, "bed stays off");
+                    Eq(null, ctl.Plan);
+                    // Bed control switched on while that run goes on: it waits for the next run.
+                    ctl.Enabled = false;
+                    ctl.KnownPattern = slot => prof;
+                    ctl.Enabled = true;
+                    True(WaitFor(() => ctl.Reason == "From the next run", 5000), "reason: " + ctl.Reason);
+                    False(sim.Out2, "still off");
+                    True(ctl.SwitchOffNow(), "switch-off confirmed by reading A2 back");
+                    False(sim.Out2, "off");
+                    device.RunAsync(d => d.Stop()).Wait();
+                } finally {
+                    device.Dispose();
+                }
+            });
+
+            Run("IN2 readings: polled only where they apply, and logged as information", () => {
+                var s = new AppSettings();
+                var ir = new DeviceService();
+                var bed = new DeviceService();
+                var st = new ReflowLink.UI.AppState(s, ir, bed);
+                False(ir.ReadIn2 || ir.ReadAlarm2 || bed.ReadIn2, "nothing extra by default");
+                s.ReadIn2 = true;
+                s.Bed.ReadIn2 = true;
+                st.ApplyBedMode();
+                True(st.IrIn2Shown && ir.ReadIn2 && !ir.ReadAlarm2, "Top IR only: IN2 (Top IR) is read, A2 isn't");
+                False(st.BedIn2Shown || bed.ReadIn2, "no second PC410: IN2 (Bed Heat) can't be on");
+                s.Bed.Mode = BedMode.SinglePc410;
+                s.ReadIn2 = false;
+                st.ApplyBedMode();
+                True(ir.ReadIn2 && ir.ReadAlarm2, "single PC410: IN2 and A2 always read, whatever the setting");
+                False(st.IrIn2Shown || st.BedIn2Shown, "single PC410: IN2 is the bed temperature, not an extra line");
+                s.Bed.Mode = BedMode.SecondPc410;
+                st.ApplyBedMode();
+                True(st.BedIn2Shown && bed.ReadIn2 && !ir.ReadIn2, "second PC410: its IN2 can be shown");
+
+                string folder = Path.Combine(Path.GetTempPath(), "reflowlink_in2_test");
+                using (var rec = new CsvRecorder(folder, "in2", withIrIn2: true)) {
+                    rec.Write(new Telemetry { Time = DateTime.Now, Pv = 150, Pv2 = 98.25, State = ProgramState.Running });
+                    string path = rec.FilePath;
+                    rec.Dispose();
+                    var lines = File.ReadAllLines(path);
+                    True(lines[0].EndsWith(",in2_top_ir_c"), "header: " + lines[0]);
+                    True(lines[1].EndsWith(",98.3") || lines[1].EndsWith(",98.2"), "row: " + lines[1]);
+                    File.Delete(path);
+                }
+            });
+
             Run("END marker mode terminates the program", () => {
                 using var c = NewSim(out _);
                 var dev = new Pc410Device(c);
@@ -864,6 +1093,15 @@ namespace ReflowLink.Tests {
         }
 
         private static void False(bool cond, string what) => True(!cond, what);
+
+        private static bool WaitFor(Func<bool> cond, int timeoutMs) {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs) {
+                if (cond()) return true;
+                Thread.Sleep(50);
+            }
+            return cond();
+        }
 
         private static void True(bool cond, string what) {
             if (!cond) throw new Exception("assertion failed: " + what);

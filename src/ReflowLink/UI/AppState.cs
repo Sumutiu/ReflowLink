@@ -47,8 +47,11 @@ namespace ReflowLink.UI {
             Settings = settings;
             Ir = new ControllerChannel("Top IR", "IR", device, false);
             BedChannel = new ControllerChannel("Bed Heat", "Bed", bed, true);
-            Sync = new SyncCoordinator(device, bed) { Enabled = settings.Bed.Enabled };
+            // The bed switch handles each poll before the coordinator, so Wait for Bed sees the bed values of the same poll.
+            BedSwitch = new BedSwitchController(device, settings) { KnownPattern = slot => slot is >= 0 and <= 9 ? SlotProfiles[slot] : null };
+            Sync = new SyncCoordinator(device, bed);
             _blockedSlots = [.. settings.BlockedPatterns];
+            ApplyBedMode();
         }
 
         public AppSettings Settings { get; }
@@ -56,13 +59,39 @@ namespace ReflowLink.UI {
         public ControllerChannel BedChannel { get; }
         /// <summary>The top IR controller.</summary>
         public DeviceService Device => Ir.Device;
-        /// <summary>The bed heat controller (only used when bed heat control is switched on).</summary>
+        /// <summary>The second (bed heat) PC410, only used with <see cref="BedMode.SecondPc410"/>.</summary>
         public DeviceService Bed => BedChannel.Device;
         public SyncCoordinator Sync { get; }
+        /// <summary>Single PC410 bed control (IN2 + OUT2), only active with <see cref="BedMode.SinglePc410"/>.</summary>
+        public BedSwitchController BedSwitch { get; }
         public Form Owner { get; set; }
 
-        /// <summary>"Use Bed Heat Control" is switched on in Settings.</summary>
-        public bool BedEnabled => Settings.Bed.Enabled;
+        /// <summary>Bed heat hardware chosen in Settings.</summary>
+        public BedMode BedMode => Settings.Bed.Mode;
+
+        /// <summary>A bed heater is controlled: bed targets, Wait for Bed, bed readings on the Dashboard.</summary>
+        public bool BedEnabled => BedMode != BedMode.None;
+
+        /// <summary>A second PC410 controls the bed: patterns are written to, read from and started on both controllers.</summary>
+        public bool DualBed => BedMode == BedMode.SecondPc410;
+
+        /// <summary>The top PC410 reads the bed on IN2 and ReflowLink switches it through OUT2.</summary>
+        public bool SingleBed => BedMode == BedMode.SinglePc410;
+
+        /// <summary>"IN2 (Top IR)" is shown as an informative reading (with a single PC410, IN2 is the bed temperature instead).</summary>
+        public bool IrIn2Shown => !SingleBed && Settings.ReadIn2;
+
+        /// <summary>"IN2 (Bed Heat)" is shown: the second PC410's second input, information only.</summary>
+        public bool BedIn2Shown => DualBed && Settings.Bed.ReadIn2;
+
+        /// <summary>Switches an informative IN2 reading on or off (the Top IR one, or the second PC410's).</summary>
+        public void SetIn2Reading(bool bed, bool on) {
+            if (bed) Settings.Bed.ReadIn2 = on;
+            else Settings.ReadIn2 = on;
+            ApplyBedMode();
+            Settings.Save();
+            BedEnabledChanged?.Invoke();
+        }
 
         /// <summary>Profiles known to be stored in controller patterns 0..9 (read or written this session).</summary>
         public readonly ReflowProfile[] SlotProfiles = new ReflowProfile[10];
@@ -78,7 +107,7 @@ namespace ReflowLink.UI {
         public event Action<string> NavigateRequested;
         /// <summary>Raised after the station or its controller units change.</summary>
         public event Action StationChanged;
-        /// <summary>Raised after "Use Bed Heat Control" is switched on or off.</summary>
+        /// <summary>Raised after the bed heat hardware (<see cref="BedMode"/>) or an IN2 reading is switched.</summary>
         public event Action BedEnabledChanged;
 
         public bool Busy => _busy > 0;
@@ -86,12 +115,31 @@ namespace ReflowLink.UI {
         /// <summary>True while either controller's auto-tune runs.</summary>
         public bool AutoTuneRunning => Ir.AutoTuneRunning || BedChannel.AutoTuneRunning;
 
-        public void SetBedEnabled(bool on) {
-            if (Settings.Bed.Enabled == on) return;
-            Settings.Bed.Enabled = on;
-            Sync.Enabled = on;
+        /// <summary>
+        /// Changes the bed heat hardware. Leaving single PC410 control switches OUT2 off first, since nothing would
+        /// regulate the bed any more; if that can't be confirmed nothing changes and false is returned, unless
+        /// <paramref name="force"/> is set.
+        /// </summary>
+        public bool SetBedMode(BedMode mode, bool force = false) {
+            if (Settings.Bed.Mode == mode) return true;
+            if (SingleBed && Device.IsConnected && !BedSwitch.SwitchOffNow() && !force) return false;
+            Settings.Bed.Mode = mode;
+            Settings.Bed.Enabled = mode == BedMode.SecondPc410;
+            ApplyBedMode();
             Settings.Save();
             BedEnabledChanged?.Invoke();
+            return true;
+        }
+
+        /// <summary>Tells the controllers and services what to read and do for the current bed and IN2 settings.</summary>
+        internal void ApplyBedMode() {
+            bool single = SingleBed;
+            Sync.Enabled = BedEnabled;
+            Sync.VirtualBed = single ? BedSwitch.VirtualBed : null;
+            BedSwitch.Enabled = single;
+            Device.ReadIn2 = single || Settings.ReadIn2;
+            Device.ReadAlarm2 = single;
+            Bed.ReadIn2 = DualBed && Settings.Bed.ReadIn2;
         }
 
         public void SetSlotProfile(int slot, ReflowProfile p) {
@@ -164,8 +212,8 @@ namespace ReflowLink.UI {
             return false;
         }
 
-        /// <summary>Both controllers needed by a pattern operation are connected (the bed only when it's used).</summary>
-        public bool EnsurePairConnected() => EnsureConnected(Ir) && (!BedEnabled || EnsureConnected(BedChannel));
+        /// <summary>Both controllers needed by a pattern operation are connected (the bed only when it's a second PC410).</summary>
+        public bool EnsurePairConnected() => EnsureConnected(Ir) && (!DualBed || EnsureConnected(BedChannel));
 
         /// <summary>Runs an exclusive operation on the top IR controller with busy state, progress and error reporting.</summary>
         public Task<(bool ok, T result)> RunAsync<T>(string label, Func<Pc410Device, IProgress<OperationProgress>, CancellationToken, T> op) =>
@@ -179,22 +227,22 @@ namespace ReflowLink.UI {
             RunOnAsync(channel, label, (d, p, ct) => { op(d); return true; });
 
         /// <summary>
-        /// Runs an operation on both controllers at once (both locked, IR first). The bed device is null when bed heat
-        /// control is off.
+        /// Runs an operation on both controllers at once (both locked, IR first). The bed device is null unless a second
+        /// PC410 controls the bed.
         /// </summary>
         public Task<(bool ok, T result)> RunPairAsync<T>(string label, Func<Pc410Device, Pc410Device, IProgress<OperationProgress>, CancellationToken, T> op) =>
             RunCoreAsync(label, EnsurePairConnected, progress =>
-                DeviceService.RunBothAsync(Device, BedEnabled ? Bed : null, (ir, bed) => op(ir, bed, progress, CancellationToken.None)));
+                DeviceService.RunBothAsync(Device, DualBed ? Bed : null, (ir, bed) => op(ir, bed, progress, CancellationToken.None)));
 
         /// <summary>
         /// Stops the program on every connected controller. Unlike <see cref="RunPairAsync{T}"/> it doesn't need both to
         /// be connected, so Stop still works when one of them is offline.
         /// </summary>
         public Task<(bool ok, bool result)> StopAllAsync() =>
-            RunCoreAsync("Stopping the program", () => Device.IsConnected || (BedEnabled && Bed.IsConnected) || EnsureConnected(Ir), async progress => {
+            RunCoreAsync("Stopping the program", () => Device.IsConnected || (DualBed && Bed.IsConnected) || EnsureConnected(Ir), async progress => {
                 var errors = new List<string>();
                 foreach (var ch in new[] { Ir, BedChannel }) {
-                    if (!ch.Device.IsConnected || (ch.IsBed && !BedEnabled)) continue;
+                    if (!ch.Device.IsConnected || (ch.IsBed && !DualBed)) continue;
                     try { await ch.Device.RunAsync(d => d.Stop()); } catch (Exception ex) { errors.Add($"{ch.Name}: {DeviceService.Describe(ex)}"); }
                 }
                 if (errors.Count > 0) throw new Pc410Exception("Couldn't stop every controller. " + string.Join(" ", errors));

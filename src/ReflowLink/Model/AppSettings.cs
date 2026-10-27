@@ -50,11 +50,19 @@ namespace ReflowLink.Model {
         public bool RtsEnable { get; set; } = true;
         public bool UseSimulator { get; set; } = false;
         public double SimulatorSpeed { get; set; } = 1;
+        /// <summary>
+        /// Show the Top IR controller's second input (IN2, P2) as "IN2 (Top IR)": information only. Always read with a
+        /// single PC410, where IN2 is the bed temperature.
+        /// </summary>
+        public bool ReadIn2 { get; set; }
 
-        /// <summary>Second PC410 that controls the bottom (bed) heater.</summary>
+        /// <summary>Bottom (bed) heater: off, the top PC410's IN2 + OUT2, or a second PC410.</summary>
         public BedSettings Bed { get; set; } = new();
 
-        /// <summary>Wait for Bed / Wait for IR choices per pattern; the controllers can't store them, so ReflowLink does.</summary>
+        /// <summary>
+        /// Wait for Bed / Wait for IR choices (and, for a single PC410, the bed targets) per pattern; the controllers can't
+        /// store them, so ReflowLink does.
+        /// </summary>
         public List<PatternSync> PatternSyncs { get; set; } = [];
 
         // Profiles
@@ -107,10 +115,11 @@ namespace ReflowLink.Model {
 
         public PatternSync SyncFor(int pattern) => PatternSyncs?.FirstOrDefault(p => p.Pattern == pattern);
 
-        /// <summary>Remembers the Wait for Bed / Wait for IR choices written to a pattern.</summary>
-        public void SetSync(int pattern, ReflowProfile profile) {
+        /// <summary>Remembers the Wait for Bed / Wait for IR choices (and targets) written to a pattern.</summary>
+        /// <param name="withBedTargets">Save the bed targets too; false when no bed heater is used (they'd just be the IR targets).</param>
+        public void SetSync(int pattern, ReflowProfile profile, bool withBedTargets = true) {
             PatternSyncs.RemoveAll(p => p.Pattern == pattern);
-            if (profile != null) PatternSyncs.Add(PatternSync.From(pattern, profile));
+            if (profile != null) PatternSyncs.Add(PatternSync.From(pattern, profile, withBedTargets));
         }
 
         /// <summary>Selects a station and applies its temperature limit.</summary>
@@ -231,10 +240,52 @@ namespace ReflowLink.Model {
         public double SimulatorLimit { get; set; } = StationModel.DefaultMaxTemperature;
     }
 
-    /// <summary>Settings of the optional second PC410 that controls the bottom (bed) heater.</summary>
+    /// <summary>How the bottom (bed) heater is wired.</summary>
+    public enum BedMode {
+        /// <summary>Top IR only.</summary>
+        None,
+        /// <summary>
+        /// The top PC410 reads the bed thermocouple on IN2 (P2) and gates the bed controller's output through its OUT2
+        /// relay, switched by rewriting alarm 2 (A2). ReflowLink regulates the bed.
+        /// </summary>
+        SinglePc410,
+        /// <summary>A second PC410 with its own serial port controls the bed.</summary>
+        SecondPc410,
+    }
+
+    /// <summary>Regulation used in <see cref="BedMode.SinglePc410"/>: ReflowLink switches OUT2 on and off.</summary>
+    public sealed class BedSwitchSettings {
+        /// <summary>Full power when the bed is this far below its setpoint (°C).</summary>
+        public double ProportionalBand { get; set; } = 15;
+        /// <summary>Integral time (s); 0 switches the integral off.</summary>
+        public double IntegralSeconds { get; set; } = 240;
+        /// <summary>Length of one on/off cycle (s).</summary>
+        public double CycleSeconds { get; set; } = 10;
+        /// <summary>A2 writes made over the lifetime of these settings (each one switches OUT2).</summary>
+        public long TotalWrites { get; set; }
+
+        internal BedSwitchSettings Sanitize() {
+            ProportionalBand = Math.Max(1, Math.Min(200, ProportionalBand));
+            IntegralSeconds = Math.Max(0, Math.Min(3600, IntegralSeconds));
+            CycleSeconds = Math.Max(4, Math.Min(120, CycleSeconds));
+            TotalWrites = Math.Max(0, TotalWrites);
+            return this;
+        }
+    }
+
+    /// <summary>Settings of the bottom (bed) heater: a second PC410, or the top PC410's IN2 and OUT2.</summary>
     public sealed class BedSettings : IConnectionSettings {
-        /// <summary>"Use Bed Heat Control" in Settings.</summary>
+        /// <summary>Bed heat hardware chosen in Settings.</summary>
+        public BedMode Mode { get; set; }
+
+        /// <summary>
+        /// "Use Bed Heat Control" of version 2.0.0, which only knew the second PC410. Kept in step with <see cref="Mode"/>
+        /// so the file still reads correctly in that version.
+        /// </summary>
         public bool Enabled { get; set; }
+
+        /// <summary>Regulation for <see cref="BedMode.SinglePc410"/>.</summary>
+        public BedSwitchSettings Switching { get; set; } = new();
         public string PortName { get; set; } = "";
         public int BaudRate { get; set; } = 9600;
         public int Address { get; set; } = 1;
@@ -253,6 +304,8 @@ namespace ReflowLink.Model {
         public UnusedStepMode UnusedSteps { get; set; } = UnusedStepMode.Zeros;
         /// <summary>Read the bed pattern back after writing and compare it.</summary>
         public bool VerifyAfterWrite { get; set; } = true;
+        /// <summary>Show the second PC410's second input (IN2, P2) as "IN2 (Bed Heat)": information only.</summary>
+        public bool ReadIn2 { get; set; }
 
         [XmlIgnore]
         public ControllerUnits Units => new(RampUnit, DwellUnit);
@@ -273,6 +326,11 @@ namespace ReflowLink.Model {
         };
 
         internal BedSettings Sanitize() {
+            // Files from 2.0.0 have no Mode: "Use Bed Heat Control" meant the second PC410.
+            if (Mode == BedMode.None && Enabled) Mode = BedMode.SecondPc410;
+            if (!Enum.IsDefined(typeof(BedMode), Mode)) Mode = BedMode.None;
+            Enabled = Mode == BedMode.SecondPc410;
+            Switching = (Switching ?? new BedSwitchSettings()).Sanitize();
             if (Address is < 0 or > 99) Address = 1;
             if (BaudRate <= 0) BaudRate = 9600;
             ResponseTimeoutMs = Math.Max(100, Math.Min(5000, ResponseTimeoutMs));
@@ -285,7 +343,7 @@ namespace ReflowLink.Model {
         }
     }
 
-    /// <summary>Wait for Bed / Wait for IR choices and holdbacks last written to a pattern.</summary>
+    /// <summary>Wait for Bed / Wait for IR choices, holdbacks and targets last written to a pattern.</summary>
     public sealed class PatternSync {
         [XmlAttribute("pattern")] public int Pattern { get; set; }
         /// <summary>Bit n set: step n + 1 has Wait for Bed.</summary>
@@ -295,19 +353,56 @@ namespace ReflowLink.Model {
         [XmlAttribute("steps")] public int Steps { get; set; }
         [XmlAttribute("irHoldback")] public double IrHoldback { get; set; } = ReflowProfile.HoldbackDefault;
         [XmlAttribute("bedHoldback")] public double BedHoldback { get; set; } = ReflowProfile.HoldbackDefault;
+        /// <summary>IR targets of the steps ("120;160;205"), to tell whether the pattern still holds the profile.</summary>
+        [XmlAttribute("irTargets")] public string IrTargetList { get; set; } = "";
+        /// <summary>Bed targets of the steps. With a single PC410 no controller stores them, so ReflowLink does.</summary>
+        [XmlAttribute("bedTargets")] public string BedTargetList { get; set; } = "";
 
         /// <summary>True when any step waits for the other heater.</summary>
         public bool Any => (WaitForBedMask | WaitForIrMask) != 0;
 
+        [XmlIgnore]
+        public IReadOnlyList<double> IrTargets => ParseList(IrTargetList);
+
+        [XmlIgnore]
+        public IReadOnlyList<double> BedTargets => ParseList(BedTargetList);
+
+        /// <summary>A bed target and an IR target were saved for every step (written by version 2.1 or later).</summary>
+        public bool HasTargets => Steps > 0 && IrTargets.Count == Steps && BedTargets.Count == Steps;
+
+        /// <summary>True when <paramref name="p"/> (read from the controller) has the steps and IR targets saved here.</summary>
+        public bool Matches(ReflowProfile p) {
+            if (p == null || !HasTargets || p.Steps.Count != Steps) return false;
+            var ir = IrTargets;
+            for (int i = 0; i < Steps; i++)
+                if (Math.Abs(p.Steps[i].Target - ir[i]) > 0.15) return false;
+            return true;
+        }
+
+        private static List<double> ParseList(string s) {
+            var list = new List<double>();
+            if (string.IsNullOrWhiteSpace(s)) return list;
+            foreach (var part in s.Split(';')) {
+                if (!double.TryParse(part, NumberStyles.Float, CultureInfo.InvariantCulture, out double v) || double.IsNaN(v) || double.IsInfinity(v)) return [];
+                list.Add(v);
+            }
+            return list;
+        }
+
+        private static string JoinList(IEnumerable<double> values) =>
+            string.Join(";", values.Select(v => Math.Round(v, 2).ToString("0.##", CultureInfo.InvariantCulture)));
+
         public bool WaitForBed(int step) => step is >= 1 and <= 30 && (WaitForBedMask & (1 << (step - 1))) != 0;
         public bool WaitForIr(int step) => step is >= 1 and <= 30 && (WaitForIrMask & (1 << (step - 1))) != 0;
 
-        public static PatternSync From(int pattern, ReflowProfile p) {
+        public static PatternSync From(int pattern, ReflowProfile p, bool withBedTargets = true) {
             var s = new PatternSync {
                 Pattern = pattern,
                 Steps = p.Steps.Count,
                 IrHoldback = p.Holdback ?? ReflowProfile.HoldbackDefault,
                 BedHoldback = p.BedHoldback ?? ReflowProfile.HoldbackDefault,
+                IrTargetList = JoinList(p.Steps.Select(st => st.Target)),
+                BedTargetList = withBedTargets ? JoinList(p.Steps.Select(st => st.BedTarget)) : "",
             };
             for (int i = 0; i < p.Steps.Count; i++) {
                 if (p.Steps[i].WaitForBed) s.WaitForBedMask |= 1 << i;
@@ -320,12 +415,20 @@ namespace ReflowLink.Model {
         /// Copies the saved choices onto a profile read back from the controllers. Nothing is copied when the pattern no
         /// longer has the same number of steps (it was changed elsewhere). Returns whether the choices were applied.
         /// </summary>
-        public bool ApplyTo(ReflowProfile p) {
+        /// <param name="includeBed">
+        /// Also copy the bed targets and bed holdback (single PC410, where no controller stores them). They are only copied
+        /// when the IR targets still match, so they can't be paired with a pattern changed elsewhere.
+        /// </param>
+        public bool ApplyTo(ReflowProfile p, bool includeBed = false) {
             if (p.Steps.Count != Steps) return false;
+            if (includeBed && !Matches(p)) return false;
+            var bed = BedTargets;
             for (int i = 0; i < p.Steps.Count; i++) {
                 p.Steps[i].WaitForBed = WaitForBed(i + 1);
                 p.Steps[i].WaitForIr = WaitForIr(i + 1);
+                if (includeBed) p.Steps[i].BedTarget = bed[i];
             }
+            if (includeBed) p.BedHoldback = BedHoldback;
             return true;
         }
     }
@@ -334,18 +437,27 @@ namespace ReflowLink.Model {
     public sealed class CsvRecorder : IDisposable {
         private readonly StreamWriter _w;
         private readonly DateTime _start;
-        private readonly bool _withBed;
+        private readonly bool _withBed, _withOut2, _withIrIn2, _withBedIn2;
 
         /// <param name="withBed">Adds the bed heat controller's columns.</param>
-        public CsvRecorder(string folder, string label, bool withBed = false) {
+        /// <param name="withOut2">Adds whether OUT2 was switched on (single PC410 bed control).</param>
+        /// <param name="withIrIn2">Adds the Top IR controller's IN2 reading (information only).</param>
+        /// <param name="withBedIn2">Adds the second PC410's IN2 reading (information only).</param>
+        public CsvRecorder(string folder, string label, bool withBed = false, bool withOut2 = false, bool withIrIn2 = false, bool withBedIn2 = false) {
             Directory.CreateDirectory(folder);
             _start = DateTime.Now;
             _withBed = withBed;
+            _withOut2 = withBed && withOut2;
+            _withIrIn2 = withIrIn2;
+            _withBedIn2 = withBedIn2;
             string safe = string.IsNullOrWhiteSpace(label) ? "session" : MakeSafe(label);
             FilePath = Path.Combine(folder, $"{_start:yyyy-MM-dd_HHmmss}_{safe}.csv");
             _w = new StreamWriter(FilePath, false, new UTF8Encoding(true));
             _w.WriteLine("timestamp,elapsed_s,pv_c,sp_c,output_pct,state,segment"
-                + (withBed ? ",bed_pv_c,bed_sp_c,bed_output_pct,bed_state,bed_segment,waiting" : ""));
+                + (withBed ? ",bed_pv_c,bed_sp_c,bed_output_pct,bed_state,bed_segment,waiting" : "")
+                + (_withOut2 ? ",bed_out2" : "")
+                + (_withIrIn2 ? ",in2_top_ir_c" : "")
+                + (_withBedIn2 ? ",in2_bed_heat_c" : ""));
             _w.Flush();
         }
 
@@ -353,7 +465,8 @@ namespace ReflowLink.Model {
         public int Rows { get; private set; }
 
         /// <summary>Writes one row: the IR reading, and the latest bed reading when bed columns are recorded.</summary>
-        public void Write(Telemetry t, Telemetry bed = null, string waiting = "") {
+        /// <param name="out2">OUT2 state for the bed_out2 column: true = on, false = off, null = unknown.</param>
+        public void Write(Telemetry t, Telemetry bed = null, string waiting = "", bool? out2 = null) {
             var c = CultureInfo.InvariantCulture;
             var line = new StringBuilder(string.Join(",",
                 t.Time.ToString("yyyy-MM-dd HH:mm:ss.fff", c),
@@ -372,6 +485,9 @@ namespace ReflowLink.Model {
                     bed?.Segment?.ToString(c) ?? "",
                     waiting ?? ""));
             }
+            if (_withOut2) line.Append(',').Append(out2 is bool on ? (on ? "1" : "0") : "");
+            if (_withIrIn2) line.Append(',').Append(t.Pv2?.ToString("0.0", c) ?? "");
+            if (_withBedIn2) line.Append(',').Append(bed?.Pv2?.ToString("0.0", c) ?? "");
             _w.WriteLine(line.ToString());
             Rows++;
             if (Rows % 10 == 0) _w.Flush();

@@ -28,6 +28,10 @@ namespace ReflowLink.Protocol {
         public int? StatusWord;
         public int? Pattern;
         public ProgramState State;
+        /// <summary>Second input IN2 (P2): the bed thermocouple with a single PC410, or an informative reading. Only read when asked for.</summary>
+        public double? Pv2;
+        /// <summary>Alarm 2 value (A2), which switches OUT2 with a single PC410. Read every other poll when asked for.</summary>
+        public double? Alarm2;
     }
 
     public struct OperationProgress(int done, int total, string text) {
@@ -85,10 +89,20 @@ namespace ReflowLink.Protocol {
 
         public const int OsStop = 0x0000, OsRun = 0x0002, OsHold = 0x0003;
 
+        // Single PC410 bed control: the bed thermocouple is read on IN2 as P2, and OUT2
+        // (configured 0P2 = AL02, AL02 = HIAL) is switched by writing alarm 2: "001" makes the high alarm active, so OUT2
+        // closes and the bed controller may heat; "500" clears it, so OUT2 opens.
+        public const string BedInput = "P2", BedAlarm = "A2";
+        public const string BedOnValue = "001", BedOffValue = "500";
+        /// <summary>An A2 value below this means OUT2 may be on (anything under 500 counts as not switched off).</summary>
+        public const double BedOffThreshold = 500;
+
         private bool _seSupported = true, _swSupported = true;
         // null = not tried yet, false = the controller doesn't report it, true = it answered before.
         private bool? _hsSupported, _lsSupported, _xsSupported;
         private int _seMisses, _swMisses;
+        private bool _p2Supported = true, _a2Supported = true;
+        private int _p2Misses, _a2Misses;
         private const int UnsupportedAfter = 3;
         private int _cycle;
 
@@ -116,7 +130,10 @@ namespace ReflowLink.Protocol {
         /// <summary>Quick check used when connecting: reads PV once.</summary>
         public double Probe() => Client.ReadNumber(Pv);
 
-        public Telemetry ReadTelemetry(bool includePattern = false) {
+        /// <param name="includePattern">Also read the selected pattern (ch).</param>
+        /// <param name="in2">Also read the second input IN2 (P2) every poll.</param>
+        /// <param name="alarm2">Also read alarm 2 (A2) every other poll, for single PC410 bed control.</param>
+        public Telemetry ReadTelemetry(bool includePattern = false, bool in2 = false, bool alarm2 = false) {
             lock (Client.SyncRoot) {
                 var t = new Telemetry {
                     Time = DateTime.Now,
@@ -124,6 +141,10 @@ namespace ReflowLink.Protocol {
                     Sp = TryNumber(Sp),
                     Op = TryNumber(Op)
                 };
+                // A controller that doesn't answer them would cost a timeout every poll: after repeated misses they're only
+                // tried every 20th poll (a single PC410's bed is kept off meanwhile, since its temperature is unknown).
+                if (in2 && (_p2Supported || _cycle % 20 == 0)) t.Pv2 = TryOptional(BedInput, ref _p2Supported, ref _p2Misses);
+                if (alarm2 && _cycle % 2 == 0 && (_a2Supported || _cycle % 20 == 0)) t.Alarm2 = TryOptional(BedAlarm, ref _a2Supported, ref _a2Misses);
                 try { t.Os = Client.ReadHexWord(Os); t.State = DecodeOs(t.Os.Value); } catch (Pc410Exception) { t.State = ProgramState.Unknown; }
 
                 // Optional parameters: give up on them only after repeated failures
@@ -146,9 +167,31 @@ namespace ReflowLink.Protocol {
             try { return Client.ReadNumber(m); } catch (Pc410Exception) { return null; }
         }
 
+        // Unlike SE and SW, one refusal doesn't give up on P2 / A2: they matter for the bed, so it takes repeated misses.
+        private double? TryOptional(string m, ref bool supported, ref int misses) {
+            try {
+                double v = Client.ReadNumber(m);
+                supported = true;
+                misses = 0;
+                return v;
+            } catch (Pc410Exception) {
+                if (++misses >= UnsupportedAfter) supported = false;
+            }
+            return null;
+        }
+
         public ProgramState ReadState() {
             return DecodeOs(Client.ReadHexWord(Os));
         }
+
+        /// <summary>
+        /// Switches OUT2 (single PC410 bed control) by writing alarm 2:
+        /// A2 = 001 (on) or A2 = 500 (off).
+        /// </summary>
+        public void SetBedSwitch(bool on) => Client.Write(BedAlarm, on ? BedOnValue : BedOffValue);
+
+        /// <summary>Reads alarm 2; below <see cref="BedOffThreshold"/> means OUT2 may be on.</summary>
+        public double ReadBedAlarm() => Client.ReadNumber(BedAlarm);
 
         public int ReadPattern() {
             return (int)Math.Round(Client.ReadNumber(Pattern));

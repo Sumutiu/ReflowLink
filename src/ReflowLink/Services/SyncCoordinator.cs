@@ -31,6 +31,8 @@ namespace ReflowLink.Services {
     /// </list>
     /// So a toggle goes on the step where the heaters drift apart (for example the step where the bed has the longer
     /// ramp). A program held by the user is never resumed automatically.
+    /// <para>With a single PC410 (<see cref="VirtualBed"/>) only Wait for Bed applies: the IR is held while the bed,
+    /// regulated by ReflowLink, lags its setpoint.</para>
     /// </summary>
     public sealed class SyncCoordinator {
         private sealed class Side(DeviceService device) {
@@ -60,6 +62,13 @@ namespace ReflowLink.Services {
 
         /// <summary>Wait for Bed / Wait for IR choices of the running pattern; null when there are none.</summary>
         public PatternSync Sync { get; set; }
+
+        /// <summary>
+        /// Single PC410: the bed's temperature and setpoint come from here instead of a second controller, and the bed is in
+        /// the same step as the IR. Only Wait for Bed applies (the bed has no program that could be held). Null with a
+        /// second PC410.
+        /// </summary>
+        public Func<(double? Pv, double? Sp)?> VirtualBed { get; set; }
 
         /// <summary>
         /// The user held or is stopping the program: leave both controllers alone until it's cleared. Setting it also
@@ -149,9 +158,13 @@ namespace ReflowLink.Services {
         private void Evaluate() {
             if (_latched) return;
             var ir = _ir.Device.Last;
-            var bed = _bed.Device.Last;
-            bool linked = Enabled && _ir.Device.State == LinkStatus.Connected && _bed.Device.State == LinkStatus.Connected && ir != null && bed != null;
-            if (linked) _wasPairRun = (bed.State is ProgramState.Running or ProgramState.Hold) && (ir.State is ProgramState.Running or ProgramState.Hold);
+            var virtualBed = VirtualBed;
+            bool single = virtualBed != null;
+            var bed = single ? null : _bed.Device.Last;
+            var virt = single ? virtualBed() : null;
+            bool linked = Enabled && _ir.Device.State == LinkStatus.Connected && ir != null
+                && (single ? virt.HasValue : _bed.Device.State == LinkStatus.Connected && bed != null);
+            if (linked) _wasPairRun = (ir.State is ProgramState.Running or ProgramState.Hold) && (single || bed.State is ProgramState.Running or ProgramState.Hold);
             if (!linked || _userHold || Sync == null) {
                 StepUnknown = false;
                 // Bed heat switched off, a controller disconnected on purpose, or no waits: let anything we held carry on.
@@ -161,14 +174,17 @@ namespace ReflowLink.Services {
             }
 
             int steps = Sync.Steps;
-            if ((ir.Segment ?? 0) > steps || (bed.Segment ?? 0) > steps) PairedSegments = true;
+            if ((ir.Segment ?? 0) > steps || (!single && (bed.Segment ?? 0) > steps)) PairedSegments = true;
             var irSide = new SyncSide(ir.State, ir.Pv, ir.Sp, StepOf(ir.Segment, steps, PairedSegments));
-            var bedSide = new SyncSide(bed.State, bed.Pv, bed.Sp, StepOf(bed.Segment, steps, PairedSegments));
+            // A single PC410's bed is always in the IR's step and "runs" exactly when the IR program does.
+            var bedSide = single
+                ? new SyncSide(ir.State, virt.Value.Pv, virt.Value.Sp, irSide.Step)
+                : new SyncSide(bed.State, bed.Pv, bed.Sp, StepOf(bed.Segment, steps, PairedSegments));
             StepUnknown = Sync.Any && irSide.Active && bedSide.Active && (irSide.Step == null || bedSide.Step == null);
 
             var (holdIr, holdBed) = Decide(Sync, irSide, bedSide);
             Apply(_ir, holdIr, ir.State);
-            Apply(_bed, holdBed, bed.State);
+            if (!single) Apply(_bed, holdBed, bed.State);
         }
 
         private void ReleaseAll() {

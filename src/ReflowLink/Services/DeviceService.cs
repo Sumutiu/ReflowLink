@@ -46,6 +46,15 @@ namespace ReflowLink.Services {
         public SetpointLimits ControllerLimits { get; private set; }
         public string LastError { get; private set; } = "";
         public int PollIntervalMs { get; set; } = 500;
+
+        private volatile bool _readIn2, _readAlarm2;
+
+        /// <summary>Also poll the second input IN2 (P2): the bed with a single PC410, or an informative reading.</summary>
+        public bool ReadIn2 { get => _readIn2; set => _readIn2 = value; }
+
+        /// <summary>Also poll alarm 2 (A2), which switches OUT2 with a single PC410.</summary>
+        public bool ReadAlarm2 { get => _readAlarm2; set => _readAlarm2 = value; }
+
         /// <summary>Process-time multiplier: the simulator can run faster than real time.</summary>
         public double TimeScale { get; private set; } = 1;
 
@@ -130,7 +139,7 @@ namespace ReflowLink.Services {
             if (ex is Pc410TimeoutException)
                 return "The controller did not answer. Check the cable, COM port, baud rate (the PC410 uses 7E1) and the device address.";
             if (ex is UnauthorizedAccessException)
-                return "The serial port is in use by another program (close PSoft or any terminal using it).";
+                return "The serial port is in use by another program (close any other station software or terminal using it).";
             if (ex is IOException) return "Serial port error: " + ex.Message;
             return ex.Message;
         }
@@ -228,7 +237,7 @@ namespace ReflowLink.Services {
                     Telemetry t;
                     using (Pc410Client.PollScope()) {
                         bool wantPattern = cycle % 10 == 0;
-                        t = dev.ReadTelemetry(wantPattern);
+                        t = dev.ReadTelemetry(wantPattern, _readIn2, _readAlarm2);
                         if (!wantPattern && t.State == ProgramState.Running && _lastState != ProgramState.Running && _lastState != ProgramState.Hold) {
                             try { t.Pattern = dev.ReadPattern(); } catch (Pc410Exception) { }
                         }
