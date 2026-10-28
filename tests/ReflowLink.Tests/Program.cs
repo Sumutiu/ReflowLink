@@ -15,6 +15,7 @@ namespace ReflowLink.Tests {
         private static int _pass, _fail;
 
         private static int Main() {
+            AppLog.Disabled = true; // keep the tests out of the real event log
             Run("Address encoding doubles each digit", () => {
                 Eq("5533", Ascii(Pc410Protocol.EncodeAddress(53)));
                 Eq("0011", Ascii(Pc410Protocol.EncodeAddress(1)));
@@ -714,7 +715,7 @@ namespace ReflowLink.Tests {
                     ctl.Enabled = true;
                     True(WaitFor(() => ctl.Reason == "From the next run", 5000), "reason: " + ctl.Reason);
                     False(sim.Out2, "still off");
-                    True(ctl.SwitchOffNow(), "switch-off confirmed by reading A2 back");
+                    True(ctl.SwitchOffAsync().Result, "switch-off confirmed by reading A2 back");
                     False(sim.Out2, "off");
                     device.RunAsync(d => d.Stop()).Wait();
                 } finally {
@@ -752,6 +753,334 @@ namespace ReflowLink.Tests {
                     True(lines[1].EndsWith(",98.3") || lines[1].EndsWith(",98.2"), "row: " + lines[1]);
                     File.Delete(path);
                 }
+            });
+
+            Run("A failing serial port is a controller error, without retries", () => {
+                var port = new BrokenTransport();
+                using var c = new Pc410Client(port, 1) { ResponseTimeoutMs = 60, Retries = 3 };
+                var ex = Catch<Pc410PortException>(() => c.Read("PV"));
+                True(ex is Pc410Exception, "handled like any controller error");
+                Eq(1, port.Writes);
+                Throws<Pc410PortException>(() => c.Write("SP", "100"));
+                // Stop on both controllers still reports the failure instead of escaping as an IOException.
+                var dev = new Pc410Device(c);
+                Throws<Pc410Exception>(() => PatternPair.Stop(dev, null));
+            });
+
+            Run("Stop cancels a profile write and blocks the half-written pattern", () => {
+                using var c = NewSim(out _);
+                var dev = new Pc410Device(c);
+                var p = new ReflowProfile();
+                p.Steps.Add(new ProfileStep(1, 150, 10));
+                p.Steps.Add(new ProfileStep(1, 200, 10));
+                using var cts = new CancellationTokenSource();
+                var progress = new SyncProgress(op => { if (op.Text.StartsWith("Writing step 2")) cts.Cancel(); });
+                var ex = Catch<ProfileRejectedException>(() => dev.UploadProfile(p, 5, UnusedStepMode.Zeros, true, progress, cts.Token));
+                True(ex.Interrupted && ex.PatternChanged && ex.PatternCleared, "cancelled, cleared and to be blocked");
+                True(ex.Issues[0].Contains("cancelled"), ex.Issues[0]);
+                Eq(0, dev.DownloadProfile(5, null, CancellationToken.None).Steps.Count);
+            });
+
+            Run("Stop never waits behind another operation and cancels it", () => {
+                var s = new AppSettings();
+                var ir = new DeviceService();
+                var bed = new DeviceService();
+                try {
+                    ir.ConnectAsync(new ConnectionOptions { UseSimulator = true, PollIntervalMs = 200 }).Wait();
+                    var st = new ReflowLink.UI.AppState(s, ir, bed);
+                    ir.RunAsync(d => d.Start(0)).Wait();
+                    var slow = st.RunOnAsync(st.Ir, "Slow read", (d, p, ct) => {
+                        for (int i = 0; i < 400; i++) {
+                            ct.ThrowIfCancellationRequested();
+                            d.Client.Read("PV");
+                        }
+                        return true;
+                    });
+                    Thread.Sleep(150);
+                    True(st.Busy, "busy with the slow read");
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    True(st.StopAllAsync().Result, "stop sent while busy");
+                    True(sw.ElapsedMilliseconds < 2000, "no waiting for the slow read: " + sw.ElapsedMilliseconds + " ms");
+                    False(slow.Result.ok, "the slow read was cancelled");
+                    Eq(ProgramState.Idle, ir.RunAsync(d => d.ReadState()).Result);
+                    Eq(1, st.StopCount);
+                    False(st.Busy, "idle again");
+                } finally {
+                    ir.Dispose();
+                    bed.Dispose();
+                }
+            });
+
+            Run("The running pattern can be read; another one only when idle", () => {
+                using var c = NewSim(out _);
+                var dev = new Pc410Device(c);
+                dev.Start(0);
+                Eq(3, dev.DownloadProfile(0, null, CancellationToken.None).Steps.Count);
+                var ex = Catch<Pc410Exception>(() => dev.DownloadProfile(4, null, CancellationToken.None));
+                True(ex.Message.Contains("is running"), ex.Message);
+                Eq(ProgramState.Running, dev.ReadState());
+                dev.Stop();
+                dev.DownloadProfile(4, null, CancellationToken.None);
+                // Program state unknown: no pattern switch on a guess.
+                c.Transport.Dispose();
+                var sim2 = new SimulatedPc410(1);
+                sim2.Open();
+                using var c2 = new Pc410Client(sim2, 1) { ResponseTimeoutMs = 60, Retries = 0 };
+                var dev2 = new Pc410Device(c2);
+                sim2.MissingParameters.Add("OS");
+                ex = Catch<Pc410Exception>(() => dev2.DownloadProfile(4, null, CancellationToken.None));
+                True(ex.Message.Contains("didn't report"), ex.Message);
+            });
+
+            Run("A write cut short by closing or a crash blocks the pattern at the next start", () => {
+                string folder = Path.Combine(Path.GetTempPath(), "reflowlink_writing_test_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(folder);
+                try {
+                    string path = Path.Combine(folder, "settings.xml");
+                    new AppSettings { StationId = StationCatalog.DefaultId, WritingPattern = 4 }.SaveTo(path);
+                    var s = AppSettings.LoadFrom(path);
+                    Eq(4, s.InterruptedWrite);
+                    True(s.BlockedPatterns.Contains(4), "blocked");
+                    Eq(-1, s.WritingPattern);
+                    new AppSettings { StationId = StationCatalog.DefaultId }.SaveTo(path);
+                    Eq(null, AppSettings.LoadFrom(path).InterruptedWrite);
+                } finally {
+                    Directory.Delete(folder, true);
+                }
+            });
+
+            Run("The step (SE) comes back after the controller stopped reporting it", () => {
+                using var c = NewSim(out var sim);
+                var dev = new Pc410Device(c);
+                dev.Start(0);
+                sim.MissingParameters.Add("SE");
+                for (int i = 0; i < 4; i++) dev.ReadTelemetry();
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                False(dev.ReadTelemetry().Segment.HasValue, "not reported");
+                True(sw.ElapsedMilliseconds < 120, "and no longer asked for every poll");
+                sim.MissingParameters.Remove("SE");
+                bool back = false;
+                for (int i = 0; i < 25 && !back; i++) back = dev.ReadTelemetry().Segment.HasValue;
+                True(back, "SE read again");
+                True(dev.ReadTelemetry().Segment.HasValue, "and every poll after that");
+                dev.Stop();
+            });
+
+            Run("A dead link on the first HS read doesn't switch the limit check off", () => {
+                var sim = new SimulatedPc410(1);
+                var flaky = new FlakyTransport(sim);
+                flaky.Open();
+                using var c = new Pc410Client(flaky, 1) { ResponseTimeoutMs = 60, Retries = 0 };
+                var dev = new Pc410Device(c);
+                flaky.SilentAfterWrites = 0;
+                Throws<Pc410TimeoutException>(() => dev.ReadSetpointLimits());
+                flaky.SilentAfterWrites = int.MaxValue;
+                Eq(260.0, dev.ReadSetpointLimits().High);
+            });
+
+            Run("Settings are saved atomically and a damaged file falls back to the backup", () => {
+                string folder = Path.Combine(Path.GetTempPath(), "reflowlink_settings_test_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(folder);
+                try {
+                    string path = Path.Combine(folder, "settings.xml");
+                    var s = new AppSettings { StationId = StationCatalog.DefaultId, BlockedPatterns = [3] };
+                    s.SaveTo(path);
+                    s.BlockedPatterns = [3, 7];
+                    s.SaveTo(path);
+                    True(File.Exists(path + ".bak"), "previous file kept");
+                    Eq(2, AppSettings.LoadFrom(path).BlockedPatterns.Count);
+                    Eq(null, AppSettings.LoadFrom(path).LoadWarning);
+
+                    File.WriteAllText(path, "<AppSettings><Broken");
+                    var fromBackup = AppSettings.LoadFrom(path);
+                    True(fromBackup.LoadWarning != null, "the user is told");
+                    Eq(1, fromBackup.BlockedPatterns.Count); // the save before
+                    False(File.Exists(path), "the damaged file is set aside");
+                    True(Directory.GetFiles(folder, "settings.unreadable-*").Length == 1, "and kept for inspection");
+
+                    File.WriteAllText(path + ".bak", "not xml");
+                    File.WriteAllText(path, "not xml either");
+                    var defaults = AppSettings.LoadFrom(path);
+                    True(defaults.LoadWarning != null && defaults.LoadWarning.Contains("default"), "defaults, and the user is told");
+
+                    // A failing write leaves the old file untouched.
+                    File.WriteAllText(path, "keep me");
+                    Throws<InvalidOperationException>(() => SafeFile.Write(path, st => {
+                        st.WriteByte(1);
+                        throw new InvalidOperationException("disk full");
+                    }));
+                    Eq("keep me", File.ReadAllText(path));
+                    False(File.Exists(path + ".tmp"), "temporary file removed");
+                } finally {
+                    Directory.Delete(folder, true);
+                }
+            });
+
+            Run("CSV recordings: unique names, this PC's format, run details and overlay", () => {
+                string folder = Path.Combine(Path.GetTempPath(), "reflowlink_csv_test_" + Guid.NewGuid().ToString("N"));
+                var culture = Thread.CurrentThread.CurrentCulture;
+                try {
+                    var t0 = DateTime.Now;
+                    using var a = new CsvRecorder(folder, "run", withBed: true, metadata: ["Station: test", "Pattern: 2"]);
+                    using var b = new CsvRecorder(folder, "run", withBed: true);
+                    True(a.FilePath != b.FilePath, "two recordings never share a file");
+                    a.Write(new Telemetry { Time = t0, Pv = 25, State = ProgramState.Idle }, new Telemetry { Pv = 24 });
+                    a.Write(new Telemetry { Time = t0.AddSeconds(2), Pv = 30, State = ProgramState.Running }, new Telemetry { Pv = 26 });
+                    a.Write(new Telemetry { Time = t0.AddSeconds(4), Pv = 40.5, State = ProgramState.Running }, new Telemetry { Pv = 28 });
+                    a.Dispose();
+                    var lines = File.ReadAllLines(a.FilePath);
+                    Eq("# Station: test", lines[0]);
+                    True(lines[2].StartsWith("timestamp,"), lines[2]);
+                    var run = RecordedRun.Load(a.FilePath);
+                    Eq(3, run.Ir.Count);
+                    Eq(0.0, run.Ir[1].Time); // time 0 is where the program started
+                    Eq(40.5, run.Ir[2].Temp);
+                    Eq(28.0, run.Bed[2].Temp);
+
+                    Thread.CurrentThread.CurrentCulture = new System.Globalization.CultureInfo("de-DE");
+                    using var c = new CsvRecorder(folder, "local", localFormat: true);
+                    c.Write(new Telemetry { Time = t0, Pv = 98.25, State = ProgramState.Running });
+                    c.Dispose();
+                    var local = File.ReadAllLines(c.FilePath);
+                    True(local[0].StartsWith("timestamp;elapsed_s;"), local[0]);
+                    True(local[1].Contains(";98,3;") || local[1].Contains(";98,2;"), local[1]);
+                    Thread.CurrentThread.CurrentCulture = culture;
+                    Eq(98.25, RecordedRun.Load(c.FilePath).Ir[0].Temp, 0.06);
+                } finally {
+                    Thread.CurrentThread.CurrentCulture = culture;
+                    if (Directory.Exists(folder)) Directory.Delete(folder, true);
+                }
+            });
+
+            Run("Profile statistics: time above liquidus and steepest ramp", () => {
+                var p = new ReflowProfile();
+                p.Steps.Add(new ProfileStep(1, 200, 0));   // 25 → 200 in 175 s
+                p.Steps.Add(new ProfileStep(1, 230, 20));  // 200 → 230 in 30 s, hold 20 s
+                p.Steps.Add(new ProfileStep(4, 150, 0));   // 230 → 150 in 20 s
+                var curve = ProfileMath.BuildPlannedCurve(p, 25);
+                // Above 217: 13 s rising, 20 s hold, 3.25 s falling.
+                Eq(36.25, ProfileMath.TimeAbove(curve, 217), 0.01);
+                Eq(4.0, ProfileMath.SteepestRamp(p));
+                Eq(0.0, ProfileMath.TimeAbove(curve, 300));
+            });
+
+            Run("Profile files: too many steps and no steps are reported", () => {
+                string path = Path.Combine(Path.GetTempPath(), "reflowlink_steps_test.rlp");
+                try {
+                    var p = new ReflowProfile { Name = "Ten" };
+                    for (int i = 0; i < 10; i++) p.Steps.Add(new ProfileStep(1, 100 + i, 5));
+                    p.Save(path);
+                    var loaded = ReflowProfile.Load(path);
+                    Eq(8, loaded.Steps.Count);
+                    True(loaded.LoadNote != null && loaded.LoadNote.Contains("10 steps"), loaded.LoadNote ?? "no note");
+                    new ReflowProfile { Name = "Empty" }.Save(path);
+                    True(ReflowProfile.Load(path).LoadNote != null, "empty file noted");
+                    p.Steps.RemoveRange(2, 8);
+                    p.Save(path);
+                    Eq(null, ReflowProfile.Load(path).LoadNote);
+                } finally {
+                    File.Delete(path);
+                }
+            });
+
+            Run("Paired segments are remembered for the next run", () => {
+                var ir = new DeviceService();
+                var bed = new DeviceService();
+                var sync = new SyncCoordinator(ir, bed);
+                sync.Reset();
+                False(sync.PairedSegments, "unknown at first");
+                sync.PairedHint = true;
+                sync.Reset();
+                True(sync.PairedSegments, "learned earlier: assumed from the start");
+                sync.RunStarted();
+                True(sync.PairedSegments, "kept for a new run");
+                Eq(2, SyncCoordinator.StepOf(3, 5, sync.PairedSegments)); // segment 3 = ramp of step 2
+
+                var s = new AppSettings { StationId = StationCatalog.DefaultId };
+                var st = new ReflowLink.UI.AppState(s, ir, bed);
+                False(st.Sync.PairedHint, "nothing learned yet");
+                s.SegmentsPaired = true;
+                s.SelectStation(StationCatalog.GenericId);
+                False(s.SegmentsPaired, "forgotten when the station changes");
+            });
+
+            Run("Single PC410: switching the bed off before a disconnect keeps the run until it's confirmed", () => {
+                var settings = new AppSettings();
+                settings.Bed.Mode = BedMode.SinglePc410;
+                settings.Bed.Switching.CycleSeconds = 4;
+                var prof = new ReflowProfile();
+                prof.Steps.Add(new ProfileStep(1.5, 120, 20) { BedTarget = 110 });
+                prof.Steps.Add(new ProfileStep(0.8, 160, 40) { BedTarget = 120 });
+                prof.Steps.Add(new ProfileStep(1.0, 205, 20) { BedTarget = 130 });
+                settings.SetSync(0, prof);
+                var device = new DeviceService();
+                try {
+                    device.ConnectAsync(new ConnectionOptions { UseSimulator = true, SimulatorSpeed = 10, PollIntervalMs = 200 }).Wait();
+                    var sim = (SimulatedPc410)device.RunAsync(d => d.Client.Transport).Result;
+                    device.ReadIn2 = device.ReadAlarm2 = true;
+                    var ctl = new BedSwitchController(device, settings) { Enabled = true, KnownPattern = slot => slot == 0 ? prof : null };
+                    Thread.Sleep(600);
+                    device.RunAsync(d => d.Start(0)).Wait();
+                    True(WaitFor(() => sim.Out2, 8000), "heating");
+                    True(ctl.SwitchOffAsync().Result, "confirmed off");
+                    False(sim.Out2, "OUT2 off");
+                    True(ctl.Plan != null, "the run is kept, in case the user cancels");
+                    True(WaitFor(() => ctl.Reason == "Switched off", 2000), "reason: " + ctl.Reason);
+                    Thread.Sleep(800);
+                    False(sim.Out2, "held off while the user decides");
+                    ctl.ResumeAfterSwitchOff();
+                    True(WaitFor(() => sim.Out2, 8000), "cancelled: regulating again");
+                    device.RunAsync(d => d.Stop()).Wait();
+                } finally {
+                    device.Dispose();
+                }
+            });
+
+            Run("Single PC410: a start that overtakes Stop doesn't switch the bed back on", () => {
+                var settings = new AppSettings();
+                settings.Bed.Mode = BedMode.SinglePc410;
+                settings.Bed.Switching.CycleSeconds = 4;
+                var prof = new ReflowProfile();
+                prof.Steps.Add(new ProfileStep(1.5, 120, 20) { BedTarget = 110 });
+                prof.Steps.Add(new ProfileStep(0.8, 160, 40) { BedTarget = 120 });
+                prof.Steps.Add(new ProfileStep(1.0, 205, 20) { BedTarget = 130 });
+                settings.SetSync(0, prof);
+                var device = new DeviceService();
+                try {
+                    device.ConnectAsync(new ConnectionOptions { UseSimulator = true, SimulatorSpeed = 10, PollIntervalMs = 200 }).Wait();
+                    var sim = (SimulatedPc410)device.RunAsync(d => d.Client.Transport).Result;
+                    device.ReadIn2 = device.ReadAlarm2 = true;
+                    var ctl = new BedSwitchController(device, settings) { Enabled = true, KnownPattern = slot => slot == 0 ? prof : null };
+                    Thread.Sleep(600);
+                    device.RunAsync(d => d.Start(0)).Wait();
+                    ctl.Stop(); // pressed before the controller took the Stop: the polls still show the run
+                    ctl.Begin(BedPlan.From(settings.SyncFor(0), 25, 25));
+                    Eq(null, ctl.Plan);
+                    Thread.Sleep(1500);
+                    False(sim.Out2, "bed stays off");
+                    Eq("Stopped", ctl.Reason);
+                    device.RunAsync(d => d.Stop()).Wait();
+                    True(WaitFor(() => ctl.Reason == "Idle", 3000), "idle: " + ctl.Reason);
+                    device.RunAsync(d => d.Start(0)).Wait();
+                    True(WaitFor(() => sim.Out2, 8000), "the next run heats again");
+                    device.RunAsync(d => d.Stop()).Wait();
+                } finally {
+                    device.Dispose();
+                }
+            });
+
+            Run("Pattern comparison lists what differs", () => {
+                var a = new ReflowProfile { Holdback = 5 };
+                a.Steps.Add(new ProfileStep(1, 150, 30) { BedTarget = 140 });
+                a.Steps.Add(new ProfileStep(1, 200, 10));
+                var b = a.Clone();
+                Eq(0, ProfileMath.Differences(a, b, true).Count);
+                b.Steps[0].Target = 155;
+                b.Steps[0].BedTarget = 120;
+                b.Steps.RemoveAt(1);
+                var d = ProfileMath.Differences(a, b, true);
+                Eq(3, d.Count);
+                Eq(2, ProfileMath.Differences(a, b, false).Count);
             });
 
             Run("END marker mode terminates the program", () => {
@@ -1093,6 +1422,32 @@ namespace ReflowLink.Tests {
         }
 
         private static void False(bool cond, string what) => True(!cond, what);
+
+        private static void Eq(double expected, double actual, double tolerance) {
+            if (Math.Abs(expected - actual) > tolerance)
+                throw new Exception($"expected <{expected}> ± {tolerance} but got <{actual}>");
+        }
+
+        /// <summary>Reports progress on the calling thread (Progress&lt;T&gt; would post it elsewhere).</summary>
+        private sealed class SyncProgress(Action<OperationProgress> report) : IProgress<OperationProgress> {
+            public void Report(OperationProgress value) => report(value);
+        }
+
+        /// <summary>A serial port that fails like an unplugged USB adapter.</summary>
+        private sealed class BrokenTransport : ITransport {
+            public int Writes;
+            public string Name => "COM9";
+            public bool IsOpen => true;
+            public void Open() { }
+            public void Close() { }
+            public void DiscardInput() { }
+            public void Write(byte[] data) {
+                Writes++;
+                throw new IOException("The device is not connected.");
+            }
+            public int ReadByte(int timeoutMs) => -1;
+            public void Dispose() { }
+        }
 
         private static bool WaitFor(Func<bool> cond, int timeoutMs) {
             var sw = System.Diagnostics.Stopwatch.StartNew();

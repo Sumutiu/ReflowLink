@@ -5,6 +5,7 @@ using System;
 using System.Threading;
 using System.Windows.Forms;
 using ReflowLink.Model;
+using ReflowLink.Services;
 using ReflowLink.UI;
 
 namespace ReflowLink {
@@ -15,20 +16,28 @@ namespace ReflowLink {
             Application.SetCompatibleTextRenderingDefault(false);
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
             Application.ThreadException += (s, e) => ShowCrash(e.Exception);
-            AppDomain.CurrentDomain.UnhandledException += (s, e) => ShowCrash(e.ExceptionObject as Exception);
+            // On another thread the process is about to end: write the report only (no window from that thread).
+            // It's shown when ReflowLink starts again.
+            AppDomain.CurrentDomain.UnhandledException += (s, e) => AppLog.WriteCrash(e.ExceptionObject as Exception);
 
             Theme.Initialize();
             var settings = AppSettings.Load();
+            AppLog.Info($"ReflowLink {typeof(Program).Assembly.GetName().Version} started");
             Application.Run(new MainForm(settings));
+            AppLog.Info("ReflowLink closed");
         }
 
         private static int _showing;
 
+        /// <summary>An error on the interface thread: logged, reported, and ReflowLink carries on.</summary>
         private static void ShowCrash(Exception ex) {
-            if (ex == null || Interlocked.Exchange(ref _showing, 1) == 1) return;
+            if (ex == null) return;
+            AppLog.Error("Unexpected error: " + ex);
+            if (Interlocked.Exchange(ref _showing, 1) == 1) return;
             try {
                 DarkDialog.Show(null, "Unexpected error",
-                    ex.Message + "\n\n" + ex.GetType().Name + (ex.StackTrace != null ? "\n" + FirstLines(ex.StackTrace, 6) : ""),
+                    ex.Message + "\n\n" + ex.GetType().Name + (ex.StackTrace != null ? "\n" + FirstLines(ex.StackTrace, 6) : "")
+                    + "\n\nDetails are in the event log: " + AppLog.Folder,
                     DialogTone.Error, ["Continue"]);
             } catch {
                 MessageBox.Show(ex.ToString(), "ReflowLink", MessageBoxButtons.OK, MessageBoxIcon.Error);

@@ -4,8 +4,12 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using ReflowLink.Model;
+using ReflowLink.Protocol;
 using ReflowLink.Services;
 using ReflowLink.UI.Controls;
 using ReflowLink.UI.Pages;
@@ -144,14 +148,15 @@ namespace ReflowLink.UI {
             _state.NavigateRequested += ShowPage;
             _state.StationChanged += () => brand.Subtitle = _state.Settings.Station.Name;
             _state.BusyChanged += UpdateConnectionUi;
-            _device.StateChanged += (s, e) => UpdateConnectionUi();
-            _bedDevice.StateChanged += (s, e) => UpdateConnectionUi();
+            _device.StateChanged += (s, e) => { UpdateConnectionUi(); UpdateTitle(); };
+            _bedDevice.StateChanged += (s, e) => { UpdateConnectionUi(); UpdateTitle(); };
             _state.BedEnabledChanged += () => {
                 if (!_state.DualBed && _bedDevice.IsConnected) _bedDevice.Disconnect();
                 UpdateConnectionUi();
                 UpdateNav();
             };
             _state.BedSwitch.CommandFailed += msg => SetStatus(msg, StatusKind.Error);
+            _dashboard.ActiveChanged += active => UpdateTitle();
             _statusFade.Tick += (s, e) => { _statusFade.Stop(); _statusText.ForeColor = Theme.TextFaint; };
 
             ApplySavedBounds(settings);
@@ -232,9 +237,11 @@ namespace ReflowLink.UI {
                     !DarkDialog.Confirm(this, "Disconnect during auto-tune?", AutoTuneWarning, "Disconnect", "Cancel", danger: true))
                     return;
                 // ReflowLink regulates a single PC410's bed: switch OUT2 off while it still can.
-                if (_state.SingleBed && !_state.BedSwitch.SwitchOffNow() &&
-                    !DarkDialog.Confirm(this, "Bed not confirmed off", BedOffWarning, "Disconnect anyway", "Cancel", danger: true))
+                if (_state.SingleBed && !SwitchBedOff() &&
+                    !DarkDialog.Confirm(this, "Bed not confirmed off", BedOffWarning, "Disconnect anyway", "Cancel", danger: true)) {
+                    _state.BedSwitch.ResumeAfterSwitchOff();
                     return;
+                }
                 _dashboard.Shutdown();
                 _device.Disconnect();
                 SetStatus("Top IR controller disconnected", StatusKind.Normal);
@@ -289,6 +296,21 @@ namespace ReflowLink.UI {
             }
         }
 
+        /// <summary>Switches a single PC410's bed off (OUT2) with a wait window. False if that couldn't be confirmed.</summary>
+        private bool SwitchBedOff(int timeoutMs = 4000) {
+            try {
+                return BusyDialog.Run(this, "Switching the bed off…", () => _state.BedSwitch.SwitchOffAsync(timeoutMs));
+            } catch {
+                return false;
+            }
+        }
+
+        /// <summary>Shows in the title bar (and the taskbar) whether a program is running.</summary>
+        private void UpdateTitle() {
+            string title = _dashboard.IsProgramActive && (_device.IsConnected || _bedDevice.IsConnected) ? "ReflowLink · Running" : "ReflowLink";
+            if (Text != title) Text = title;
+        }
+
         private const string BedOffWarning =
             "The Top IR controller didn't confirm that OUT2 was switched off (A2 = 500). Once disconnected, ReflowLink can't switch the bed off: "
             + "the bed controller behind OUT2 keeps heating to its own setpoint. Check the bed on the station.";
@@ -315,6 +337,15 @@ namespace ReflowLink.UI {
 
         protected override void OnShown(EventArgs e) {
             base.OnShown(e);
+            if (_state.Settings.LoadWarning != null)
+                DarkDialog.Show(this, "Settings couldn't be read", _state.Settings.LoadWarning, DialogTone.Warning, ["OK"]);
+            if (_state.Settings.InterruptedWrite is int slot) {
+                _state.Settings.Save(); // keeps the block
+                DarkDialog.Show(this, $"Pattern {slot} may be half-written",
+                    $"ReflowLink closed while it was writing pattern {slot}. The pattern may hold part of the new profile and part of the old one, "
+                    + "so it's blocked: write a profile to it on the Profiles page before running it.", DialogTone.Warning, ["OK"]);
+            }
+            ShowPendingCrash();
             if (_state.Settings.StationChosen) return;
             // First run: ask which station the PC410 is in (sets units and temperature limit).
             string id = StationPickerDialog.Pick(this, StationCatalog.DefaultId);
@@ -326,18 +357,47 @@ namespace ReflowLink.UI {
             Theme.ApplyDarkTitleBar(this);
         }
 
+        /// <summary>ReflowLink closed unexpectedly last time: say where the report is.</summary>
+        private void ShowPendingCrash() {
+            string path = AppLog.PendingCrashPath;
+            try {
+                if (!File.Exists(path)) return;
+                string kept = Path.Combine(AppLog.Folder, $"crash-{File.GetLastWriteTime(path):yyyyMMdd-HHmmss}.log");
+                File.Delete(path);
+                int r = DarkDialog.Show(this, "ReflowLink closed unexpectedly",
+                    "ReflowLink stopped because of an unexpected error the last time it ran. A report was saved:\n\n" + kept
+                    + "\n\nIf a program was running, check the station: the controller carried on with it on its own.",
+                    DialogTone.Warning, ["Open folder", "Close"], 1);
+                if (r == 0) DashboardPage.OpenFolder(AppLog.Folder);
+            } catch { }
+        }
+
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData) {
+            // F12 stops the program from any page, even while another operation is running.
+            switch (keyData) {
+                case Keys.F12:
+                    _dashboard.StopFromShortcut();
+                    return true;
+                case Keys.F5 when _current == _dashboard:
+                    _dashboard.StartFromShortcut();
+                    return true;
+                case Keys.F6 when _current == _dashboard:
+                    _dashboard.HoldFromShortcut();
+                    return true;
+            }
             if (_current != null && (keyData & Keys.Control) != 0 && _current.HandleShortcut(keyData)) return true;
             return base.ProcessCmdKey(ref msg, keyData);
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e) {
             if (e.CloseReason == CloseReason.UserClosing) {
+                // Every question first, so nothing is stopped or switched off before the user has agreed to all of it.
                 if (_state.Busy &&
                     DarkDialog.Show(this, "An operation is in progress",
                         "ReflowLink is still talking to the controller (for example writing a profile). Closing now can leave a pattern half-written.",
                         DialogTone.Warning, ["Exit anyway", "Cancel"], 1, ButtonKind.Danger) != 0) { e.Cancel = true; return; }
 
+                bool stop = false;
                 if (_dashboard.IsProgramActive && (_device.IsConnected || _bedDevice.IsConnected)) {
                     string text = _state.SingleBed
                         ? "The Top IR controller keeps running the program after ReflowLink closes. The bed is switched off (OUT2), since only ReflowLink regulates it."
@@ -345,21 +405,29 @@ namespace ReflowLink.UI {
                     int r = DarkDialog.Show(this, "A program is running", text,
                         DialogTone.Warning, ["Stop program and exit", "Exit, keep running", "Cancel"], 2);
                     if (r is 2 or < 0) { e.Cancel = true; return; }
-                    if (r == 0 && !TryStopBeforeExit()) {
-                        int r2 = DarkDialog.Show(this, "Could not stop the program",
-                            "The controller did not confirm the stop command. The heater program may still be running — stop it on the station's front panel.",
-                            DialogTone.Error, ["Exit anyway", "Cancel"], 1, ButtonKind.Danger);
-                        if (r2 != 0) { e.Cancel = true; return; }
-                    }
+                    stop = r == 0;
                 }
                 if (_state.AutoTuneRunning && (_device.IsConnected || _bedDevice.IsConnected) &&
                     !DarkDialog.Confirm(this, "Auto-tune is running", AutoTuneWarning, "Exit anyway", "Cancel", danger: true)) { e.Cancel = true; return; }
                 if (!_profiles.ConfirmClose()) { e.Cancel = true; return; }
-                if (_state.SingleBed && _device.IsConnected && !_state.BedSwitch.SwitchOffNow() &&
-                    !DarkDialog.Confirm(this, "Bed not confirmed off", BedOffWarning, "Exit anyway", "Cancel", danger: true)) { e.Cancel = true; return; }
+
+                // Then act. A failure still lets the user stay.
+                if (_state.Busy) FinishOperationBeforeExit();
+                if (stop && !TryStopBeforeExit()) {
+                    int r2 = DarkDialog.Show(this, "Could not stop the program",
+                        "The controller did not confirm the stop command. The heater program may still be running — stop it on the station's front panel.",
+                        DialogTone.Error, ["Exit anyway", "Cancel"], 1, ButtonKind.Danger);
+                    if (r2 != 0) { e.Cancel = true; return; }
+                }
+                if (_state.SingleBed && _device.IsConnected && !SwitchBedOff() &&
+                    !DarkDialog.Confirm(this, "Bed not confirmed off", BedOffWarning, "Exit anyway", "Cancel", danger: true)) {
+                    _state.BedSwitch.ResumeAfterSwitchOff();
+                    e.Cancel = true;
+                    return;
+                }
             } else if (_state.SingleBed && _device.IsConnected) {
                 // Windows shutting down or logging off: no questions, but still switch the bed off.
-                _state.BedSwitch.SwitchOffNow(2000);
+                SwitchBedOff(2000);
             }
             var s = _state.Settings;
             s.WindowMaximized = WindowState == FormWindowState.Maximized;
@@ -372,25 +440,55 @@ namespace ReflowLink.UI {
             base.OnFormClosing(e);
         }
 
-        /// <summary>Sends Stop to every connected controller and confirms they report idle. False if that couldn't be confirmed.</summary>
-        private bool TryStopBeforeExit() {
-            _state.Sync.UserHold = true;
-            _state.Sync.Halt();
-            Cursor = Cursors.WaitCursor;
+        /// <summary>
+        /// "Exit anyway" during an operation: cancel it and give it a few seconds to finish, so a half-written pattern gets
+        /// cleared and blocked before the ports close.
+        /// </summary>
+        private void FinishOperationBeforeExit() {
+            _state.CancelOperation();
             try {
-                bool ok = true;
-                foreach (var device in new[] { _device, _bedDevice }) {
-                    if (!device.IsConnected) continue;
-                    try {
-                        var t = device.RunAsync(d => {
-                            d.Stop();
-                            return d.ReadState();
-                        });
-                        ok &= t.Wait(8000) && t.Result == Protocol.ProgramState.Idle;
-                    } catch { ok = false; }
-                }
-                return ok;
-            } finally { Cursor = Cursors.Default; }
+                BusyDialog.Run(this, "Finishing the current operation…", async () => {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    while (_state.Busy && sw.ElapsedMilliseconds < 6000) await Task.Delay(50);
+                    return true;
+                });
+            } catch { }
+        }
+
+        /// <summary>
+        /// Sends Stop to every connected controller and confirms they report idle. False if that couldn't be confirmed;
+        /// then the user hold stays on, so nothing is resumed automatically (as after a failed Stop on the Dashboard).
+        /// </summary>
+        private bool TryStopBeforeExit() {
+            _state.BeginStop();
+            _state.Sync.UserHold = true;
+            if (_state.SingleBed) _state.BedSwitch.Stop();
+            var devices = new[] { _device, _bedDevice }.Where(d => d.IsConnected).ToList();
+            bool ok;
+            try {
+                ok = BusyDialog.Run(this, "Stopping the program…", async () => {
+                    var results = await Task.WhenAll(devices.Select(StopAndConfirmAsync));
+                    return results.All(r => r);
+                });
+            } catch {
+                ok = false;
+            }
+            if (ok) _state.Sync.Halt();
+            AppLog.Write(ok ? "INFO" : "ERROR", ok ? "Program stopped before exit" : "Stop before exit not confirmed");
+            return ok;
+        }
+
+        private static async Task<bool> StopAndConfirmAsync(DeviceService device) {
+            try {
+                var t = device.RunAsync(d => {
+                    d.Stop();
+                    return d.ReadState();
+                });
+                if (await Task.WhenAny(t, Task.Delay(8000)) != t) return false;
+                return await t == ProgramState.Idle;
+            } catch {
+                return false;
+            }
         }
 
         // ==================================================================== small painted parts

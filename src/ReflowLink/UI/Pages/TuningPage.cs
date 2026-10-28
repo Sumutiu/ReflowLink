@@ -39,13 +39,14 @@ namespace ReflowLink.UI.Pages {
         private readonly List<SettingRow> _rows = [];
         private readonly ThemedLabel _source, _lockNote, _tuneStatus, _tuneSetpoint, _focusText, _nowStats, _disclaimer;
         private readonly CardPanel _tuneCard;
-        private readonly ModernButton _readAll, _discard, _writeChanges, _tuneButton;
+        private readonly ModernButton _readAll, _discard, _writeChanges, _tuneButton, _restore;
         private readonly ChartView _chart;
         private readonly ChartSeries _spSeries, _nowSeries, _editSeries;
         private readonly MiniStat _statLag, _statOver, _statSettle, _statSwings;
         private readonly NumberBox _simRate, _simTarget;
         private readonly Timer _previewTimer = new() { Interval = 150 };
         private readonly Timer _tunePoll = new() { Interval = 3000 };
+        private readonly ToolTip _tip = Theme.CreateToolTip();
 
         private TuningSnapshot _shown;
         private TuningParameter _focus;
@@ -76,7 +77,7 @@ namespace ReflowLink.UI.Pages {
             _discard.Click += (s, e) => DiscardChanges();
             _writeChanges = new ModernButton("Write changes", Glyph.Upload, ButtonKind.Primary) { Margin = Padding.Empty };
             _writeChanges.Click += async (s, e) => await WriteChanges();
-            var tip = Theme.CreateToolTip();
+            var tip = _tip;
             tip.SetToolTip(_readAll, "Read every control setting from the controller");
             tip.SetToolTip(_discard, "Put back the values shown for the controller");
             tip.SetToolTip(_writeChanges, "Write the changed settings to the controller (each one is read back)");
@@ -124,6 +125,9 @@ namespace ReflowLink.UI.Pages {
             var tuneLine = Flow();
             tuneLine.Controls.AddRange([new ThemedLabel("Status", Theme.Body, Theme.TextDim) { AutoSize = true, Margin = new Padding(0, Theme.S(8), Theme.S(10), 0) }, _tuneStatus, _tuneButton]);
             tuneBody.Controls.Add(tuneLine);
+            _restore = new ModernButton("Restore P, I, D from before auto-tune", Glyph.Refresh) { Margin = new Padding(0, Theme.S(8), 0, 0) };
+            _restore.Click += async (s, e) => await RestoreBackup();
+            tuneBody.Controls.Add(_restore);
             _tuneSetpoint = Para("", Theme.Small, Theme.TextDim, 6);
             tuneBody.Controls.Add(_tuneSetpoint);
             tuneBody.Controls.Add(Para(
@@ -135,7 +139,7 @@ namespace ReflowLink.UI.Pages {
                 + "⚠ Set the station up as for a real job: board in place and the thermocouple attached as you normally use it. "
                 + "Tuning with nothing on the station gives values that don't suit real boards.\n"
                 + "⚠ Stay with the station until it finishes. It can take several minutes, and programs can't be started meanwhile.\n"
-                + "⚠ Note the current P, I and D first (they're shown above), so you can put them back.",
+                + "ReflowLink keeps the P, I and D from before the tune, so you can put them back with the button above.",
                 Theme.Small, Theme.Yellow, 8));
             column.Controls.Add(FitCard(_tuneCard));
 
@@ -454,6 +458,9 @@ namespace ReflowLink.UI.Pages {
             _tuneButton.Glyph = IsTuning ? Glyph.Stop : Glyph.Spark;
             _tuneButton.Kind = IsTuning ? ButtonKind.Danger : ButtonKind.Secondary;
             _tuneButton.Enabled = conn && !busy && fresh && !_finishing && _shown.AutoTune != null && (IsTuning || !ProgramActive);
+            var backup = Backup;
+            _restore.Enabled = backup != null && conn && !busy && fresh && !locked && !_finishing;
+            _tip.SetToolTip(_restore, backup == null ? "Nothing saved yet: ReflowLink saves P, I and D when it starts an auto-tune." : BackupText(backup));
             UpdateSetpointText();
         }
 
@@ -628,6 +635,7 @@ namespace ReflowLink.UI.Pages {
                 }
             }
             _beforeTune = before;
+            SaveBackup(before);
             _shown.AutoTune = true;
             UpdateState();
             StartTunePolling();
@@ -635,6 +643,55 @@ namespace ReflowLink.UI.Pages {
         }
 
         private string Value(TuningParameter p) => _shown[p] is double v ? p.Format(v) : "not reported";
+
+        /// <summary>P, I and D from before this controller's last auto-tune (kept in the settings).</summary>
+        private TuningBackup Backup {
+            get => _ch.IsBed ? State.Settings.BedTuningBackup : State.Settings.IrTuningBackup;
+            set {
+                if (_ch.IsBed) State.Settings.BedTuningBackup = value;
+                else State.Settings.IrTuningBackup = value;
+                State.Settings.Save();
+            }
+        }
+
+        /// <summary>Keeps the values an auto-tune is about to replace (only when all three were read).</summary>
+        private void SaveBackup(TuningSnapshot before) {
+            if (before?[TuningCatalog.Proportional] is not double p || before[TuningCatalog.Integral] is not double i
+                || before[TuningCatalog.Derivative] is not double d || !before.FromController)
+                return;
+            Backup = new TuningBackup { P = p, I = i, D = d, Saved = DateTime.Now };
+            UpdateState();
+        }
+
+        private string BackupText(TuningBackup b) =>
+            $"P {TuningCatalog.Proportional.Format(b.P)}, I {TuningCatalog.Integral.Format(b.I)}, D {TuningCatalog.Derivative.Format(b.D)} (saved {b.Saved:yyyy-MM-dd HH:mm})";
+
+        /// <summary>Writes back the P, I and D saved before the last auto-tune, and reads the controller again.</summary>
+        private async Task RestoreBackup() {
+            var b = Backup;
+            if (b == null) return;
+            if (!DarkDialog.Confirm(FindForm(), "Put the old values back?",
+                    $"The {_ch.Name} controller gets the values from before its last auto-tune:\n\n{BackupText(b)}\n\n"
+                    + "Now it has: " + $"P {Value(TuningCatalog.Proportional)}, I {Value(TuningCatalog.Integral)}, D {Value(TuningCatalog.Derivative)}.",
+                    "Restore", "Cancel"))
+                return;
+            int connection = _connection;
+            var (ok, snap) = await State.RunOnAsync(_ch, $"Restoring {_ch.Name} P, I and D", (d, progress, ct) => {
+                d.WriteSetting(TuningCatalog.Proportional, b.P);
+                d.WriteSetting(TuningCatalog.Integral, b.I);
+                d.WriteSetting(TuningCatalog.Derivative, b.D);
+                return d.ReadTuning(progress, ct);
+            });
+            if (!ok && connection == _connection && Dev.IsConnected) {
+                // Some of the three may have been written: show what the controller has now.
+                var (read, now) = await State.RunOnAsync(_ch, $"Reading {_ch.Name} control settings", (d, progress, ct) => d.ReadTuning(progress, ct));
+                if (read && connection == _connection) ApplyRead(now, replaceEdits: true);
+                return;
+            }
+            if (!ok || connection != _connection) return;
+            ApplyRead(snap, replaceEdits: true);
+            State.SetStatus($"{_ch.Name} P, I and D restored", StatusKind.Success);
+        }
 
         private void StartTunePolling() {
             _beforeTune ??= _shown;

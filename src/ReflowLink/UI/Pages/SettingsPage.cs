@@ -37,7 +37,7 @@ namespace ReflowLink.UI.Pages {
         private readonly ModernDropDown _unused, _bedUnused, _station, _rampUnit, _dwellUnit, _bedRamp, _bedDwell, _bedMode;
         private readonly ThemedLabel _stationControls, _stationNotes;
         private readonly ToggleSwitch _verify, _bedVerify, _autoRecord, _irIn2, _bedIn2;
-        private readonly NumberBox _afterRun;
+        private readonly NumberBox _afterRun, _maxWait;
         private readonly ModernTextBox _folder;
         private readonly ConnectionCard _irConn, _bedConn;
         private readonly LimitCard _irLimit, _bedLimit;
@@ -54,7 +54,8 @@ namespace ReflowLink.UI.Pages {
             _station.SetItems(StationCatalog.All.Select(st => st.Name), StationCatalog.IndexOf(s.StationId));
             _station.SelectedIndexChanged += (o, e) => {
                 if (_loading || _station.SelectedIndex < 0) return;
-                State.ChangeStation(StationCatalog.All[_station.SelectedIndex].Id);
+                var next = StationCatalog.All[_station.SelectedIndex];
+                State.ChangeStation(next.Id, KeepCustomLimit(next));
             };
             _stationControls = WrapLabel(Theme.Body, Theme.Text, 2);
             _stationNotes = WrapLabel(Theme.Small, Theme.TextDim, 3);
@@ -81,10 +82,9 @@ namespace ReflowLink.UI.Pages {
                     ShowBedEnabled();
                     return;
                 }
-                if (!State.SetBedMode(mode) && !(DarkDialog.Confirm(FindForm(), "Bed not confirmed off",
+                if (!State.SetBedMode(mode, () => DarkDialog.Confirm(FindForm(), "Bed not confirmed off",
                         "The Top IR controller didn't confirm that OUT2 was switched off (A2 = 500). After this change ReflowLink no longer "
-                        + "regulates the bed, so check it on the station.", "Change anyway", "Cancel", danger: true)
-                        && State.SetBedMode(mode, force: true)))
+                        + "regulates the bed, so check it on the station.", "Change anyway", "Cancel", danger: true)))
                     ShowBedEnabled();
             };
 
@@ -142,6 +142,8 @@ namespace ReflowLink.UI.Pages {
             _bedVerify = Toggle("Read back and compare", s.Bed.VerifyAfterWrite, v => s.Bed.VerifyAfterWrite = v);
             Row(_bedLimit.Form, "Unused steps", _bedUnused, "How segments after the last step are cleared on the bed controller (second PC410).");
             Row(_bedLimit.Form, "Verify after write", _bedVerify, "Second PC410 only. With a single PC410 the bed targets are kept by ReflowLink.");
+            _maxWait = Num(0, 240, 0, 1, s.MaxWaitMinutes, "min", v => { s.MaxWaitMinutes = v; State.Sync.MaxWaitMinutes = v; });
+            Row(_bedLimit.Form, "Longest wait", _maxWait, "Wait for Bed / Wait for IR: after this long ReflowLink asks whether to keep waiting or stop (0 = never ask).");
             FitCard(_bedLimit.Card, _bedLimit.Form);
 
             // ---------------------------------------------------------------- logging
@@ -160,19 +162,35 @@ namespace ReflowLink.UI.Pages {
             var folderRow = Flow();
             folderRow.Controls.AddRange([_folder, browse, open]);
 
+            var csvFormat = new ModernDropDown { Width = Theme.S(260) };
+            csvFormat.SetItems(["Standard (commas, decimal points)", "This PC's format (Excel opens it here)"], s.CsvLocalFormat ? 1 : 0);
+            csvFormat.SelectedIndexChanged += (o, e) => { s.CsvLocalFormat = csvFormat.SelectedIndex == 1; Changed(); };
+
             var log = Card("Logging", "CSV files with timestamp, temperatures, setpoints, output and state");
             var lf = Form(log);
             Row(lf, "Auto-record", _autoRecord, null);
             Row(lf, "Keep recording after run", _afterRun, "Captures the cool-down after the program ends.");
             Row(lf, "Log folder", folderRow, null);
+            Row(lf, "CSV format", csvFormat, "This PC's format uses its list separator and decimal mark, so Excel opens the file in columns where the decimal mark is a comma.");
             FitCard(log, lf);
 
             // ---------------------------------------------------------------- about
             var about = new AboutPanel { Dock = DockStyle.Fill };
             var aboutCard = Card("About", "");
+            var copy = new ModernButton("Copy diagnostics", Glyph.None) { Margin = new Padding(0, 0, Theme.S(8), 0) };
+            copy.Click += (o, e) => CopyDiagnostics();
+            var events = new ModernButton("Event log", Glyph.Folder) { Margin = Padding.Empty };
+            events.Click += (o, e) => DashboardPage.OpenFolder(AppLog.Folder);
+            var tip = Theme.CreateToolTip();
+            tip.SetToolTip(copy, "Copies the version, setup, connection state and recent events, to paste into a support request");
+            tip.SetToolTip(events, "Open the folder with the event logs and crash reports");
+            var aboutButtons = Flow();
+            aboutButtons.Dock = DockStyle.Bottom;
+            aboutButtons.Controls.AddRange([copy, events]);
             aboutCard.Controls.Add(about);
+            aboutCard.Controls.Add(aboutButtons);
             about.BringToFront();
-            aboutCard.Height = Theme.S(250);
+            aboutCard.Height = Theme.S(290);
 
             // ---------------------------------------------------------------- layout
             var grid = Table(2, 1);
@@ -225,9 +243,12 @@ namespace ReflowLink.UI.Pages {
                 Changed();
             };
 
+            // A rate or speed set outside the list (an edited settings file) is shown as it is, not as the first entry.
+            var bauds = Pc410Protocol.StandardBaudRates.ToList();
+            if (!bauds.Contains(cs.BaudRate)) bauds.Add(cs.BaudRate);
             c.Baud = new ModernDropDown { Width = Theme.S(200) };
-            c.Baud.SetItems(Pc410Protocol.StandardBaudRates.Select(b => b + " baud"), Math.Max(0, Array.IndexOf(Pc410Protocol.StandardBaudRates, cs.BaudRate)));
-            c.Baud.SelectedIndexChanged += (o, e) => { cs.BaudRate = Pc410Protocol.StandardBaudRates[c.Baud.SelectedIndex]; Changed(); };
+            c.Baud.SetItems(bauds.Select(b => b + " baud"), bauds.IndexOf(cs.BaudRate));
+            c.Baud.SelectedIndexChanged += (o, e) => { cs.BaudRate = bauds[c.Baud.SelectedIndex]; Changed(); };
 
             var address = Num(0, 99, 0, 1, cs.Address, "", v => cs.Address = (int)v);
             var timeout = Num(100, 5000, 0, 50, cs.ResponseTimeoutMs, "ms", v => cs.ResponseTimeoutMs = (int)v);
@@ -241,9 +262,11 @@ namespace ReflowLink.UI.Pages {
             dtr.Margin = new Padding(0, 0, Theme.S(20), 0);
 
             var sim = Toggle("Use built-in simulator", cs.UseSimulator, v => { cs.UseSimulator = v; c.SimSpeed.Enabled = v && c.Form.Enabled; });
+            var speeds = SimSpeeds.ToList();
+            if (!speeds.Contains(cs.SimulatorSpeed)) speeds.Add(cs.SimulatorSpeed);
             c.SimSpeed = new ModernDropDown { Width = Theme.S(120), Enabled = cs.UseSimulator, Margin = new Padding(Theme.S(16), 0, 0, 0) };
-            c.SimSpeed.SetItems(SimSpeeds.Select(v => v + "× speed"), Math.Max(0, Array.IndexOf(SimSpeeds, cs.SimulatorSpeed)));
-            c.SimSpeed.SelectedIndexChanged += (o, e) => { cs.SimulatorSpeed = SimSpeeds[c.SimSpeed.SelectedIndex]; Changed(); };
+            c.SimSpeed.SetItems(speeds.Select(v => v + "× speed"), speeds.IndexOf(cs.SimulatorSpeed));
+            c.SimSpeed.SelectedIndexChanged += (o, e) => { cs.SimulatorSpeed = speeds[c.SimSpeed.SelectedIndex]; Changed(); };
             var simRow = Flow();
             simRow.Controls.Add(sim);
             simRow.Controls.Add(c.SimSpeed);
@@ -407,6 +430,52 @@ namespace ReflowLink.UI.Pages {
         }
 
         private static readonly string[] BedModeNames = ["Off (top IR only)", "Single PC410 (IN2 + OUT2)", "Second PC410"];
+
+        /// <summary>
+        /// A station change normally sets its default temperature limit. If the user had set a limit of their own, ask
+        /// whether to keep it. True keeps the current limit.
+        /// </summary>
+        private bool KeepCustomLimit(StationModel next) {
+            var s = State.Settings;
+            if (!s.CustomLimit || Math.Abs(next.MaxTemperature - s.MaxTemperature) < 0.01) return false;
+            int r = DarkDialog.Show(FindForm(), "Keep your temperature limit?",
+                $"The Top IR limit is set to {s.MaxTemperature:0.#} °C (the {s.Station.Name} default is {s.Station.MaxTemperature:0.#} °C). "
+                + $"The {next.Name} default is {next.MaxTemperature:0.#} °C.",
+                DialogTone.Question, [$"Use {next.MaxTemperature:0.#} °C", $"Keep {s.MaxTemperature:0.#} °C"], 0);
+            return r == 1;
+        }
+
+        /// <summary>Copies what helps with a support request: version, setup, connections, limits and recent events.</summary>
+        private void CopyDiagnostics() {
+            var s = State.Settings;
+            var sb = new System.Text.StringBuilder();
+            var ver = Assembly.GetExecutingAssembly().GetName().Version;
+            sb.AppendLine($"ReflowLink {ver}  ·  Windows {Environment.OSVersion.Version}  ·  .NET {Environment.Version}");
+            sb.AppendLine($"Station: {s.Station.Name}  ·  units: ramp {s.Units.Ramp}, hold {s.Units.Dwell}  ·  limit {s.MaxTemperature:0.#} °C");
+            sb.AppendLine($"Bed heat: {State.BedMode}  ·  bed limit {s.Bed.MaxTemperature:0.#} °C  ·  IN2 readings: Top IR {s.ReadIn2}, Bed {s.Bed.ReadIn2}");
+            if (State.SingleBed) {
+                var w = s.Bed.Switching;
+                sb.AppendLine($"Bed switching: band {w.ProportionalBand:0.#} °C, integral {w.IntegralSeconds:0} s, cycle {w.CycleSeconds:0} s, A2 writes {w.TotalWrites}");
+            }
+            foreach (var ch in new[] { State.Ir, State.BedChannel }) {
+                var d = ch.Device;
+                IConnectionSettings cs = ch.IsBed ? s.Bed : s;
+                string link = d.IsConnected ? $"{d.State}, {d.LinkName}, address {d.Address:00}" : "not connected";
+                string limits = d.ControllerLimits.Known ? $", HS {d.ControllerLimits.High?.ToString("0.#") ?? "?"} / LS {d.ControllerLimits.Low?.ToString("0.#") ?? "?"}" : "";
+                sb.AppendLine($"{ch.Name}: {link}{limits}  ·  settings {(cs.UseSimulator ? "simulator" : cs.PortName)} {cs.BaudRate} baud, timeout {cs.ResponseTimeoutMs} ms, retries {cs.Retries}, poll {cs.PollIntervalMs} ms");
+                if (!string.IsNullOrEmpty(d.LastError)) sb.AppendLine($"  last error: {d.LastError}");
+            }
+            sb.AppendLine($"Blocked patterns: {(s.BlockedPatterns.Count == 0 ? "none" : string.Join(", ", s.BlockedPatterns))}  ·  segments paired: {s.SegmentsPaired}");
+            sb.AppendLine();
+            sb.AppendLine("Recent events:");
+            sb.AppendLine(AppLog.Tail(80));
+            try {
+                Clipboard.SetText(sb.ToString());
+                State.SetStatus("Diagnostics copied to the clipboard", StatusKind.Success);
+            } catch (Exception ex) {
+                DarkDialog.Error(FindForm(), "Couldn't copy", ex.Message);
+            }
+        }
 
         /// <summary>Asks before changing the bed hardware when it matters. False keeps the current choice.</summary>
         private bool ConfirmBedMode(BedMode mode) {

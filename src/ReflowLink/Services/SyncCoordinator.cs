@@ -40,10 +40,16 @@ namespace ReflowLink.Services {
             /// <summary>The coordinator put this controller on hold (as opposed to the user).</summary>
             public bool AutoHeld;
             public bool Pending;
+            /// <summary>When the current automatic wait began (real time); null while not waiting.</summary>
+            public DateTime? HeldSince;
+            /// <summary>When a wait was last released; a wait that comes back soon after counts as the same wait.</summary>
+            public DateTime? ReleasedAt;
+            public bool TimeoutReported;
         }
 
         private readonly Side _ir, _bed;
         private bool _wasPairRun, _bedLostReported, _irLostReported;
+        private int _pairedEvidence;
         // Read from the command threads: a stop, a user hold or a lost link must cancel commands already queued.
         private volatile bool _userHold, _latched;
         private volatile int _generation;
@@ -91,6 +97,38 @@ namespace ReflowLink.Services {
         /// <summary>Segments seem to count ramp and dwell separately (1..16), so a step is two segments.</summary>
         public bool PairedSegments { get; private set; }
 
+        /// <summary>
+        /// The controllers were seen counting ramp and dwell separately in an earlier run: assume it from the start of each
+        /// run, rather than only once a segment above the number of steps has been seen.
+        /// </summary>
+        public bool PairedHint { get; set; }
+
+        /// <summary>
+        /// Raised when a run shows that the controllers count ramp and dwell as separate segments. Only for a run started
+        /// from ReflowLink after its pattern was checked (<see cref="CheckedRun"/>), where the step count is certain.
+        /// </summary>
+        public event Action PairedDetected;
+
+        /// <summary>The run was started from ReflowLink on a pattern it just read back; cleared by <see cref="Reset"/>.</summary>
+        public bool CheckedRun { get; set; }
+
+        /// <summary>
+        /// Longest automatic wait, in minutes of process time, before <see cref="WaitTimeout"/> asks the user what to do;
+        /// 0 = no limit.
+        /// </summary>
+        public double MaxWaitMinutes { get; set; } = 10;
+
+        /// <summary>Raised once per wait when a controller has been held longer than <see cref="MaxWaitMinutes"/>.</summary>
+        public event Action<string> WaitTimeout;
+
+        /// <summary>The user chose to keep waiting after <see cref="WaitTimeout"/>: start the wait time again.</summary>
+        public void KeepWaiting() {
+            foreach (var side in new[] { _ir, _bed }) {
+                if (side.HeldSince.HasValue) side.HeldSince = DateTime.Now;
+                side.TimeoutReported = false;
+            }
+        }
+
         /// <summary>The controllers don't report their current step, so the per-step choices can't be applied.</summary>
         public bool StepUnknown { get; private set; }
 
@@ -110,7 +148,13 @@ namespace ReflowLink.Services {
         public void Reset() {
             _generation++;
             _ir.AutoHeld = _bed.AutoHeld = false;
-            PairedSegments = false;
+            PairedSegments = PairedHint;
+            _pairedEvidence = 0;
+            CheckedRun = false;
+            foreach (var side in new[] { _ir, _bed }) {
+                side.HeldSince = side.ReleasedAt = null;
+                side.TimeoutReported = false;
+            }
             _bedLostReported = _irLostReported = false;
             _latched = false;
             _userHold = false;
@@ -126,7 +170,8 @@ namespace ReflowLink.Services {
             _latched = false;
             _userHold = false;
             _bedLostReported = _irLostReported = false;
-            PairedSegments = false;
+            PairedSegments = PairedHint;
+            _pairedEvidence = 0;
         }
 
         /// <summary>Stops the coordinator from sending anything until <see cref="Reset"/> (used when the program is stopped).</summary>
@@ -174,7 +219,13 @@ namespace ReflowLink.Services {
             }
 
             int steps = Sync.Steps;
-            if ((ir.Segment ?? 0) > steps || (!single && (bed.Segment ?? 0) > steps)) PairedSegments = true;
+            // A segment above the step count (up to twice as many) in a few readings means ramp and dwell are counted
+            // separately; one bad reading isn't enough.
+            static bool Beyond(int? segment, int n) => segment > n && segment <= 2 * n;
+            if (!PairedSegments && (Beyond(ir.Segment, steps) || (!single && Beyond(bed.Segment, steps))) && ++_pairedEvidence >= 3) {
+                PairedSegments = true;
+                if (!PairedHint && CheckedRun) PairedDetected?.Invoke();
+            }
             var irSide = new SyncSide(ir.State, ir.Pv, ir.Sp, StepOf(ir.Segment, steps, PairedSegments));
             // A single PC410's bed is always in the IR's step and "runs" exactly when the IR program does.
             var bedSide = single
@@ -185,6 +236,30 @@ namespace ReflowLink.Services {
             var (holdIr, holdBed) = Decide(Sync, irSide, bedSide);
             Apply(_ir, holdIr, ir.State);
             if (!single) Apply(_bed, holdBed, bed.State);
+            CheckWaitTime(_ir, "The Top IR program has been waiting for the bed");
+            if (!single) CheckWaitTime(_bed, "The bed program has been waiting for the Top IR");
+        }
+
+        /// <summary>Asks the user once per wait when a hold lasts longer than <see cref="MaxWaitMinutes"/>.</summary>
+        private void CheckWaitTime(Side side, string what) {
+            double scale = Math.Max(1, side.Device.TimeScale);
+            if (!side.AutoHeld) {
+                // Released: a wait that comes back within a minute is the same wait (a heater hovering at the holdback edge).
+                if (side.HeldSince == null) return;
+                side.ReleasedAt ??= DateTime.Now;
+                if ((DateTime.Now - side.ReleasedAt.Value).TotalSeconds * scale > 60) {
+                    side.HeldSince = side.ReleasedAt = null;
+                    side.TimeoutReported = false;
+                }
+                return;
+            }
+            side.ReleasedAt = null;
+            side.HeldSince ??= DateTime.Now;
+            if (MaxWaitMinutes <= 0 || side.TimeoutReported) return;
+            double minutes = (DateTime.Now - side.HeldSince.Value).TotalMinutes * scale;
+            if (minutes < MaxWaitMinutes) return;
+            side.TimeoutReported = true;
+            WaitTimeout?.Invoke($"{what} for {minutes:0} minutes.");
         }
 
         private void ReleaseAll() {

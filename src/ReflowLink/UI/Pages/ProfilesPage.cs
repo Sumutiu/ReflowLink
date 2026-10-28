@@ -25,6 +25,10 @@ namespace ReflowLink.UI.Pages {
 
         public string Value { get => _value; set { _value = value; Invalidate(); } }
 
+        /// <summary>Shows the value in the warning colour.</summary>
+        public bool Warn { get => _warn; set { _warn = value; Invalidate(); } }
+        private bool _warn;
+
         protected override void OnPaint(PaintEventArgs e) {
             var g = e.Graphics;
             Theme.HighQuality(g);
@@ -33,7 +37,7 @@ namespace ReflowLink.UI.Pages {
                 g.FillPath(b, p);
             int pad = Theme.S(12);
             TextRenderer.DrawText(g, Text.ToUpperInvariant(), Theme.SmallBold, new Rectangle(pad, Theme.S(7), Width - pad * 2, Theme.S(18)), Theme.TextFaint, Theme.LeftMiddle);
-            TextRenderer.DrawText(g, _value, Theme.Heading, new Rectangle(pad, Theme.S(24), Width - pad * 2, Theme.S(24)), Theme.Text, Theme.LeftMiddle);
+            TextRenderer.DrawText(g, _value, Theme.Heading, new Rectangle(pad, Theme.S(24), Width - pad * 2, Theme.S(24)), Warn ? Theme.Yellow : Theme.Text, Theme.LeftMiddle);
         }
     }
 
@@ -49,13 +53,14 @@ namespace ReflowLink.UI.Pages {
         private readonly List<StepRow> _rows = [];
         private readonly ModernTextBox _name;
         private readonly ModernDropDown _slot;
-        private readonly ModernButton _read, _write, _new, _open, _save, _saveAs, _readHoldback, _writeHoldback, _readBedHoldback, _writeBedHoldback;
+        private readonly ModernButton _read, _write, _new, _open, _save, _saveAs, _readHoldback, _writeHoldback, _readBedHoldback, _writeBedHoldback,
+            _patterns, _notesButton, _overlay;
         private readonly NumberBox _holdback, _bedHoldback, _startTemp;
         private readonly ThemedLabel _validation;
         private readonly CardHeader _editorHeader;
         private readonly ChartView _chart;
-        private readonly ChartSeries _curve, _bedCurve;
-        private readonly MiniStat _statTotal, _statPeak, _statSteps, _statRamp;
+        private readonly ChartSeries _curve, _bedCurve, _overlayIr, _overlayBed;
+        private readonly MiniStat _statTotal, _statPeak, _statSteps, _statRamp, _statAbove, _statSteepest;
         private readonly Timer _previewTimer = new() { Interval = 120 };
 
         private string _filePath = "";
@@ -90,12 +95,15 @@ namespace ReflowLink.UI.Pages {
             _read.Click += async (s, e) => await ReadFromController();
             _write = new ModernButton("Write to controller", Glyph.Upload, ButtonKind.Primary) { Margin = Padding.Empty };
             _write.Click += async (s, e) => await WriteToController();
+            _patterns = new ModernButton("Patterns…", Glyph.None) { Margin = new Padding(0, 0, Theme.S(12), 0) };
+            _patterns.Click += async (s, e) => await ShowPatterns();
             var tip = Theme.CreateToolTip();
+            tip.SetToolTip(_patterns, "All ten controller patterns: read them all, compare one with the editor, or write a file to one");
             tip.SetToolTip(_read, "Read the selected pattern into the editor (from both controllers when bed heat control is on)");
             tip.SetToolTip(_write, "Store the edited profile in the selected pattern (of both controllers when bed heat control is on)");
 
             var right = Flow();
-            right.Controls.AddRange([_slot, _read, _write]);
+            right.Controls.AddRange([_patterns, _slot, _read, _write]);
 
             var bar = Table(3, 1);
             bar.Dock = DockStyle.Fill;
@@ -210,15 +218,20 @@ namespace ReflowLink.UI.Pages {
             extras.Controls.Add(hbHint, 0, 3);
             extras.Controls.Add(_validation, 0, 4);
 
-            var nameRow = Table(2, 1);
+            var nameRow = Table(3, 1);
             nameRow.Dock = DockStyle.Top;
             nameRow.Height = Theme.S(34 + 18);
             nameRow.Padding = new Padding(0, 0, 0, Theme.S(18));
             nameRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(82)));
-            nameRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(544)));
+            nameRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(444)));
+            nameRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(100)));
             nameRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             nameRow.Controls.Add(new ThemedLabel("Name", Theme.Body, Theme.TextDim) { Anchor = AnchorStyles.Left, Margin = new Padding(Theme.S(4), 0, 0, 0) }, 0, 0);
             nameRow.Controls.Add(_name, 1, 0);
+            _notesButton = new ModernButton("Notes", Glyph.None) { AutoWidth = false, Width = Theme.S(92), Anchor = AnchorStyles.Right, Margin = Padding.Empty };
+            _notesButton.Click += (s, e) => EditNotes();
+            tip.SetToolTip(_notesButton, "Notes saved with the profile file");
+            nameRow.Controls.Add(_notesButton, 2, 0);
 
             editor.Controls.Add(extras);
             editor.Controls.Add(grid);
@@ -229,9 +242,13 @@ namespace ReflowLink.UI.Pages {
             // ---------------------------------------------------------------- preview card
             _curve = new ChartSeries { Name = "Top IR", Color = Theme.Accent, Width = 2.2f, FillArea = true };
             _bedCurve = new ChartSeries { Name = "Bed heat", Color = Theme.Green, Width = 1.8f };
+            _overlayIr = new ChartSeries { Name = "Recorded IR", Color = Theme.Yellow, Width = 1.4f, ShowInLegend = false };
+            _overlayBed = new ChartSeries { Name = "Recorded bed", Color = Color.FromArgb(45, 212, 191), Width = 1.2f, ShowInLegend = false };
             _chart = new ChartView { Dock = DockStyle.Fill, ShowSecondaryAxis = false, EmptyText = "Add a step to see the curve", ShowLegend = false };
-            _chart.Series.Add(_curve);
+            _chart.Series.Add(_overlayBed);
+            _chart.Series.Add(_overlayIr);
             _chart.Series.Add(_bedCurve);
+            _chart.Series.Add(_curve);
 
             _startTemp = new NumberBox(0, 200, 0, 1) {
                 Suffix = "°C",
@@ -244,23 +261,34 @@ namespace ReflowLink.UI.Pages {
                 SchedulePreview();
             };
             var previewHeader = new CardHeader("Preview", "Ideal setpoint path");
+            _overlay = new ModernButton("Overlay run…", Glyph.None) { Margin = new Padding(0, 0, Theme.S(12), 0) };
+            _overlay.Click += (s, e) => ToggleOverlay();
+            tip.SetToolTip(_overlay, "Lay a recorded run (CSV) over the preview, to compare what the station did with the plan");
+            previewHeader.Tools.Controls.Add(_overlay);
             previewHeader.Tools.Controls.Add(new ThemedLabel("Start at", Theme.Small, Theme.TextDim) { Margin = new Padding(0, Theme.S(9), Theme.S(8), 0) });
             previewHeader.Tools.Controls.Add(_startTemp);
 
-            _statTotal = new MiniStat("Total") { Dock = DockStyle.Fill, Margin = new Padding(0, 0, Theme.S(6), 0) };
-            _statPeak = new MiniStat("Peak") { Dock = DockStyle.Fill, Margin = new Padding(Theme.S(3), 0, Theme.S(3), 0) };
-            _statRamp = new MiniStat("Ramping") { Dock = DockStyle.Fill, Margin = new Padding(Theme.S(3), 0, Theme.S(3), 0) };
-            _statSteps = new MiniStat("Steps") { Dock = DockStyle.Fill, Margin = new Padding(Theme.S(6), 0, 0, 0) };
-            var stats = Table(4, 1);
+            _statTotal = new MiniStat("Total") { Dock = DockStyle.Fill, Margin = new Padding(0, 0, Theme.S(4), Theme.S(8)) };
+            _statPeak = new MiniStat("Peak") { Dock = DockStyle.Fill, Margin = new Padding(Theme.S(4), 0, Theme.S(4), Theme.S(8)) };
+            _statRamp = new MiniStat("Ramping") { Dock = DockStyle.Fill, Margin = new Padding(Theme.S(4), 0, 0, Theme.S(8)) };
+            _statAbove = new MiniStat("Above 183 / 217 °C") { Dock = DockStyle.Fill, Margin = new Padding(0, 0, Theme.S(4), 0) };
+            _statSteepest = new MiniStat("Steepest ramp") { Dock = DockStyle.Fill, Margin = new Padding(Theme.S(4), 0, Theme.S(4), 0) };
+            _statSteps = new MiniStat("Steps") { Dock = DockStyle.Fill, Margin = new Padding(Theme.S(4), 0, 0, 0) };
+            tip.SetToolTip(_statAbove, "Time the planned IR curve spends above 183 °C (leaded liquidus) and 217 °C (lead-free liquidus)");
+            tip.SetToolTip(_statSteepest, $"Ramps above {ProfileMath.SteepRamp:0} °C/s can crack components and boards");
+            var stats = Table(3, 2);
             stats.Dock = DockStyle.Bottom;
-            stats.Height = Theme.S(54 + 12);
+            stats.Height = Theme.S(54 * 2 + 8 + 12);
             stats.Padding = new Padding(0, Theme.S(12), 0, 0);
-            for (int i = 0; i < 4; i++) stats.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
-            stats.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            for (int i = 0; i < 3; i++) stats.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.3f));
+            stats.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+            stats.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
             stats.Controls.Add(_statTotal, 0, 0);
             stats.Controls.Add(_statPeak, 1, 0);
             stats.Controls.Add(_statRamp, 2, 0);
-            stats.Controls.Add(_statSteps, 3, 0);
+            stats.Controls.Add(_statAbove, 0, 1);
+            stats.Controls.Add(_statSteepest, 1, 1);
+            stats.Controls.Add(_statSteps, 2, 1);
 
             var preview = new CardPanel { Dock = DockStyle.Fill, Margin = new Padding(Theme.S(8), 0, 0, 0) };
             preview.Controls.Add(_chart);
@@ -294,11 +322,12 @@ namespace ReflowLink.UI.Pages {
             _previewTimer.Tick += (s, e) => { _previewTimer.Stop(); UpdatePreview(); };
             State.SlotProfilesChanged += () => _slot.SetItems(State.SlotLabels(), _slot.SelectedIndex);
             State.BusyChanged += UpdateButtons;
-            State.StationChanged += UpdatePreview;
+            State.StationChanged += () => { ApplyRampDecimals(); UpdatePreview(); };
             State.Device.StateChanged += (s, e) => UpdatePreview(); // also refreshes the buttons
             State.Bed.StateChanged += (s, e) => UpdatePreview();
             State.BedEnabledChanged += () => { ApplyRowStates(); UpdatePreview(); };
 
+            ApplyRampDecimals();
             // Initial profile: last opened file, else the leaded preset.
             ReflowProfile initial = null;
             if (!string.IsNullOrEmpty(State.Settings.LastProfilePath) && File.Exists(State.Settings.LastProfilePath)) {
@@ -330,10 +359,105 @@ namespace ReflowLink.UI.Pages {
             _bedHoldback.Value = p.BedHoldback ?? ReflowProfile.HoldbackDefault;
             _filePath = path ?? "";
             _loading = false;
+            UpdateNotesButton();
             ApplyRowStates();
             _dirty = false;
             UpdateHeader();
             UpdatePreview();
+        }
+
+        /// <summary>
+        /// A controller counting ramps per minute stores steps of 1/60 °C/s, so the editor shows 4 decimals then (0.0167
+        /// °C/s is 1 °C/min); otherwise 2.
+        /// </summary>
+        private void ApplyRampDecimals() {
+            bool perMinute = State.Settings.Units.Ramp == RampUnit.PerMinute || (State.DualBed && State.Settings.Bed.Units.Ramp == RampUnit.PerMinute);
+            int decimals = perMinute ? 4 : 2;
+            bool wasLoading = _loading;
+            _loading = true;
+            foreach (var r in _rows) {
+                if (r.Ramp.Decimals == decimals) continue;
+                var v = r.Ramp.Value;
+                r.Ramp.Decimals = decimals;
+                r.Ramp.Step = perMinute ? 1 / 60.0 : 0.1;
+                if (v.HasValue) r.Ramp.Value = Math.Round(v.Value, decimals);
+            }
+            _loading = wasLoading;
+        }
+
+        /// <summary>Fields that don't hold a usable number (saving them would store a made-up value).</summary>
+        private List<string> FieldErrors() {
+            var errors = new List<string>();
+            for (int i = 0; i < _rows.Count; i++) {
+                var r = _rows[i];
+                if (!r.Use.Checked) break;
+                if (!r.Ramp.IsValid) errors.Add($"Step {i + 1}: ramp rate must be between 0.01 and 10 °C/s.");
+                if (!r.Target.IsValid) errors.Add($"Step {i + 1}: enter a valid target temperature.");
+                if (!r.Hold.IsValid) errors.Add($"Step {i + 1}: hold time must be 0–9999 s.");
+                if (!r.BedTarget.IsValid && r.BedTarget.Enabled) errors.Add($"Step {i + 1}: enter a valid bed heat target.");
+            }
+            if (!_holdback.IsValid) errors.Add(ReflowProfile.HoldbackRangeMessage);
+            if (_bedHoldback.Enabled && !_bedHoldback.IsValid) errors.Add($"Bed holdback must be between {ReflowProfile.HoldbackMin:0} and {ReflowProfile.HoldbackMax:0} °C.");
+            return errors;
+        }
+
+        private void EditNotes() {
+            string name = string.IsNullOrWhiteSpace(_name.Text) ? "Untitled profile" : _name.Text.Trim();
+            string notes = NotesDialog.Edit(FindForm(), name, _notes);
+            if (notes == null || notes == _notes) return;
+            _notes = notes;
+            MarkDirty();
+            UpdateNotesButton();
+        }
+
+        private void UpdateNotesButton() => _notesButton.Text = string.IsNullOrWhiteSpace(_notes) ? "Notes" : "Notes •";
+
+        /// <summary>Loads a CSV recording over the preview, or removes the one shown.</summary>
+        private void ToggleOverlay() {
+            if (_overlayIr.Points.Count > 0 || _overlayBed.Points.Count > 0) {
+                _overlayIr.Points.Clear();
+                _overlayBed.Points.Clear();
+                _overlay.Text = "Overlay run…";
+                UpdatePreview();
+                return;
+            }
+            using var d = new OpenFileDialog { Filter = "ReflowLink recordings (*.csv)|*.csv|All files (*.*)|*.*", InitialDirectory = State.Settings.EffectiveLogFolder };
+            if (d.ShowDialog(this) != DialogResult.OK) return;
+            try {
+                var run = RecordedRun.Load(d.FileName);
+                foreach (var p in run.Ir) _overlayIr.Points.Add(new PointD(p.Time, p.Temp));
+                foreach (var p in run.Bed) _overlayBed.Points.Add(new PointD(p.Time, p.Temp));
+                _overlay.Text = "Remove overlay";
+                State.SetStatus("Overlaid " + Path.GetFileName(d.FileName) + ": time 0 is where the program started", StatusKind.Success);
+                UpdatePreview();
+            } catch (Exception ex) {
+                DarkDialog.Error(FindForm(), "Cannot overlay this file", ex.Message);
+            }
+        }
+
+        private async Task ShowPatterns() {
+            var (choice, slot) = PatternsDialog.Show(FindForm(), State, () => BuildProfile(null), _slot.SelectedIndex);
+            if (choice == PatternsDialog.Choice.None) return;
+            if (choice == PatternsDialog.Choice.LoadIntoEditor) {
+                var p = State.SlotProfiles[slot];
+                if (p == null || !ConfirmDiscard()) return;
+                _slot.SelectedIndex = slot;
+                var copy = p.Clone();
+                if (string.IsNullOrWhiteSpace(copy.Name)) copy.Name = $"Pattern {slot} profile";
+                LoadProfile(copy, "");
+                _dirty = true;
+                UpdateHeader();
+                State.SetStatus($"Pattern {slot} loaded into the editor", StatusKind.Success);
+                return;
+            }
+            // Write a file: open it in the editor, then the usual checks and confirmation.
+            if (!ConfirmDiscard()) return;
+            using (var d = new OpenFileDialog { Filter = ReflowProfile.FileFilter, InitialDirectory = EnsureProfilesFolder() }) {
+                if (d.ShowDialog(this) != DialogResult.OK) return;
+                if (!OpenFile(d.FileName)) return;
+            }
+            _slot.SelectedIndex = slot;
+            await WriteToController();
         }
 
         private ProfileStep DefaultStepAfter(ReflowProfile p, int index) {
@@ -430,13 +554,17 @@ namespace ReflowLink.UI.Pages {
             _bedCurve.Points.Clear();
             if (bed) foreach (var pt in bc.Points) _bedCurve.Points.Add(new PointD(pt.Time, pt.Temp));
             _bedCurve.Visible = bed;
-            _chart.ShowLegend = bed;
+            _overlayBed.Visible = bed;
+            _chart.ShowLegend = bed || _overlayIr.Points.Count > 0;
+            _overlayIr.ShowInLegend = _overlayIr.Points.Count > 0;
+            _overlayBed.ShowInLegend = bed && _overlayBed.Points.Count > 0;
             _chart.Markers.Clear();
             for (int i = 0; i < c.StepStarts.Count; i++)
                 _chart.Markers.Add(new ChartMarker { X = c.StepStarts[i], Label = "S" + (i + 1) });
             _chart.XMin = 0;
             double total = bed ? Math.Max(c.TotalSeconds, bc.TotalSeconds) : c.TotalSeconds;
-            _chart.XMax = Math.Max(60, total * 1.04);
+            double overlayEnd = _overlayIr.Points.Count > 0 ? _overlayIr.Points[_overlayIr.Points.Count - 1].X : 0;
+            _chart.XMax = Math.Max(60, Math.Max(total, overlayEnd) * 1.04);
             _chart.MinXSpan = 60;
             _chart.LimitLine = State.Settings.MaxTemperature;
             _chart.LimitLabel = $"Limit {State.Settings.MaxTemperature:0} °C";
@@ -461,6 +589,13 @@ namespace ReflowLink.UI.Pages {
             _statPeak.Invalidate();
             _statRamp.Value = ProfileMath.FormatDuration(rampTime);
             _statSteps.Value = $"{p.Steps.Count} of 8";
+            double above183 = ProfileMath.TimeAbove(c, 183), above217 = ProfileMath.TimeAbove(c, 217);
+            _statAbove.Value = above183 <= 0 ? "—" : $"{ProfileMath.FormatDuration(above183)} / {(above217 > 0 ? ProfileMath.FormatDuration(above217) : "0")}";
+            double steepest = ProfileMath.SteepestRamp(p);
+            _statSteepest.Value = $"{steepest:0.##} °C/s";
+            _statSteepest.Warn = steepest > ProfileMath.SteepRamp;
+            if (steepest > ProfileMath.SteepRamp)
+                errors.Add($"A ramp of {steepest:0.##} °C/s is steeper than {ProfileMath.SteepRamp:0} °C/s: components and boards can crack (warning only).");
             _validation.Text = string.Join(Environment.NewLine, errors.Distinct().Take(4));
             UpdateButtons();
         }
@@ -510,17 +645,33 @@ namespace ReflowLink.UI.Pages {
             if (!ConfirmDiscard()) return;
             using var d = new OpenFileDialog { Filter = ReflowProfile.FileFilter, InitialDirectory = EnsureProfilesFolder() };
             if (d.ShowDialog(this) != DialogResult.OK) return;
+            OpenFile(d.FileName);
+        }
+
+        private bool OpenFile(string path) {
             try {
-                var p = ReflowProfile.Load(d.FileName);
-                LoadProfile(p, d.FileName);
-                State.Settings.LastProfilePath = d.FileName;
-                State.SetStatus("Opened " + Path.GetFileName(d.FileName), StatusKind.Success);
+                var p = ReflowProfile.Load(path);
+                LoadProfile(p, path);
+                State.Settings.LastProfilePath = path;
+                if (p.LoadNote != null) {
+                    DarkDialog.Show(FindForm(), "Profile adjusted", p.LoadNote, DialogTone.Warning, ["OK"]);
+                    _dirty = true;
+                    UpdateHeader();
+                }
+                State.SetStatus("Opened " + Path.GetFileName(path), StatusKind.Success);
+                return true;
             } catch (Exception ex) {
                 DarkDialog.Error(FindForm(), "Cannot open profile", ex.InnerException?.Message ?? ex.Message);
+                return false;
             }
         }
 
         private bool SaveProfile(bool saveAs) {
+            var invalid = FieldErrors();
+            if (invalid.Count > 0) {
+                DarkDialog.Error(FindForm(), "Fix the profile first", "Some fields don't hold a valid number, so they can't be saved:\n\n" + string.Join("\n", invalid.Distinct().Take(8)));
+                return false;
+            }
             var p = BuildProfile(null);
             string path = _filePath;
             if (saveAs || string.IsNullOrEmpty(path)) {
@@ -610,6 +761,12 @@ namespace ReflowLink.UI.Pages {
                 return;
             }
             bool both = State.DualBed, single = State.SingleBed;
+            // Waits that don't apply to this setup aren't saved with the pattern (their toggles are greyed out, but a
+            // profile file can still carry them): Wait for Bed needs a bed heater, Wait for IR a second PC410.
+            foreach (var st in p.Steps) {
+                if (!State.BedEnabled) st.WaitForBed = false;
+                if (!both) st.WaitForIr = false;
+            }
             var curve = ProfileMath.BuildPlannedCurve(p, State.Settings.PreviewStartTemperature);
             string where = both ? $"pattern {slot} of both the Top IR and the Bed Heat controller"
                 : single ? $"controller pattern {slot} (ReflowLink keeps the bed targets for it)"
@@ -623,8 +780,18 @@ namespace ReflowLink.UI.Pages {
             bool verify = State.Settings.VerifyAfterWrite;
             var bedMode = State.Settings.Bed.UnusedSteps;
             bool bedVerify = State.Settings.Bed.VerifyAfterWrite;
-            var (ok, res) = await State.RunPairAsync($"Writing pattern {slot}",
-                (ir, bed, progress, ct) => PatternPair.Write(ir, bed, p, slot, mode, verify, progress, ct, bedMode, bedVerify));
+            // Saved before writing: if ReflowLink closes, crashes or loses power halfway, the pattern is blocked at the next start.
+            State.Settings.WritingPattern = slot;
+            State.Settings.Save();
+            bool ok;
+            UploadResult res;
+            try {
+                (ok, res) = await State.RunPairAsync($"Writing pattern {slot}",
+                    (ir, bed, progress, ct) => PatternPair.Write(ir, bed, p, slot, mode, verify, progress, ct, bedMode, bedVerify));
+            } finally {
+                State.Settings.WritingPattern = -1;
+                State.Settings.Save();
+            }
             if (!ok) return;
             State.UnblockSlot(slot);
             State.SetSlotProfile(slot, p);
@@ -655,6 +822,12 @@ namespace ReflowLink.UI.Pages {
                 DarkDialog.Error(FindForm(), "Check the holdback", ReflowProfile.HoldbackRangeMessage);
                 return;
             }
+            // Holdback is one setting for every pattern, so it also changes a program that's running now.
+            bool running = channel.Device.Last?.State is ProgramState.Running or ProgramState.Hold;
+            if (running && !DarkDialog.Confirm(FindForm(), $"Change the {channel.Name} holdback during a run?",
+                    $"The {channel.Name} controller is running a program. The new holdback ({value:0.#} °C) applies to it straight away.",
+                    "Write", "Cancel"))
+                return;
             var (ok, stored) = await State.RunOnAsync(channel, $"Writing {channel.Name} holdback", (d, progress, ct) => d.WriteHoldback(value));
             if (ok) State.SetStatus($"{channel.Name} holdback set to {stored:0.#} °C for all its patterns", StatusKind.Success);
         }

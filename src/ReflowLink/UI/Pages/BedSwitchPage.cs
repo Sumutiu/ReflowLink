@@ -156,9 +156,17 @@ namespace ReflowLink.UI.Pages {
                 Margin = Padding.Empty,
                 Value = value,
             };
-            n.TextChanged += (o, e) => {
-                if (_loading || !n.IsValid) return;
-                apply(n.Value.Value);
+            // Applied on Enter or when leaving the box, never halfway through typing: "12" on the way to "120" s would
+            // already change the regulation of a running bed.
+            double applied = value;
+            n.Committed += (o, e) => {
+                if (_loading) return;
+                if (!n.IsValid) {
+                    n.Value = applied;
+                    return;
+                }
+                applied = n.Value.Value;
+                apply(applied);
                 State.Settings.Save();
             };
             return n;

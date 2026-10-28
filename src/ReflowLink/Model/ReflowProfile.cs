@@ -57,6 +57,10 @@ namespace ReflowLink.Model {
         [XmlArray("Steps"), XmlArrayItem("Step")]
         public List<ProfileStep> Steps { get; set; } = [];
 
+        /// <summary>Set by <see cref="Load"/> when the file needed changes to fit (too many steps, no steps). Not saved.</summary>
+        [XmlIgnore]
+        public string LoadNote { get; private set; }
+
         public ReflowProfile Clone() => new() {
             FormatVersion = FormatVersion,
             Name = Name,
@@ -129,19 +133,25 @@ namespace ReflowLink.Model {
 
         private static readonly XmlSerializer Serializer = new(typeof(ReflowProfile));
 
+        /// <summary>Saves the profile; the old file is only replaced once the new one is completely written.</summary>
         public void Save(string path) {
             var settings = new XmlWriterSettings { Indent = true, IndentChars = "  " };
-            string tmp = path + ".tmp";
-            using (var w = XmlWriter.Create(tmp, settings)) Serializer.Serialize(w, this);
-            if (File.Exists(path)) File.Delete(path);
-            File.Move(tmp, path);
+            SafeFile.Write(path, stream => {
+                using var w = XmlWriter.Create(stream, settings);
+                Serializer.Serialize(w, this);
+            });
         }
 
         public static ReflowProfile Load(string path) {
             using var r = XmlReader.Create(path);
             var p = (ReflowProfile)Serializer.Deserialize(r);
-            p.Steps ??= [];
-            if (p.Steps.Count > MaxSteps) p.Steps = [.. p.Steps.Take(MaxSteps)];
+            p.Steps = [.. (p.Steps ?? []).Where(s => s != null)];
+            if (p.Steps.Count > MaxSteps) {
+                p.LoadNote = $"The file has {p.Steps.Count} steps, but the PC410 runs at most {MaxSteps}: only the first {MaxSteps} were loaded.";
+                p.Steps = [.. p.Steps.Take(MaxSteps)];
+            } else if (p.Steps.Count == 0) {
+                p.LoadNote = "The file has no steps: the editor starts with one default step.";
+            }
             if (string.IsNullOrWhiteSpace(p.Name)) p.Name = Path.GetFileNameWithoutExtension(path);
             return p;
         }
@@ -161,6 +171,50 @@ namespace ReflowLink.Model {
     }
 
     public static class ProfileMath {
+        /// <summary>Ramps steeper than this (°C/s) risk cracking components and are flagged in the editor.</summary>
+        public const double SteepRamp = 3;
+
+        /// <summary>Seconds the curve spends above <paramref name="temperature"/> (piecewise linear between its points).</summary>
+        public static double TimeAbove(PlannedCurve curve, double temperature) {
+            double total = 0;
+            for (int i = 1; i < curve.Points.Count; i++) {
+                var a = curve.Points[i - 1];
+                var b = curve.Points[i];
+                double dt = b.Time - a.Time;
+                if (dt <= 0) continue;
+                bool aAbove = a.Temp > temperature, bAbove = b.Temp > temperature;
+                if (aAbove && bAbove) total += dt;
+                else if (aAbove != bAbove) {
+                    // Crosses the line: count the part above it.
+                    double f = (temperature - a.Temp) / (b.Temp - a.Temp);
+                    total += aAbove ? f * dt : (1 - f) * dt;
+                }
+            }
+            return total;
+        }
+
+        /// <summary>Lists how pattern <paramref name="b"/> differs from the editor's profile <paramref name="a"/> (bed targets when <paramref name="bed"/>).</summary>
+        public static List<string> Differences(ReflowProfile a, ReflowProfile b, bool bed) {
+            var c = System.Globalization.CultureInfo.InvariantCulture;
+            var list = new List<string>();
+            if (a.Steps.Count != b.Steps.Count) list.Add($"Steps: editor {a.Steps.Count}, pattern {b.Steps.Count}.");
+            for (int i = 0; i < Math.Min(a.Steps.Count, b.Steps.Count); i++) {
+                var x = a.Steps[i];
+                var y = b.Steps[i];
+                if (Math.Abs(x.RampRate - y.RampRate) > 0.011) list.Add($"Step {i + 1} ramp: editor {x.RampRate.ToString("0.##", c)}, pattern {y.RampRate.ToString("0.##", c)} °C/s.");
+                if (Math.Abs(x.Target - y.Target) > 0.11) list.Add($"Step {i + 1} target: editor {x.Target.ToString("0.#", c)}, pattern {y.Target.ToString("0.#", c)} °C.");
+                if (x.HoldSeconds != y.HoldSeconds) list.Add($"Step {i + 1} hold: editor {x.HoldSeconds} s, pattern {y.HoldSeconds} s.");
+                if (bed && Math.Abs(x.BedTarget - y.BedTarget) > 0.11) list.Add($"Step {i + 1} bed target: editor {x.BedTarget.ToString("0.#", c)}, pattern {y.BedTarget.ToString("0.#", c)} °C.");
+            }
+            if (a.Holdback.HasValue && b.Holdback.HasValue && Math.Abs(a.Holdback.Value - b.Holdback.Value) > 0.05)
+                list.Add($"Holdback: editor {a.Holdback.Value.ToString("0.#", c)}, controller {b.Holdback.Value.ToString("0.#", c)} °C.");
+            return list;
+        }
+
+        /// <summary>The steepest ramp rate of the profile (°C/s); 0 without steps.</summary>
+        public static double SteepestRamp(ReflowProfile profile) =>
+            profile.Steps.Count == 0 ? 0 : profile.Steps.Max(s => s.RampRate);
+
         /// <summary>Ideal setpoint trajectory of a profile when started from <paramref name="startTemp"/>.</summary>
         public static PlannedCurve BuildPlannedCurve(ReflowProfile profile, double startTemp) {
             var c = new PlannedCurve();

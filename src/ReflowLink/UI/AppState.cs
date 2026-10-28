@@ -41,7 +41,9 @@ namespace ReflowLink.UI {
 
     /// <summary>Shared application state passed to every page.</summary>
     public sealed class AppState {
-        private int _busy;
+        private int _busy, _stopping;
+        // Cancelled by Stop, so a long operation (reading or writing a pattern) frees the bus at its next step.
+        private CancellationTokenSource _opCts;
 
         public AppState(AppSettings settings, DeviceService device, DeviceService bed) {
             Settings = settings;
@@ -49,9 +51,26 @@ namespace ReflowLink.UI {
             BedChannel = new ControllerChannel("Bed Heat", "Bed", bed, true);
             // The bed switch handles each poll before the coordinator, so Wait for Bed sees the bed values of the same poll.
             BedSwitch = new BedSwitchController(device, settings) { KnownPattern = slot => slot is >= 0 and <= 9 ? SlotProfiles[slot] : null };
-            Sync = new SyncCoordinator(device, bed);
+            Sync = new SyncCoordinator(device, bed) { MaxWaitMinutes = settings.MaxWaitMinutes };
+            Sync.PairedHint = BedSwitch.PairedHint = settings.SegmentsPaired;
+            Sync.PairedDetected += LearnPairedSegments;
+            BedSwitch.PairedDetected += LearnPairedSegments;
             _blockedSlots = [.. settings.BlockedPatterns];
+            _irUnits = settings.Units;
+            _bedUnits = settings.Bed.Units;
+            _warnOnUnitChange = settings.StationChosen;
             ApplyBedMode();
+        }
+
+        private ControllerUnits _irUnits, _bedUnits;
+        private bool _warnOnUnitChange;
+
+        /// <summary>A run showed that the controllers count ramp and dwell as separate segments: remember it.</summary>
+        private void LearnPairedSegments() {
+            if (Settings.SegmentsPaired) return;
+            Settings.SegmentsPaired = true;
+            Sync.PairedHint = BedSwitch.PairedHint = true;
+            Settings.Save();
         }
 
         public AppSettings Settings { get; }
@@ -110,7 +129,11 @@ namespace ReflowLink.UI {
         /// <summary>Raised after the bed heat hardware (<see cref="BedMode"/>) or an IN2 reading is switched.</summary>
         public event Action BedEnabledChanged;
 
-        public bool Busy => _busy > 0;
+        /// <summary>An operation or a Stop is talking to the controllers.</summary>
+        public bool Busy => _busy > 0 || _stopping > 0;
+
+        /// <summary>Counts Stop requests, so an operation that finishes after a Stop can tell it was overtaken.</summary>
+        public int StopCount { get; private set; }
 
         /// <summary>True while either controller's auto-tune runs.</summary>
         public bool AutoTuneRunning => Ir.AutoTuneRunning || BedChannel.AutoTuneRunning;
@@ -118,11 +141,17 @@ namespace ReflowLink.UI {
         /// <summary>
         /// Changes the bed heat hardware. Leaving single PC410 control switches OUT2 off first, since nothing would
         /// regulate the bed any more; if that can't be confirmed nothing changes and false is returned, unless
-        /// <paramref name="force"/> is set.
+        /// <paramref name="forceIfNotOff"/> says to go ahead anyway.
         /// </summary>
-        public bool SetBedMode(BedMode mode, bool force = false) {
+        public bool SetBedMode(BedMode mode, Func<bool> forceIfNotOff = null) {
             if (Settings.Bed.Mode == mode) return true;
-            if (SingleBed && Device.IsConnected && !BedSwitch.SwitchOffNow() && !force) return false;
+            if (SingleBed && Device.IsConnected) {
+                bool off = BusyDialog.Run(Owner, "Switching the bed off…", () => BedSwitch.SwitchOffAsync());
+                if (!off && (forceIfNotOff == null || !forceIfNotOff())) {
+                    BedSwitch.ResumeAfterSwitchOff();
+                    return false;
+                }
+            }
             Settings.Bed.Mode = mode;
             Settings.Bed.Enabled = mode == BedMode.SecondPc410;
             ApplyBedMode();
@@ -183,23 +212,64 @@ namespace ReflowLink.UI {
             for (int i = 0; i < 10; i++) yield return SlotLabel(i);
         }
 
-        public void SetStatus(string message, StatusKind kind = StatusKind.Normal) => StatusChanged?.Invoke(message, kind);
+        public void SetStatus(string message, StatusKind kind = StatusKind.Normal) {
+            AppLog.Write(kind switch { StatusKind.Error => "ERROR", StatusKind.Warning => "WARN", _ => "INFO" }, message);
+            StatusChanged?.Invoke(message, kind);
+        }
+
+        /// <summary>
+        /// A stop is about to be sent: counts it (so a start finishing afterwards isn't set up as a run) and cancels the
+        /// operation in progress.
+        /// </summary>
+        public void BeginStop() {
+            StopCount++;
+            CancelOperation();
+        }
+
+        /// <summary>Cancels the operation in progress at its next step (used by Stop and before exiting).</summary>
+        public void CancelOperation() {
+            try { _opCts?.Cancel(); } catch (ObjectDisposedException) { }
+        }
 
         public void Navigate(string page) => NavigateRequested?.Invoke(page);
 
-        /// <summary>Selects a station: applies its temperature limit and units, saves, and notifies the UI.</summary>
-        public void ChangeStation(string id) {
-            Settings.SelectStation(id);
+        /// <summary>Selects a station: applies its temperature limit (unless kept) and units, saves, and notifies the UI.</summary>
+        public void ChangeStation(string id, bool keepLimit = false) {
+            Settings.SelectStation(id, keepLimit);
             ApplyStation();
         }
 
-        /// <summary>Call after the generic station's units (or the bed controller's units) were edited.</summary>
+        /// <summary>
+        /// Call after the station, the generic station's units or the bed controller's units changed. When the units
+        /// change, the patterns already in the controller were written for the old ones: what ReflowLink knew about them
+        /// is forgotten, and the user is told.
+        /// </summary>
         public void ApplyStation() {
-            Device.SetUnits(Settings.Units);
-            Bed.SetUnits(Settings.Bed.Units);
+            var ir = Settings.Units;
+            var bed = Settings.Bed.Units;
+            bool irChanged = !SameUnits(ir, _irUnits);
+            bool bedChanged = DualBed && !SameUnits(bed, _bedUnits);
+            _irUnits = ir;
+            _bedUnits = bed;
+            Device.SetUnits(ir);
+            Bed.SetUnits(bed);
+            Sync.PairedHint = BedSwitch.PairedHint = Settings.SegmentsPaired;
             Settings.Save();
+            if ((irChanged || bedChanged) && _warnOnUnitChange) {
+                Array.Clear(SlotProfiles, 0, SlotProfiles.Length);
+                SlotProfilesChanged?.Invoke();
+                string which = irChanged && bedChanged ? "both controllers" : irChanged ? "the Top IR controller" : "the Bed Heat controller";
+                DarkDialog.Show(Owner, "Controller units changed",
+                    $"The ramp and hold units of {which} changed. Patterns already stored in the controller were written for the old units, "
+                    + "so ReflowLink now reads their ramps and holds differently.\n\nRead each pattern back on the Profiles page and check it, "
+                    + "or write your profiles again, before running them.", DialogTone.Warning, ["OK"]);
+            }
+            _warnOnUnitChange = true;
             StationChanged?.Invoke();
         }
+
+        private static bool SameUnits(ControllerUnits a, ControllerUnits b) =>
+            a != null && b != null && a.Ramp == b.Ramp && a.Dwell == b.Dwell;
 
         public bool EnsureConnected() => EnsureConnected(Ir);
 
@@ -221,7 +291,7 @@ namespace ReflowLink.UI {
 
         /// <summary>Runs an exclusive operation on one controller.</summary>
         public Task<(bool ok, T result)> RunOnAsync<T>(ControllerChannel channel, string label, Func<Pc410Device, IProgress<OperationProgress>, CancellationToken, T> op) =>
-            RunCoreAsync(label, () => EnsureConnected(channel), progress => channel.Device.RunAsync(d => op(d, progress, CancellationToken.None)));
+            RunCoreAsync(label, () => EnsureConnected(channel), (progress, ct) => channel.Device.RunAsync(d => op(d, progress, ct)));
 
         public Task<(bool ok, bool result)> RunOnAsync(ControllerChannel channel, string label, Action<Pc410Device> op) =>
             RunOnAsync(channel, label, (d, p, ct) => { op(d); return true; });
@@ -231,45 +301,82 @@ namespace ReflowLink.UI {
         /// PC410 controls the bed.
         /// </summary>
         public Task<(bool ok, T result)> RunPairAsync<T>(string label, Func<Pc410Device, Pc410Device, IProgress<OperationProgress>, CancellationToken, T> op) =>
-            RunCoreAsync(label, EnsurePairConnected, progress =>
-                DeviceService.RunBothAsync(Device, DualBed ? Bed : null, (ir, bed) => op(ir, bed, progress, CancellationToken.None)));
+            RunCoreAsync(label, EnsurePairConnected, (progress, ct) =>
+                DeviceService.RunBothAsync(Device, DualBed ? Bed : null, (ir, bed) => op(ir, bed, progress, ct)));
 
         /// <summary>
-        /// Stops the program on every connected controller. Unlike <see cref="RunPairAsync{T}"/> it doesn't need both to
-        /// be connected, so Stop still works when one of them is offline.
+        /// Stops the program on every connected controller. It never waits for, or is refused by, another operation:
+        /// that operation is cancelled at its next step, and Stop is sent as soon as each controller's bus is free. Unlike
+        /// <see cref="RunPairAsync{T}"/> it doesn't need both controllers connected, so Stop still works when one is offline.
+        /// Returns false (after telling the user) when a controller didn't take the command.
         /// </summary>
-        public Task<(bool ok, bool result)> StopAllAsync() =>
-            RunCoreAsync("Stopping the program", () => Device.IsConnected || (DualBed && Bed.IsConnected) || EnsureConnected(Ir), async progress => {
-                var errors = new List<string>();
-                foreach (var ch in new[] { Ir, BedChannel }) {
-                    if (!ch.Device.IsConnected || (ch.IsBed && !DualBed)) continue;
-                    try { await ch.Device.RunAsync(d => d.Stop()); } catch (Exception ex) { errors.Add($"{ch.Name}: {DeviceService.Describe(ex)}"); }
-                }
-                if (errors.Count > 0) throw new Pc410Exception("Couldn't stop every controller. " + string.Join(" ", errors));
+        public async Task<bool> StopAllAsync() {
+            var targets = new[] { Ir, BedChannel }.Where(ch => ch.Device.IsConnected && (!ch.IsBed || DualBed)).ToList();
+            if (targets.Count == 0) {
+                EnsureConnected(Ir);
+                return false;
+            }
+            BeginStop();
+            _stopping++;
+            BusyChanged?.Invoke();
+            SetStatus("Stopping the program…");
+            string[] errors;
+            try {
+                // Each controller gets its Stop as soon as its own bus is free; one waiting doesn't delay the other.
+                errors = await Task.WhenAll(targets.Select(async ch => {
+                    try {
+                        await ch.Device.RunAsync(d => d.Stop());
+                        return null;
+                    } catch (Exception ex) {
+                        return $"{ch.Name}: {DeviceService.Describe(ex)}";
+                    }
+                }));
+            } finally {
+                _stopping--;
+                BusyChanged?.Invoke();
+                Device.PollNow();
+                Bed.PollNow();
+            }
+            var failed = errors.Where(e => e != null).ToList();
+            if (failed.Count == 0) {
+                SetStatus("Stop sent", StatusKind.Success);
                 return true;
-            });
+            }
+            string msg = "Couldn't stop every controller. " + string.Join(" ", failed);
+            SetStatus(msg, StatusKind.Error);
+            DarkDialog.Error(Owner, "Stop failed", msg + "\n\nStop the program on the station's front panel.");
+            return false;
+        }
 
-        private async Task<(bool ok, T result)> RunCoreAsync<T>(string label, Func<bool> ensure, Func<IProgress<OperationProgress>, Task<T>> run) {
+        private async Task<(bool ok, T result)> RunCoreAsync<T>(string label, Func<bool> ensure, Func<IProgress<OperationProgress>, CancellationToken, Task<T>> run) {
             if (!ensure()) return (false, default(T));
             if (Busy) {
                 SetStatus("Another operation is still running…", StatusKind.Warning);
                 return (false, default(T));
             }
             _busy++;
+            var cts = new CancellationTokenSource();
+            _opCts = cts;
+            int stops = StopCount;
             BusyChanged?.Invoke();
             ProgressChanged?.Invoke(-1);
             SetStatus(label + "…");
             var progress = new Progress<OperationProgress>(p => {
                 ProgressChanged?.Invoke(p.Total > 0 ? p.Done / (double)p.Total : -1);
-                if (!string.IsNullOrEmpty(p.Text)) SetStatus(p.Text);
+                // Shown, but not logged: every step of every operation would flood the event log.
+                if (!string.IsNullOrEmpty(p.Text)) StatusChanged?.Invoke(p.Text, StatusKind.Normal);
             });
             try {
-                var r = await run(progress);
+                var r = await run(progress, cts.Token);
                 SetStatus(label + " — done", StatusKind.Success);
                 return (true, r);
+            } catch (OperationCanceledException) {
+                SetStatus(label + " — cancelled by Stop", StatusKind.Warning);
+                return (false, default(T));
             } catch (ProfileRejectedException ex) {
                 if (ex.PatternChanged) BlockSlot(ex.Slot);
-                string title = ex.PatternChanged ? "Profile rejected by the controller" : label + " refused";
+                string title = ex.Interrupted && stops != StopCount ? label + " stopped"
+                    : ex.PatternChanged ? "Profile rejected by the controller" : label + " refused";
                 SetStatus(title, StatusKind.Error);
                 DarkDialog.Error(Owner, title, ex.Message);
                 return (false, default(T));
@@ -279,6 +386,8 @@ namespace ReflowLink.UI {
                 DarkDialog.Error(Owner, label + " failed", msg);
                 return (false, default(T));
             } finally {
+                if (_opCts == cts) _opCts = null;
+                cts.Dispose();
                 _busy--;
                 ProgressChanged?.Invoke(null);
                 BusyChanged?.Invoke();

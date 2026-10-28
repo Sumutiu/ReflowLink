@@ -195,6 +195,7 @@ namespace ReflowLink.Protocol {
         private static string F1(double v) => v.ToString("0.0", CultureInfo.InvariantCulture);
 
         private string HandleRead(string mn) {
+            if (MissingParameters.Contains(mn)) return null;
             switch (mn) {
                 case "PV": return F1(Math.Round(_pv + (_rng.NextDouble() - 0.5) * 0.3, 1));
                 case "SP": return F1(_state == ProgramState.Idle ? ParseOr(_misc["SL"], 25) : _sp);
@@ -214,7 +215,6 @@ namespace ReflowLink.Protocol {
                 };
             }
             if (HideSetpointLimits && mn is "HS" or "LS") return null;
-            if (MissingParameters.Contains(mn)) return null;
             return _misc.TryGetValue(mn, out var val) ? val : null; // unknown parameter: silence
         }
 

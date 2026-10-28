@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
+using System.Linq;
 using System.Windows.Forms;
 
 namespace ReflowLink.UI.Controls {
@@ -18,6 +19,8 @@ namespace ReflowLink.UI.Controls {
         /// <summary>Plot against the right-hand 0..100 % axis.</summary>
         public bool Secondary;
         public bool Visible = true;
+        /// <summary>Switched off by clicking its legend entry (separate from <see cref="Visible"/>, which the page controls).</summary>
+        public bool Hidden;
         public bool ShowInLegend = true;
         public string Unit = "°C";
         public string Format = "0.0";
@@ -47,10 +50,44 @@ namespace ReflowLink.UI.Controls {
     public class ChartView : Control {
         private Point? _mouse;
 
+        private List<(ChartSeries Series, Rectangle Bounds)> _legend = [];
+
         public ChartView() {
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
             BackColor = Theme.Surface;
             Font = Theme.Small;
+        }
+
+        /// <summary>Drawn: shown by the page and not switched off in the legend.</summary>
+        private static bool Drawn(ChartSeries s) => s.Visible && !s.Hidden;
+
+        /// <summary>Lays the legend out from left to right, wrapping onto more rows when it doesn't fit.</summary>
+        private List<(ChartSeries Series, Rectangle Bounds)> LayoutLegend(int left, int right) {
+            var items = new List<(ChartSeries, Rectangle)>();
+            int x = left, row = 0, rowH = Theme.S(22);
+            for (int si = Series.Count - 1; si >= 0; si--) {
+                var s = Series[si];
+                if (!s.ShowInLegend) continue;
+                int w = Theme.S(22) + TextRenderer.MeasureText(s.Name, Font).Width + Theme.S(4);
+                if (x > left && x + w > right) {
+                    row++;
+                    x = left;
+                }
+                items.Add((s, new Rectangle(x, Theme.S(2) + row * rowH, w, rowH)));
+                x += w + Theme.S(12);
+            }
+            return items;
+        }
+
+        protected override void OnMouseClick(MouseEventArgs e) {
+            base.OnMouseClick(e);
+            if (e.Button != MouseButtons.Left) return;
+            foreach (var (s, r) in _legend) {
+                if (!r.Contains(e.Location)) continue;
+                s.Hidden = !s.Hidden;
+                Invalidate();
+                return;
+            }
         }
 
         public readonly List<ChartSeries> Series = [];
@@ -77,13 +114,20 @@ namespace ReflowLink.UI.Controls {
             return t >= 3600 ? $"{t / 3600}:{t / 60 % 60:00}:{t % 60:00}" : $"{t / 60}:{t % 60:00}";
         }
 
-        protected override void OnMouseMove(MouseEventArgs e) { base.OnMouseMove(e); _mouse = e.Location; Invalidate(); }
+        protected override void OnMouseMove(MouseEventArgs e) {
+            base.OnMouseMove(e);
+            _mouse = e.Location;
+            bool overLegend = false;
+            foreach (var (_, r) in _legend) overLegend |= r.Contains(e.Location);
+            Cursor = overLegend ? Cursors.Hand : Cursors.Default;
+            Invalidate();
+        }
         protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); _mouse = null; Invalidate(); }
 
         private void DataRange(out double xmin, out double xmax, out double ymin, out double ymax, out bool any) {
             xmin = double.MaxValue; xmax = double.MinValue; ymin = double.MaxValue; ymax = double.MinValue; any = false;
             foreach (var s in Series) {
-                if (!s.Visible || s.Points.Count == 0) continue;
+                if (!Drawn(s) || s.Points.Count == 0) continue;
                 any = true;
                 xmin = Math.Min(xmin, s.Points[0].X);
                 xmax = Math.Max(xmax, s.Points[s.Points.Count - 1].X);
@@ -94,7 +138,7 @@ namespace ReflowLink.UI.Controls {
             if (xmax - xmin < MinXSpan) xmax = xmin + MinXSpan;
 
             foreach (var s in Series) {
-                if (!s.Visible || s.Secondary) continue;
+                if (!Drawn(s) || s.Secondary) continue;
                 int i0 = LowerBound(s.Points, xmin);
                 if (i0 > 0) i0--;
                 for (int i = i0; i < s.Points.Count; i++) {
@@ -144,8 +188,10 @@ namespace ReflowLink.UI.Controls {
             ymax = Math.Ceiling(ymax / yStep) * yStep;
             ymin = Math.Floor(ymin / yStep) * yStep;
 
-            int legendH = ShowLegend ? Theme.S(26) : 0;
-            int left = Theme.S(44), right = ShowSecondaryAxis ? Theme.S(42) : Theme.S(14), top = legendH + Theme.S(8), bottom = Theme.S(26);
+            int left = Theme.S(44), right = ShowSecondaryAxis ? Theme.S(42) : Theme.S(14), bottom = Theme.S(26);
+            _legend = ShowLegend ? LayoutLegend(left, Width - right) : [];
+            int legendH = _legend.Count == 0 ? (ShowLegend ? Theme.S(26) : 0) : _legend.Max(l => l.Bounds.Bottom) + Theme.S(4);
+            int top = legendH + Theme.S(8);
             var plot = new Rectangle(left, top, Math.Max(10, Width - left - right), Math.Max(10, Height - top - bottom));
 
             float X(double x) => (float)(plot.Left + (x - xmin) / (xmax - xmin) * plot.Width);
@@ -211,7 +257,7 @@ namespace ReflowLink.UI.Controls {
             var oldClip = g.Clip;
             g.SetClip(new Rectangle(plot.Left, plot.Top - 2, plot.Width + 1, plot.Height + 3));
             foreach (var s in Series) {
-                if (!s.Visible || s.Points.Count == 0) continue;
+                if (!Drawn(s) || s.Points.Count == 0) continue;
                 var pts = Project(s, xmin, xmax, plot.Width, s.Secondary ? (Func<double, float>)Y2 : Y, X);
                 if (pts.Count < 1) continue;
                 if (pts.Count == 1) pts.Add(new PointF(pts[0].X + 0.5f, pts[0].Y));
@@ -229,19 +275,19 @@ namespace ReflowLink.UI.Controls {
             if (!any)
                 TextRenderer.DrawText(g, EmptyText, Theme.Body, plot, Theme.TextFaint, Theme.CenterMiddle);
 
-            // Legend
-            if (ShowLegend) {
-                int lx = left;
-                for (int si = Series.Count - 1; si >= 0; si--) {
-                    var s = Series[si];
-                    if (!s.ShowInLegend) continue;
-                    var c = s.Visible ? s.Color : Theme.TextFaint;
-                    using (var pen = new Pen(c, Theme.Sf(2.5f)) { DashStyle = s.Dashed ? DashStyle.Dash : DashStyle.Solid })
-                        g.DrawLine(pen, lx, Theme.S(13), lx + Theme.S(16), Theme.S(13));
-                    var sz = TextRenderer.MeasureText(g, s.Name, Font);
-                    TextRenderer.DrawText(g, s.Name, Font, new Point(lx + Theme.S(22), Theme.S(13) - sz.Height / 2), s.Visible ? Theme.TextDim : Theme.TextFaint, TextFormatFlags.NoPadding);
-                    lx += Theme.S(34) + sz.Width;
-                }
+            // Legend: click an entry to hide or show its curve.
+            foreach (var (s, r) in _legend) {
+                bool drawn = Drawn(s);
+                var c = drawn ? s.Color : Theme.WithAlpha(Theme.TextFaint, 120);
+                int cy = r.Top + r.Height / 2;
+                using (var pen = new Pen(c, Theme.Sf(2.5f)) { DashStyle = s.Dashed ? DashStyle.Dash : DashStyle.Solid })
+                    g.DrawLine(pen, r.Left, cy, r.Left + Theme.S(16), cy);
+                var sz = TextRenderer.MeasureText(g, s.Name, Font);
+                var textPos = new Point(r.Left + Theme.S(22), cy - sz.Height / 2);
+                TextRenderer.DrawText(g, s.Name, Font, textPos, drawn ? Theme.TextDim : Theme.TextFaint, TextFormatFlags.NoPadding);
+                if (s.Hidden)
+                    using (var pen = new Pen(Theme.TextFaint))
+                        g.DrawLine(pen, textPos.X, cy, textPos.X + sz.Width, cy);
             }
 
             // Hover read-out
@@ -253,7 +299,7 @@ namespace ReflowLink.UI.Controls {
                 var lines = new List<KeyValuePair<Color, string>> { new(Theme.TextDim, XLabel(hx)) };
                 for (int si = Series.Count - 1; si >= 0; si--) {
                     var s = Series[si];
-                    if (!s.Visible || s.Points.Count == 0 || !s.ShowInLegend) continue;
+                    if (!Drawn(s) || s.Points.Count == 0 || !s.ShowInLegend) continue;
                     int i = LowerBound(s.Points, hx);
                     if (i >= s.Points.Count) i = s.Points.Count - 1;
                     if (i > 0 && Math.Abs(s.Points[i - 1].X - hx) < Math.Abs(s.Points[i].X - hx)) i--;

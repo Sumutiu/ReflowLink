@@ -62,6 +62,10 @@ namespace ReflowLink.Protocol {
                         last = ex;
                         Log(TrafficKind.Error, null, $"Read {mnemonic}: {ex.Message}" + (attempt < Retries ? " — retrying" : ""));
                         Thread.Sleep(40);
+                    } catch (Exception ex) when (Pc410PortException.IsPortError(ex)) {
+                        // The port itself failed: retrying won't help, and callers handle it like any controller error.
+                        Log(TrafficKind.Error, null, $"Read {mnemonic}: serial port error: {ex.Message}");
+                        throw new Pc410PortException(ex);
                     }
                 }
                 throw last;
@@ -79,6 +83,9 @@ namespace ReflowLink.Protocol {
                         last = ex;
                         Log(TrafficKind.Error, null, $"Write {mnemonic}={data}: {ex.Message}" + (attempt < Retries ? " — retrying" : ""));
                         Thread.Sleep(40);
+                    } catch (Exception ex) when (Pc410PortException.IsPortError(ex)) {
+                        Log(TrafficKind.Error, null, $"Write {mnemonic}={data}: serial port error: {ex.Message}");
+                        throw new Pc410PortException(ex);
                     }
                 }
                 throw last;

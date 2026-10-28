@@ -65,6 +65,21 @@ namespace ReflowLink.Model {
         /// </summary>
         public List<PatternSync> PatternSyncs { get; set; } = [];
 
+        /// <summary>
+        /// The controllers were seen counting ramp and dwell as separate segments (a step is two segments). Learned during a
+        /// run and kept, so Wait for Bed / Wait for IR and the step display are right from the start of the next run.
+        /// </summary>
+        public bool SegmentsPaired { get; set; }
+
+        /// <summary>Longest Wait for Bed / Wait for IR hold before ReflowLink asks what to do (minutes; 0 = no limit).</summary>
+        public double MaxWaitMinutes { get; set; } = 10;
+
+        /// <summary>P, I and D of the Top IR controller from before its last auto-tune, so they can be put back.</summary>
+        public TuningBackup IrTuningBackup { get; set; }
+
+        /// <summary>P, I and D of the second PC410 from before its last auto-tune.</summary>
+        public TuningBackup BedTuningBackup { get; set; }
+
         // Profiles
         public double MaxTemperature { get; set; } = StationModel.DefaultMaxTemperature;
         public UnusedStepMode UnusedSteps { get; set; } = UnusedStepMode.Zeros;
@@ -73,12 +88,25 @@ namespace ReflowLink.Model {
         public string LastProfilePath { get; set; } = "";
         /// <summary>Controller patterns that were left with rejected or partial settings; they can't be started until rewritten.</summary>
         public List<int> BlockedPatterns { get; set; } = [];
+        /// <summary>
+        /// Pattern being written right now (-1 = none), saved before the write starts. Still set when the settings are
+        /// loaded means ReflowLink closed (or crashed, or lost power) during the write, so the pattern gets blocked.
+        /// </summary>
+        public int WritingPattern { get; set; } = -1;
+        /// <summary>Set when loading found an interrupted write: the pattern that was blocked for it. Not saved.</summary>
+        [XmlIgnore]
+        public int? InterruptedWrite { get; private set; }
         public int LastSlot { get; set; } = 0;
 
         // Logging
         public bool AutoRecordRuns { get; set; } = true;
         public int RecordAfterRunSeconds { get; set; } = 60;
         public string LogFolder { get; set; } = "";
+        /// <summary>
+        /// Write CSV recordings with this PC's list separator and decimal mark (so Excel opens them in columns here) instead
+        /// of commas and points.
+        /// </summary>
+        public bool CsvLocalFormat { get; set; }
 
         // Window
         public int WindowX { get; set; } = int.MinValue;
@@ -89,6 +117,10 @@ namespace ReflowLink.Model {
 
         [XmlIgnore]
         public StationModel Station => StationCatalog.Find(StationId);
+
+        /// <summary>Set when the settings file couldn't be read: what happened, for the user. Not saved.</summary>
+        [XmlIgnore]
+        public string LoadWarning { get; private set; }
 
         /// <summary>Units the controller of the selected station is configured for.</summary>
         [XmlIgnore]
@@ -122,12 +154,17 @@ namespace ReflowLink.Model {
             if (profile != null) PatternSyncs.Add(PatternSync.From(pattern, profile, withBedTargets));
         }
 
-        /// <summary>Selects a station and applies its temperature limit.</summary>
-        public void SelectStation(string id) {
+        /// <summary>Selects a station and applies its temperature limit (unless <paramref name="keepLimit"/>).</summary>
+        public void SelectStation(string id, bool keepLimit = false) {
             var station = StationCatalog.Find(id);
+            if (station.Id != StationId) SegmentsPaired = false; // learned for the old station's controller
             StationId = station.Id;
-            MaxTemperature = station.MaxTemperature;
+            if (!keepLimit) MaxTemperature = station.MaxTemperature;
         }
+
+        /// <summary>True when the temperature limit was changed from the selected station's default.</summary>
+        [XmlIgnore]
+        public bool CustomLimit => StationChosen && Math.Abs(MaxTemperature - Station.MaxTemperature) > 0.01;
 
         [XmlIgnore]
         public string EffectiveLogFolder =>
@@ -155,12 +192,61 @@ namespace ReflowLink.Model {
 
         private static readonly XmlSerializer Serializer = new(typeof(AppSettings));
 
-        public static AppSettings Load() {
+
+        /// <summary>
+        /// Loads the settings. If the file can't be read, the copy kept from the previous save is used; if that fails too,
+        /// the defaults are used. Either way <see cref="LoadWarning"/> says so, since the settings hold safety state (the
+        /// blocked patterns, the bed targets and the temperature limits).
+        /// </summary>
+        public static AppSettings Load() => LoadFrom(SettingsPath, legacy: true);
+
+        /// <summary>Loads from <paramref name="path"/>, falling back to its backup (path + ".bak").</summary>
+        internal static AppSettings LoadFrom(string path, bool legacy = false) {
+            string backupPath = path + ".bak";
+            string error = null;
+            if (File.Exists(path)) {
+                try {
+                    return Read(path).Sanitize();
+                } catch (Exception ex) {
+                    error = ex.GetBaseException().Message;
+                    SetAside(path);
+                }
+            }
+            if (File.Exists(backupPath)) {
+                try {
+                    var s = Read(backupPath).Sanitize();
+                    // Also when the main file is missing: a save was interrupted between removing it and putting the new one in place.
+                    s.LoadWarning = (error != null ? $"ReflowLink's settings file couldn't be read ({error})" : "ReflowLink's settings file was missing")
+                        + ", so the copy kept from the save before it was used. The most recent changes may be missing: check Settings, "
+                        + "and write your profiles to the controller again if a pattern was being written.";
+                    return s;
+                } catch (Exception ex) {
+                    error ??= ex.GetBaseException().Message;
+                }
+            }
+            if (error == null && legacy) {
+                try {
+                    if (File.Exists(LegacySettingsPath)) return MigrateFromIr6500Studio();
+                } catch { /* old settings unreadable: start fresh */ }
+            }
+            var d = new AppSettings { SettingsVersion = CurrentVersion };
+            if (error != null) {
+                d.LoadWarning = $"ReflowLink's settings couldn't be read ({error}), so it started with the default settings. "
+                    + "Check the station, connections and temperature limits in Settings. Patterns that were blocked after a rejected write "
+                    + "and the bed targets saved per pattern are lost: write your profiles to the controller again before running them.";
+            }
+            return d;
+        }
+
+        /// <summary>Keeps an unreadable settings file for inspection, out of the way of the next save.</summary>
+        private static void SetAside(string path) {
             try {
-                if (File.Exists(SettingsPath)) return Read(SettingsPath).Sanitize();
-                if (File.Exists(LegacySettingsPath)) return MigrateFromIr6500Studio();
-            } catch { /* corrupt settings: fall back to defaults */ }
-            return new AppSettings { SettingsVersion = CurrentVersion };
+                string target = Path.Combine(Path.GetDirectoryName(path), $"{Path.GetFileNameWithoutExtension(path)}.unreadable-{DateTime.Now:yyyyMMdd-HHmmss}.xml");
+                File.Move(path, target);
+            } catch {
+                // It must not stay: the next save would turn it into the backup, over the good copy.
+                try { File.Delete(path); } catch { }
+            }
         }
 
         private static AppSettings Read(string path) {
@@ -192,12 +278,16 @@ namespace ReflowLink.Model {
                 ? DocumentsFolder + path.Substring(LegacyDocumentsFolder.Length)
                 : path;
 
+        /// <summary>Saves the settings without ever leaving a half-written file; the previous file is kept as a backup.</summary>
         public void Save() {
-            try {
-                Directory.CreateDirectory(SettingsFolder);
-                using var w = XmlWriter.Create(SettingsPath, new XmlWriterSettings { Indent = true });
+            try { SaveTo(SettingsPath); } catch { /* settings are best-effort */ }
+        }
+
+        internal void SaveTo(string path) {
+            SafeFile.Write(path, stream => {
+                using var w = XmlWriter.Create(stream, new XmlWriterSettings { Indent = true });
                 Serializer.Serialize(w, this);
-            } catch { /* settings are best-effort */ }
+            }, path + ".bak");
         }
 
         internal AppSettings Sanitize() {
@@ -216,11 +306,25 @@ namespace ReflowLink.Model {
             if (SimulatorSpeed is < 1 or > 50) SimulatorSpeed = 1;
             if (LastSlot is < 0 or > 9) LastSlot = 0;
             BlockedPatterns = [.. (BlockedPatterns ?? []).Where(p => p is >= 0 and <= 9).Distinct()];
+            if (WritingPattern is >= 0 and <= 9) {
+                InterruptedWrite = WritingPattern;
+                if (!BlockedPatterns.Contains(WritingPattern)) BlockedPatterns.Add(WritingPattern);
+            }
+            WritingPattern = -1;
             Bed = (Bed ?? new BedSettings()).Sanitize();
             PatternSyncs = [.. (PatternSyncs ?? []).Where(p => p != null && p.Pattern is >= 0 and <= 9).GroupBy(p => p.Pattern).Select(g => g.Last())];
             RecordAfterRunSeconds = Math.Max(0, Math.Min(3600, RecordAfterRunSeconds));
+            MaxWaitMinutes = double.IsNaN(MaxWaitMinutes) ? 10 : Math.Max(0, Math.Min(240, MaxWaitMinutes));
             return this;
         }
+    }
+
+    /// <summary>P, I and D saved before an auto-tune replaced them.</summary>
+    public sealed class TuningBackup {
+        [XmlAttribute("p")] public double P { get; set; }
+        [XmlAttribute("i")] public double I { get; set; }
+        [XmlAttribute("d")] public double D { get; set; }
+        [XmlAttribute("saved")] public DateTime Saved { get; set; }
     }
 
     /// <summary>How to reach one PC410 (built from the settings; not saved).</summary>
@@ -433,43 +537,74 @@ namespace ReflowLink.Model {
         }
     }
 
-    /// <summary>Writes telemetry to a CSV file (invariant culture, Excel-friendly).</summary>
+    /// <summary>
+    /// Writes telemetry to a CSV file: commas and decimal points by default, or this PC's list separator and decimal mark
+    /// so Excel opens it in columns. Optional "# " lines before the column names describe the run.
+    /// </summary>
     public sealed class CsvRecorder : IDisposable {
+        /// <summary>Lines before the column names start with this.</summary>
+        public const string MetadataPrefix = "# ";
+
         private readonly StreamWriter _w;
         private readonly DateTime _start;
         private readonly bool _withBed, _withOut2, _withIrIn2, _withBedIn2;
+        private readonly CultureInfo _culture;
+        private readonly string _sep;
 
         /// <param name="withBed">Adds the bed heat controller's columns.</param>
         /// <param name="withOut2">Adds whether OUT2 was switched on (single PC410 bed control).</param>
         /// <param name="withIrIn2">Adds the Top IR controller's IN2 reading (information only).</param>
         /// <param name="withBedIn2">Adds the second PC410's IN2 reading (information only).</param>
-        public CsvRecorder(string folder, string label, bool withBed = false, bool withOut2 = false, bool withIrIn2 = false, bool withBedIn2 = false) {
+        /// <param name="localFormat">Use this PC's list separator and decimal mark instead of commas and points.</param>
+        /// <param name="metadata">Lines describing the run (station, pattern, profile…), written before the column names.</param>
+        public CsvRecorder(string folder, string label, bool withBed = false, bool withOut2 = false, bool withIrIn2 = false, bool withBedIn2 = false,
+            bool localFormat = false, IEnumerable<string> metadata = null) {
             Directory.CreateDirectory(folder);
             _start = DateTime.Now;
             _withBed = withBed;
             _withOut2 = withBed && withOut2;
             _withIrIn2 = withIrIn2;
             _withBedIn2 = withBedIn2;
+            (_culture, _sep) = Format(localFormat);
             string safe = string.IsNullOrWhiteSpace(label) ? "session" : MakeSafe(label);
-            FilePath = Path.Combine(folder, $"{_start:yyyy-MM-dd_HHmmss}_{safe}.csv");
-            _w = new StreamWriter(FilePath, false, new UTF8Encoding(true));
-            _w.WriteLine("timestamp,elapsed_s,pv_c,sp_c,output_pct,state,segment"
-                + (withBed ? ",bed_pv_c,bed_sp_c,bed_output_pct,bed_state,bed_segment,waiting" : "")
-                + (_withOut2 ? ",bed_out2" : "")
-                + (_withIrIn2 ? ",in2_top_ir_c" : "")
-                + (_withBedIn2 ? ",in2_bed_heat_c" : ""));
+            // Never overwrite an earlier recording (two runs started within the same second get a suffix).
+            FileStream fs = null;
+            for (int n = 0; fs == null; n++) {
+                FilePath = Path.Combine(folder, $"{_start:yyyy-MM-dd_HHmmss}_{safe}{(n == 0 ? "" : "_" + n)}.csv");
+                try {
+                    fs = new FileStream(FilePath, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+                } catch (IOException) when (n < 100 && File.Exists(FilePath)) { }
+            }
+            _w = new StreamWriter(fs, new UTF8Encoding(true));
+            foreach (var line in metadata ?? []) _w.WriteLine(MetadataPrefix + line.Replace("\r", " ").Replace("\n", " "));
+            var columns = new List<string> { "timestamp", "elapsed_s", "pv_c", "sp_c", "output_pct", "state", "segment" };
+            if (withBed) columns.AddRange(["bed_pv_c", "bed_sp_c", "bed_output_pct", "bed_state", "bed_segment", "waiting"]);
+            if (_withOut2) columns.Add("bed_out2");
+            if (_withIrIn2) columns.Add("in2_top_ir_c");
+            if (_withBedIn2) columns.Add("in2_bed_heat_c");
+            _w.WriteLine(string.Join(_sep, columns));
             _w.Flush();
         }
 
-        public string FilePath { get; }
+        /// <summary>Culture and separator for the numbers; a separator equal to the decimal mark falls back to ';'.</summary>
+        public static (CultureInfo Culture, string Separator) Format(bool local) {
+            if (!local) return (CultureInfo.InvariantCulture, ",");
+            var c = CultureInfo.CurrentCulture;
+            string sep = c.TextInfo.ListSeparator;
+            if (string.IsNullOrEmpty(sep) || sep == c.NumberFormat.NumberDecimalSeparator) sep = ";";
+            return (c, sep);
+        }
+
+        public string FilePath { get; private set; }
         public int Rows { get; private set; }
 
         /// <summary>Writes one row: the IR reading, and the latest bed reading when bed columns are recorded.</summary>
         /// <param name="out2">OUT2 state for the bed_out2 column: true = on, false = off, null = unknown.</param>
         public void Write(Telemetry t, Telemetry bed = null, string waiting = "", bool? out2 = null) {
-            var c = CultureInfo.InvariantCulture;
-            var line = new StringBuilder(string.Join(",",
-                t.Time.ToString("yyyy-MM-dd HH:mm:ss.fff", c),
+            var c = _culture;
+            string sep = _sep;
+            var line = new StringBuilder(string.Join(sep,
+                t.Time.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture),
                 (t.Time - _start).TotalSeconds.ToString("0.0", c),
                 t.Pv?.ToString("0.0", c) ?? "",
                 t.Sp?.ToString("0.0", c) ?? "",
@@ -477,7 +612,7 @@ namespace ReflowLink.Model {
                 t.State.ToString(),
                 t.Segment?.ToString(c) ?? ""));
             if (_withBed) {
-                line.Append(',').Append(string.Join(",",
+                line.Append(sep).Append(string.Join(sep,
                     bed?.Pv?.ToString("0.0", c) ?? "",
                     bed?.Sp?.ToString("0.0", c) ?? "",
                     bed?.Op?.ToString("0", c) ?? "",
@@ -485,12 +620,13 @@ namespace ReflowLink.Model {
                     bed?.Segment?.ToString(c) ?? "",
                     waiting ?? ""));
             }
-            if (_withOut2) line.Append(',').Append(out2 is bool on ? (on ? "1" : "0") : "");
-            if (_withIrIn2) line.Append(',').Append(t.Pv2?.ToString("0.0", c) ?? "");
-            if (_withBedIn2) line.Append(',').Append(bed?.Pv2?.ToString("0.0", c) ?? "");
+            if (_withOut2) line.Append(sep).Append(out2 is bool on ? (on ? "1" : "0") : "");
+            if (_withIrIn2) line.Append(sep).Append(t.Pv2?.ToString("0.0", c) ?? "");
+            if (_withBedIn2) line.Append(sep).Append(bed?.Pv2?.ToString("0.0", c) ?? "");
             _w.WriteLine(line.ToString());
             Rows++;
-            if (Rows % 10 == 0) _w.Flush();
+            // Every row reaches the disk: a crash or power cut loses at most the last reading.
+            _w.Flush();
         }
 
         private static string MakeSafe(string s) {

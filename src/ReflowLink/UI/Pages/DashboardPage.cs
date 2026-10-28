@@ -62,6 +62,11 @@ namespace ReflowLink.UI.Pages {
         private bool _autoRecording, _settingToggle, _userStopped, _wasActive;
         private DateTime? _autoStopAt;
         private double _lastX;
+        // Why ReflowLink stopped the run itself (a controller or the bed reading lost); null for a normal end or Stop.
+        private string _abortReason;
+
+        /// <summary>Raised when a program starts or ends (either controller running counts).</summary>
+        public event Action<bool> ActiveChanged;
 
         private static readonly string[] WindowNames = ["Current run", "Last 2 min", "Last 5 min", "Last 15 min", "Whole session"];
         private static readonly double[] WindowSeconds = [0, 120, 300, 900, 0];
@@ -104,7 +109,7 @@ namespace ReflowLink.UI.Pages {
             var export = new ModernButton("", Glyph.Image) { Margin = new Padding(0, 0, Theme.S(8), 0) };
             export.Click += (s, e) => ExportPng();
             var clear = new ModernButton("", Glyph.Trash) { Margin = Padding.Empty };
-            clear.Click += (s, e) => ClearChart();
+            clear.Click += (s, e) => ClearChart(true);
             var tip = Theme.CreateToolTip();
             tip.SetToolTip(export, "Export chart as PNG");
             tip.SetToolTip(clear, "Clear chart");
@@ -155,6 +160,9 @@ namespace ReflowLink.UI.Pages {
             _stop.Click += async (s, e) => await StopProgram();
             row.Controls.Add(_hold, 0, 0);
             row.Controls.Add(_stop, 1, 0);
+            tip.SetToolTip(_run, "Start the selected pattern (F5)");
+            tip.SetToolTip(_hold, "Hold or resume the program (F6)");
+            tip.SetToolTip(_stop, "Stop the program (F12, from any page)");
             Add(row, 8);
 
             Add(new Divider(), 12);
@@ -228,7 +236,9 @@ namespace ReflowLink.UI.Pages {
             State.Sync.Changed += () => { UpdateProgramInfo(State.Device.Last); UpdateButtons(); };
             State.Sync.CommandFailed += msg => State.SetStatus(msg, StatusKind.Error);
             State.Sync.BedLost += async () => await OnBedLost();
+            State.Sync.WaitTimeout += async msg => await OnWaitTimeout(msg);
             State.Sync.IrLost += () => {
+                _abortReason = "the Top IR controller stopped answering";
                 State.SetStatus("Top IR controller stopped answering", StatusKind.Error);
                 DarkDialog.Error(FindForm(), "Top IR controller not answering", State.SingleBed
                     ? "The Top IR controller stopped answering during the run. It keeps running its program on its own, but ReflowLink can no longer "
@@ -335,10 +345,17 @@ namespace ReflowLink.UI.Pages {
             UpdateButtons();
         }
 
-        private double X(DateTime time, DeviceService device) => (time - _sessionStart).TotalSeconds * device.TimeScale;
+        /// <summary>
+        /// Chart time of a reading: one time base for both controllers, so their curves line up even when two simulators
+        /// run at different speeds (the Top IR's speed counts while it's connected).
+        /// </summary>
+        private double X(DateTime time) {
+            double scale = State.Device.IsConnected ? State.Device.TimeScale : Dual && State.Bed.IsConnected ? State.Bed.TimeScale : 1;
+            return (time - _sessionStart).TotalSeconds * scale;
+        }
 
         private void OnTelemetry(Telemetry t) {
-            double x = X(t.Time, State.Device);
+            double x = X(t.Time);
             _lastX = x;
             if (t.Pv.HasValue) _pv.Points.Add(new PointD(x, t.Pv.Value));
             if (t.Sp.HasValue) _sp.Points.Add(new PointD(x, t.Sp.Value));
@@ -388,7 +405,9 @@ namespace ReflowLink.UI.Pages {
 
         private void OnBedTelemetry(Telemetry t) {
             if (!Bed) return;
-            double x = X(t.Time, Dual ? State.Bed : State.Device);
+            double x = X(t.Time);
+            // With the Top IR offline the bed's readings move the chart on.
+            if (!State.Device.IsConnected && x > _lastX) _lastX = x;
             if (t.Pv.HasValue) _bedPv.Points.Add(new PointD(x, t.Pv.Value));
             if (t.Sp.HasValue) _bedSp.Points.Add(new PointD(x, t.Sp.Value));
             if (t.Op.HasValue) _bedOp.Points.Add(new PointD(x, t.Op.Value));
@@ -422,8 +441,9 @@ namespace ReflowLink.UI.Pages {
 
         private static void Trim(params ChartSeries[] series) {
             const int cap = 250000;
+            // Drop the oldest tenth at once rather than one point per poll, which would move the whole list every time.
             foreach (var s in series)
-                if (s.Points.Count > cap) s.Points.RemoveRange(0, s.Points.Count - cap);
+                if (s.Points.Count > cap) s.Points.RemoveRange(0, s.Points.Count - cap + cap / 10);
         }
 
         private static double? Rate(ChartSeries series, double seconds) {
@@ -529,6 +549,8 @@ namespace ReflowLink.UI.Pages {
             bool wasActive = prev is ProgramState.Running or ProgramState.Hold;
             if (now == ProgramState.Running && !wasActive) {
                 // A run has started (from this app or the front panel).
+                _userStopped = false;
+                _abortReason = null;
                 _runStart = _lastX;
                 _runPattern = State.Device.ActivePattern;
                 _plan.Points.Clear();
@@ -575,14 +597,20 @@ namespace ReflowLink.UI.Pages {
         private void OnCombinedStateChanged() {
             bool active = Combined() is ProgramState.Running or ProgramState.Hold;
             if (active) {
-                if (!_wasActive) State.Sync.RunStarted();
+                if (!_wasActive) {
+                    State.Sync.RunStarted();
+                    ActiveChanged?.Invoke(true);
+                }
                 _wasActive = true;
                 return;
             }
             if (!_wasActive || Combined() != ProgramState.Idle) return;
             _wasActive = false;
-            State.SetStatus(_userStopped ? "Program stopped" : "Program finished", StatusKind.Success);
+            ActiveChanged?.Invoke(false);
+            if (_abortReason != null) State.SetStatus("Program aborted: " + _abortReason, StatusKind.Error);
+            else State.SetStatus(_userStopped ? "Program stopped" : "Program finished", StatusKind.Success);
             _userStopped = false;
+            _abortReason = null;
             State.Sync.Reset();
             State.Sync.Sync = null;
             if (_autoRecording && _recorder != null)
@@ -631,7 +659,18 @@ namespace ReflowLink.UI.Pages {
             _chart.Invalidate();
         }
 
-        private void ClearChart() {
+        /// <param name="ask">From the Clear button: during a run, ask first.</param>
+        private void ClearChart(bool ask = false) {
+            if (IsProgramActive) {
+                // Keep the run's time base, planned curves and step markers; only the readings so far go.
+                if (ask && !DarkDialog.Confirm(FindForm(), "Clear the chart during a run?",
+                        "The readings so far are removed from the chart (a CSV recording isn't affected). The planned curves and step markers stay.",
+                        "Clear", "Cancel"))
+                    return;
+                foreach (var s in new[] { _pv, _sp, _op, _bedPv, _bedSp, _bedOp, _irIn2, _bedIn2 }) s.Points.Clear();
+                UpdateWindow();
+                return;
+            }
             _sessionStart = DateTime.Now;
             _lastX = 0;
             foreach (var s in _chart.Series) s.Points.Clear();
@@ -660,7 +699,8 @@ namespace ReflowLink.UI.Pages {
             bool active = combined is ProgramState.Running or ProgramState.Hold;
             _run.Enabled = conn && !busy && !active;
             _slot.Enabled = !busy && !active;
-            _stop.Enabled = any && !busy;
+            // Stop is never blocked by another operation: it cancels it and is sent as soon as the bus is free.
+            _stop.Enabled = any;
             _hold.Enabled = conn && !busy && active;
             // With bed heat control the coordinator may hold one controller; Resume is about the user's own hold.
             bool resume = Bed ? State.Sync.UserHold : _state == ProgramState.Hold;
@@ -686,15 +726,19 @@ namespace ReflowLink.UI.Pages {
             if (single && !CanStartSingleBed(slot, sync)) return;
             State.Sync.Reset();
             State.Sync.Sync = null; // set once the pattern has been checked
+            int stops = State.StopCount;
             var (ok, prof) = await State.RunPairAsync(both ? $"Starting pattern {slot} on both controllers" : $"Starting pattern {slot}", (ir, bed, progress, ct) => {
                 var p = PatternPair.Check(ir, bed, slot, limit, bedLimit, progress, ct);
                 // The bed targets kept by ReflowLink must belong to the profile the pattern holds now.
                 if (single && !sync.Matches(p))
                     throw new ProfileRejectedException(slot, [$"Pattern {slot} was changed since ReflowLink saved its bed targets. Write the profile to it again."], false, false);
+                ct.ThrowIfCancellationRequested(); // Stop pressed while checking: don't start
                 PatternPair.Start(ir, bed, slot);
                 return p;
             });
-            if (!ok) return;
+            // Stop pressed while starting: the stop has gone out after the start, so don't set this run up.
+            if (!ok || State.StopCount != stops) return;
+            State.Sync.CheckedRun = true;
             if (single) {
                 State.BedSwitch.Begin(BedPlan.From(sync, State.Device.Last?.Pv ?? sync.IrTargets[0], State.BedSwitch.BedTemperature ?? sync.BedTargets[0]));
                 sync.ApplyTo(prof, true);
@@ -753,22 +797,64 @@ namespace ReflowLink.UI.Pages {
             UpdateButtons();
         }
 
-        private async Task StopProgram() {
-            _userStopped = true;
-            if (State.SingleBed) State.BedSwitch.Stop(); // the bed goes off first, whatever happens to the stop
-            if (!Bed) {
-                var (stopped, _) = await State.RunAsync("Stopping program", d => d.Stop());
-                if (!stopped) _userStopped = false;
+        /// <summary>
+        /// Stops the program on every connected controller (Stop button and F12). Works while another operation runs: that
+        /// operation is cancelled and the stop goes out as soon as the bus is free.
+        /// </summary>
+        public async Task StopProgram() {
+            if (!State.Device.IsConnected && !(Dual && State.Bed.IsConnected)) {
+                State.EnsureConnected();
                 return;
             }
-            State.Sync.UserHold = true; // cancels queued holds and resumes, and blocks new ones while stopping
-            var (ok, _) = await State.StopAllAsync();
-            if (ok) State.Sync.Halt();
-            else _userStopped = false; // the user hold stays on: nothing is resumed automatically after a failed stop
+            _userStopped = true;
+            if (State.SingleBed) State.BedSwitch.Stop(); // the bed goes off first, whatever happens to the stop
+            if (Bed) State.Sync.UserHold = true; // cancels queued holds and resumes, and blocks new ones while stopping
+            bool ok = await State.StopAllAsync();
+            if (ok) {
+                if (Bed) State.Sync.Halt();
+            } else {
+                _userStopped = false; // the user hold stays on: nothing is resumed automatically after a failed stop
+            }
+            UpdateButtons();
+        }
+
+        /// <summary>F12 from any page. Never throws: a failure is reported by the stop itself.</summary>
+        public async void StopFromShortcut() {
+            try {
+                await StopProgram();
+            } catch (Exception ex) {
+                State.SetStatus("Stop failed: " + ex.Message, StatusKind.Error);
+            }
+        }
+
+        /// <summary>F5 on the Dashboard: starts the selected pattern when Start is available.</summary>
+        public void StartFromShortcut() {
+            if (_run.Enabled) _run.PerformClick();
+        }
+
+        /// <summary>F6 on the Dashboard: holds or resumes when that's available.</summary>
+        public void HoldFromShortcut() {
+            if (_hold.Enabled) _hold.PerformClick();
+        }
+
+        /// <summary>A Wait for Bed / Wait for IR hold has lasted longer than the limit in Settings: ask what to do.</summary>
+        private async Task OnWaitTimeout(string message) {
+            // Raised while a reading is being handed out: let that finish before a dialog opens (readings keep arriving
+            // while it's open, and must not be overtaken by the one that raised it).
+            await Task.Yield();
+            int r = DarkDialog.Show(FindForm(), "Still waiting", message
+                + "\n\nThe other heater isn't reaching its setpoint. Check that it's heating (its controller, the bed SSR, the thermocouple), "
+                + "or stop the program.", DialogTone.Warning, ["Keep waiting", "Stop program"], 0);
+            if (r == 1) {
+                await StopProgram();
+            } else {
+                State.Sync.KeepWaiting();
+            }
         }
 
         /// <summary>The bed controller stopped answering during a run: stop the IR and tell the user.</summary>
         private async Task OnBedLost() {
+            _abortReason = "the Bed Heat controller stopped answering";
             string result;
             try {
                 await State.Device.RunAsync(d => d.Stop());
@@ -782,6 +868,7 @@ namespace ReflowLink.UI.Pages {
 
         /// <summary>Single PC410: the bed reading (P2) was lost during the run. The bed is already off; stop the IR too.</summary>
         private async Task OnBedSensorLost() {
+            _abortReason = "the bed temperature (IN2) was lost";
             string result;
             try {
                 await State.Device.RunAsync(d => d.Stop());
@@ -804,7 +891,8 @@ namespace ReflowLink.UI.Pages {
                 var prof = pattern.HasValue ? State.SlotProfiles[pattern.Value] : null;
                 string label = prof != null && !string.IsNullOrWhiteSpace(prof.Name) ? prof.Name
                     : pattern.HasValue ? "pattern" + pattern.Value : "session";
-                _recorder = new CsvRecorder(State.Settings.EffectiveLogFolder, label, Bed, State.SingleBed, State.IrIn2Shown, State.BedIn2Shown);
+                _recorder = new CsvRecorder(State.Settings.EffectiveLogFolder, label, Bed, State.SingleBed, State.IrIn2Shown, State.BedIn2Shown,
+                    State.Settings.CsvLocalFormat, RunMetadata(pattern, prof));
                 _autoRecording = auto;
                 _autoStopAt = null;
                 _recordInfo.Text = "Recording · 0 rows\n" + Path.GetFileName(_recorder.FilePath);
@@ -815,6 +903,31 @@ namespace ReflowLink.UI.Pages {
                 SetToggle(false);
                 DarkDialog.Error(FindForm(), "Cannot start recording", ex.Message);
             }
+        }
+
+        /// <summary>Describes the run at the top of the CSV file, so a recording can be understood (and overlaid) later.</summary>
+        private System.Collections.Generic.List<string> RunMetadata(int? pattern, ReflowProfile prof) {
+            var s = State.Settings;
+            var units = s.Units;
+            var lines = new System.Collections.Generic.List<string> {
+                $"ReflowLink {typeof(DashboardPage).Assembly.GetName().Version.ToString(3)} recording",
+                $"Started: {DateTime.Now:yyyy-MM-dd HH:mm:ss}",
+                $"Station: {s.Station.Name}",
+                $"Controller units: ramp {(units.Ramp == RampUnit.PerMinute ? "°C/min" : "°C/s")}, hold {(units.Dwell == DwellUnit.Minutes ? "min" : "s")}",
+                "Bed heat: " + State.BedMode switch { BedMode.SinglePc410 => "single PC410 (IN2 + OUT2)", BedMode.SecondPc410 => "second PC410", _ => "off" },
+                "Pattern: " + (pattern?.ToString() ?? "unknown"),
+            };
+            if (prof != null) {
+                if (!string.IsNullOrWhiteSpace(prof.Name)) lines.Add("Profile: " + prof.Name);
+                var c = System.Globalization.CultureInfo.InvariantCulture;
+                for (int i = 0; i < prof.Steps.Count; i++) {
+                    var st = prof.Steps[i];
+                    string bed = Bed ? $", bed {st.BedTarget.ToString("0.#", c)} °C" : "";
+                    string waits = (st.WaitForBed ? ", wait for bed" : "") + (st.WaitForIr ? ", wait for IR" : "");
+                    lines.Add($"Step {i + 1}: {st.RampRate.ToString("0.##", c)} °C/s to {st.Target.ToString("0.#", c)} °C, hold {st.HoldSeconds.ToString("0", c)} s{bed}{waits}");
+                }
+            }
+            return lines;
         }
 
         private void StopRecording() {

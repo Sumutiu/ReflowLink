@@ -147,10 +147,19 @@ namespace ReflowLink.Protocol {
                 if (alarm2 && _cycle % 2 == 0 && (_a2Supported || _cycle % 20 == 0)) t.Alarm2 = TryOptional(BedAlarm, ref _a2Supported, ref _a2Misses);
                 try { t.Os = Client.ReadHexWord(Os); t.State = DecodeOs(t.Os.Value); } catch (Pc410Exception) { t.State = ProgramState.Unknown; }
 
-                // Optional parameters: give up on them only after repeated failures
-                // in cycles where PV itself answered (so a cable glitch does not disable them).
-                if (_seSupported) {
-                    try { t.Segment = (int)Client.ReadNumber(Se); _seMisses = 0; } catch (Pc410NakException) { _seSupported = false; } catch (Pc410Exception) { if (++_seMisses >= UnsupportedAfter) _seSupported = false; }
+                // Optional parameters: give up on them only after repeated failures in cycles where PV itself answered (so
+                // a cable glitch does not disable them). The step (SE) matters for Wait for Bed and the single PC410 bed, so
+                // it's still tried every 20th poll and comes back as soon as it answers again.
+                if (_seSupported || _cycle % 20 == 0) {
+                    try {
+                        t.Segment = (int)Client.ReadNumber(Se);
+                        _seSupported = true;
+                        _seMisses = 0;
+                    } catch (Pc410NakException) {
+                        _seSupported = false;
+                    } catch (Pc410Exception) {
+                        if (++_seMisses >= UnsupportedAfter) _seSupported = false;
+                    }
                 }
                 if (_swSupported && (_cycle % 5 == 0)) {
                     try { t.StatusWord = Client.ReadHexWord(Sw); _swMisses = 0; } catch (Pc410NakException) { _swSupported = false; } catch (Pc410Exception) { if (++_swMisses >= UnsupportedAfter) _swSupported = false; }
@@ -182,6 +191,10 @@ namespace ReflowLink.Protocol {
 
         public ProgramState ReadState() {
             return DecodeOs(Client.ReadHexWord(Os));
+        }
+
+        private ProgramState ReadStateOrUnknown() {
+            try { return ReadState(); } catch (Pc410Exception) { return ProgramState.Unknown; }
         }
 
         /// <summary>
@@ -351,7 +364,20 @@ namespace ReflowLink.Protocol {
             lock (Client.SyncRoot) {
                 int total = 2 + Pc410Protocol.SegmentCount;
                 progress?.Report(new OperationProgress(0, total, $"Selecting pattern {slot}…"));
-                SelectPattern(slot);
+                // Already selected: nothing to change, which also allows reading the pattern that's running. Another pattern
+                // can't be selected while a program runs, since that would change the program.
+                int current = -1;
+                try { current = ReadPattern(); } catch (Pc410Exception) { }
+                if (current != slot) {
+                    // Selecting another pattern changes the program, so only when the controller is known to be idle.
+                    var state = ReadStateOrUnknown();
+                    if (state is ProgramState.Running or ProgramState.Hold)
+                        throw new Pc410Exception($"{(current >= 0 ? $"Pattern {current}" : "A program")} is running. Stop it before reading pattern {slot}: "
+                            + "the PC410 can only read the selected pattern.");
+                    if (state == ProgramState.Unknown)
+                        throw new Pc410Exception($"The controller didn't report whether a program is running, so pattern {slot} wasn't selected. Try again.");
+                    SelectPattern(slot);
+                }
 
                 var p = new ReflowProfile { Name = "" };
                 progress?.Report(new OperationProgress(1, total, "Reading holdback…"));
@@ -398,7 +424,10 @@ namespace ReflowLink.Protocol {
                 double value = Client.ReadNumber(mnemonic);
                 supported = true;
                 return value;
-            } catch (Pc410Exception) when (supported == null) {
+            } catch (Pc410Exception ex) when (supported == null) {
+                // Only a parameter the controller refuses, or doesn't answer while PV does, counts as not supported. A
+                // dead link is an error, so a glitch on the first read can't switch the limit check off for good.
+                if (ex is not Pc410NakException && !LinkAlive()) throw;
                 supported = false;
                 return null;
             }
@@ -508,13 +537,17 @@ namespace ReflowLink.Protocol {
                     }
                 } catch (Pc410Exception ex) {
                     throw Interrupted(slot, $"Communication failed while writing step {step}: {ex.Message}");
+                } catch (OperationCanceledException) {
+                    // Stop pressed while writing: the pattern is only partly written.
+                    throw Interrupted(slot, $"Writing was cancelled at step {step}.");
                 }
                 if (rejected.Count > 0) throw new ProfileRejectedException(slot, rejected, true, TryClearPattern());
 
                 // Read back. Targets of the profile's steps are always checked, because a controller may silently
                 // limit a setpoint instead of rejecting it. Everything else is checked when verification is on.
                 for (int n = 1; n <= Pc410Protocol.SegmentCount; n++) {
-                    ct.ThrowIfCancellationRequested();
+                    // Cancelled before the targets were checked: the controller may hold clamped values.
+                    if (ct.IsCancellationRequested) throw Interrupted(slot, $"Checking was cancelled at step {n}.");
                     progress?.Report(new OperationProgress(done, total, $"Verifying step {n}…"));
                     for (int k = 0; k < 3; k++) {
                         bool isTarget = k == 1 && n <= profile.Steps.Count;

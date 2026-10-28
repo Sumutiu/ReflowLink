@@ -218,4 +218,11 @@ namespace ReflowLink.Protocol {
 
     public sealed class Pc410ChecksumException(string message) : Pc410Exception(message) {
     }
+
+    /// <summary>The serial port itself failed (adapter unplugged, port closed, driver error), not the controller.</summary>
+    public sealed class Pc410PortException(Exception inner) : Pc410Exception("Serial port error: " + inner.Message, inner) {
+        /// <summary>Exceptions a serial port throws when it fails or disappears.</summary>
+        public static bool IsPortError(Exception ex) =>
+            ex is System.IO.IOException or InvalidOperationException or UnauthorizedAccessException or TimeoutException or ObjectDisposedException;
+    }
 }

@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Tasks;
 using ReflowLink.Model;
 using ReflowLink.Protocol;
 
@@ -124,12 +125,20 @@ namespace ReflowLink.Services {
 
         private BedPlan _plan;
         private bool _wasActive, _halted, _paired, _pending, _offQueued, _failureReported, _sensorLostReported;
+        // Held off by SwitchOffAsync while the user decides whether to disconnect, exit or change the bed hardware.
+        private bool _holdOff;
+        // Stop pressed: stays off until the program has been seen idle, even if a start that was already on its way shows
+        // up as running first. A new run can only be set up after that.
+        private bool _stopHeld;
+        // The plan came from a start in ReflowLink (a checked pattern), so what the run shows about segments can be learned.
+        private bool _planFromBegin;
+        private int _pairedEvidence;
         // Set when bed control is switched on: a run already in progress then isn't taken over (it starts with the next run).
         private bool _freshEnable;
         private string _noPlanReason = "No bed targets";
         private double _lastProcessTime = double.NaN;
         private int _failures;
-        private System.Threading.Tasks.Task _pendingTask;
+        private Task _pendingTask;
         private DateTime _lastBedReading = DateTime.MinValue, _retryAfter = DateTime.MinValue;
         private bool _enabled;
 
@@ -154,6 +163,15 @@ namespace ReflowLink.Services {
 
         /// <summary>Profile looked up for a pattern started outside ReflowLink, to check the saved bed targets still fit it.</summary>
         public Func<int, ReflowProfile> KnownPattern { get; set; }
+
+        /// <summary>
+        /// This controller was seen counting ramp and dwell as separate segments in an earlier run, so a step is two
+        /// segments from the start of a run (instead of only once a segment above the number of steps has been seen).
+        /// </summary>
+        public bool PairedHint { get; set; }
+
+        /// <summary>Raised when a run shows that the controller counts ramp and dwell as separate segments.</summary>
+        public event Action PairedDetected;
 
         public BedPlan Plan => _plan;
         /// <summary>Bed temperature (P2) from the latest poll; null when missing, implausible or stale.</summary>
@@ -191,8 +209,9 @@ namespace ReflowLink.Services {
 
         /// <summary>Sets the plan for the run being started from ReflowLink (also fine after its first poll arrived).</summary>
         public void Begin(BedPlan plan) {
-            if (!_enabled) return;
+            if (!_enabled || _stopHeld) return;
             _plan = plan;
+            _planFromBegin = plan != null;
             _halted = false;
             Changed?.Invoke();
         }
@@ -201,6 +220,7 @@ namespace ReflowLink.Services {
         public void Stop() {
             if (!_enabled) return;
             _halted = true;
+            _stopHeld = true;
             _plan = null;
             WantOn = false;
             Setpoint = null;
@@ -211,12 +231,12 @@ namespace ReflowLink.Services {
         }
 
         /// <summary>
-        /// Switches OUT2 off and waits for the controller to confirm (used before disconnecting, closing ReflowLink or
-        /// changing the bed hardware). Returns false if that couldn't be confirmed.
+        /// Switches OUT2 off and waits for the controller to confirm, without ending the run (used before disconnecting,
+        /// closing ReflowLink or changing the bed hardware). The bed stays off until <see cref="ResumeAfterSwitchOff"/>, so
+        /// regulation carries on unchanged if the user then cancels. Returns false if the switch-off couldn't be confirmed.
         /// </summary>
-        public bool SwitchOffNow(int timeoutMs = 4000) {
-            _halted = true;
-            _plan = null;
+        public async Task<bool> SwitchOffAsync(int timeoutMs = 4000) {
+            _holdOff = true;
             WantOn = false;
             if (!_ir.IsConnected) return false;
             try {
@@ -224,17 +244,17 @@ namespace ReflowLink.Services {
                 // land in time, the result can't be confirmed.
                 bool earlierLanded = true;
                 var pending = _pendingTask;
-                if (pending != null && !pending.IsCompleted) {
-                    try { earlierLanded = pending.Wait(timeoutMs); } catch (AggregateException) { /* failed: it won't land */ }
-                }
+                if (pending != null && !pending.IsCompleted)
+                    earlierLanded = await Task.WhenAny(pending, Task.Delay(timeoutMs)) == pending && pending.Status == TaskStatus.RanToCompletion;
                 // Write "off" and read it back inside the same bus lock.
                 var t = _ir.RunAsync(d => {
                     d.SetBedSwitch(false);
                     return d.ReadBedAlarm() >= Pc410Device.BedOffThreshold;
                 });
-                if (!t.Wait(timeoutMs)) return false;
+                if (await Task.WhenAny(t, Task.Delay(timeoutMs)) != t) return false;
+                bool off = await t;
                 NoteWrite(false);
-                return earlierLanded && t.Result;
+                return earlierLanded && off;
             } catch (Exception ex) {
                 LastError = DeviceService.Describe(ex.GetBaseException());
                 return false;
@@ -243,9 +263,21 @@ namespace ReflowLink.Services {
             }
         }
 
+        /// <summary>The user cancelled after <see cref="SwitchOffAsync"/>: regulate the bed again.</summary>
+        public void ResumeAfterSwitchOff() {
+            if (!_holdOff) return;
+            _holdOff = false;
+            Changed?.Invoke();
+        }
+
+        /// <summary>True while the bed is held off by <see cref="SwitchOffAsync"/>.</summary>
+        public bool HeldOff => _holdOff;
+
         private void Reset() {
             _plan = null;
-            _wasActive = _halted = _paired = false;
+            _wasActive = _halted = _holdOff = _stopHeld = _planFromBegin = false;
+            _paired = PairedHint;
+            _pairedEvidence = 0;
             _offQueued = _failureReported = _sensorLostReported = false;
             _lastProcessTime = double.NaN;
             _failures = 0;
@@ -278,6 +310,7 @@ namespace ReflowLink.Services {
             }
             if (!_ir.IsConnected) {
                 // Nothing can be switched any more; OUT2 stays as it was (the hardware limit covers this).
+                _holdOff = false;
                 Out2 = null;
                 Alarm2 = null;
                 _wasActive = false;
@@ -326,19 +359,28 @@ namespace ReflowLink.Services {
                 if (active && !_wasActive) StartRun(t);
                 if (!active && _wasActive) {
                     _plan = null; // program ended or stopped
+                    _planFromBegin = false;
                     _halted = false;
                 }
+                if (!active) _stopHeld = false;
                 _wasActive = active;
             }
 
             // Which step the IR program is in (some controllers count ramp and dwell as separate segments).
             int? step = null;
             if (_plan != null) {
-                if ((t.Segment ?? 0) > _plan.Steps) _paired = true;
+                // Segments above the step count (up to twice as many) mean ramp and dwell are counted separately. A few
+                // readings are needed, so one bad reading can't change how steps are counted.
+                int seg = t.Segment ?? 0;
+                if (!_paired && seg > _plan.Steps && seg <= 2 * _plan.Steps && ++_pairedEvidence >= 3) {
+                    _paired = true;
+                    if (!PairedHint && _planFromBegin) PairedDetected?.Invoke();
+                }
                 step = SyncCoordinator.StepOf(t.Segment, _plan.Steps, _paired);
             }
 
-            var why = !stateKnown ? "Program state unknown"
+            var why = _holdOff ? "Switched off"
+                : !stateKnown ? "Program state unknown"
                 : Decide(_ir.State == LinkStatus.Connected, active, _halted, _plan, step, BedTemperature, _settings.Bed.MaxTemperature);
             if (why == "No bed targets") why = _noPlanReason;
             if (why == null) {
@@ -378,8 +420,11 @@ namespace ReflowLink.Services {
         private void StartRun(Telemetry t) {
             _regulator.Reset();
             _proportioner.Reset();
-            _paired = false;
-            _halted = false;
+            _paired = PairedHint;
+            _pairedEvidence = 0;
+            // A start that overtook a Stop doesn't switch the bed back on.
+            _halted = _stopHeld;
+            if (_stopHeld) return;
             _sensorLostReported = false;
             _noPlanReason = "No bed targets";
             if (_plan != null) return; // set by Begin
@@ -399,6 +444,7 @@ namespace ReflowLink.Services {
                 return;
             }
             _plan = BedPlan.From(sync, t.Pv ?? sync.IrTargets[0], BedTemperature ?? t.Pv ?? sync.BedTargets[0]);
+            _planFromBegin = false;
         }
 
         /// <summary>

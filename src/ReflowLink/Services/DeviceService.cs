@@ -136,6 +136,7 @@ namespace ReflowLink.Services {
         }
 
         public static string Describe(Exception ex) {
+            if (ex is Pc410PortException) return ex.Message + " Check the USB adapter, then disconnect and connect again.";
             if (ex is Pc410TimeoutException)
                 return "The controller did not answer. Check the cable, COM port, baud rate (the PC410 uses 7E1) and the device address.";
             if (ex is UnauthorizedAccessException)

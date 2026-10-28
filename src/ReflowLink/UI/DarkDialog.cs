@@ -94,7 +94,9 @@ namespace ReflowLink.UI {
         public static int Show(IWin32Window owner, string title, string message, DialogTone tone, string[] buttons, int defaultIndex = 0, ButtonKind primary = ButtonKind.Primary) {
             using var d = new DarkDialog(title, message, tone, buttons, defaultIndex, primary);
             if (owner == null) d.StartPosition = FormStartPosition.CenterScreen;
+            Services.AppLog.Write(tone switch { DialogTone.Error => "ERROR", DialogTone.Warning => "WARN", _ => "INFO" }, $"Dialog \"{title}\": {message}");
             d.ShowDialog(owner);
+            if (buttons.Length > 1) Services.AppLog.Info($"Dialog \"{title}\": answered \"{(d.Result >= 0 ? buttons[d.Result] : "closed")}\"");
             return d.Result;
         }
 
