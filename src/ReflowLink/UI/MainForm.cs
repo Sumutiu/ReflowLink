@@ -137,6 +137,8 @@ namespace ReflowLink.UI {
             AddPage("console", new ConsolePage(_state, _state.Ir));
             AddPage("bedconsole", new ConsolePage(_state, _state.BedChannel));
             AddPage("settings", new SettingsPage(_state));
+            // Offers a newer release only while nothing is going on: no run, no operation, no other dialog open.
+            _state.Updates = new UpdateNotifier(_state, this, () => !_dashboard.IsProgramActive && !_state.Busy && ActiveForm == this);
 
             // ---------------------------------------------------------------- wiring
             _state.StatusChanged += SetStatus;
@@ -346,6 +348,7 @@ namespace ReflowLink.UI {
                     + "so it's blocked: write a profile to it on the Profiles page before running it.", DialogTone.Warning, ["OK"]);
             }
             ShowPendingCrash();
+            _state.Updates.CheckOnStartup();
             if (_state.Settings.StationChosen) return;
             // First run: ask which station the PC410 is in (sets units and temperature limit).
             string id = StationPickerDialog.Pick(this, StationCatalog.DefaultId);

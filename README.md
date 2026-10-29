@@ -91,6 +91,12 @@ Parameter codes: `XP` (P), `TI` (I), `TD` (D), `HO` (output limit), `CH` (heat c
 - **Console**: the raw serial traffic (TX/RX, decoded and in hex), plus manual read or write of any parameter for troubleshooting.
 - **Settings**: station, COM port, baud rate, address, timeouts, DTR/RTS, temperature limit, logging folder and CSV format, and a **built-in simulator** so you can try everything without a station. *About → Copy diagnostics* copies the version, setup, connection state and recent events for a support request.
 
+### Updates
+
+When it starts, ReflowLink asks GitHub at most once a day whether a newer release of [ReflowLink](https://github.com/Sumutiu/ReflowLink/releases) is out. It never checks during a run, and without internet it says nothing. If there is a newer release, it shows what's new and offers to open the download page, skip that version, or remind you later. Nothing is downloaded or installed automatically, and only GitHub's public release information is read. *Settings → About* has *Check for updates* and a switch to turn the start-up check off.
+
+Releases are tagged `v<major>.<minor>.<patch>` (for example `v2.1.2`). The check compares the tag with the first three numbers of the exe's version (2.1.2.0), so set *Package version*, *Assembly version* and *File version* in the project to the release number before building it.
+
 ### Recordings (CSV)
 
 Each run gets its own file (two runs started in the same second get a suffix, so nothing is overwritten). The file starts with `# ` lines that describe the run (station, units, bed mode, pattern and its steps), followed by the column names and one row per reading. Every row is written to disk straight away. By default the file uses commas and decimal points; *Settings → Logging → CSV format → This PC's format* uses the PC's list separator and decimal mark instead, so Excel opens it in columns where the decimal mark is a comma.
@@ -167,6 +173,7 @@ Add an entry to `StationCatalog.All` in `src/ReflowLink/Model/Stations.cs`: an i
 ## Files and folders
 
 - Settings: `%APPDATA%\ReflowLink\settings.xml`. Every save writes a new file and then swaps it in, keeping the previous one as `settings.xml.bak`. If the settings can't be read, the backup is used (or the defaults), and ReflowLink says so when it starts.
+- Update check: asks `api.github.com` for the latest release (at most once a day, if switched on).
 - Event log and crash reports: `%APPDATA%\ReflowLink\Logs` (one `events-<date>.log` per day, kept 30 days). If ReflowLink closes unexpectedly, the next start says where the crash report is.
 - A pattern being written when ReflowLink closes, crashes or loses power is blocked at the next start, until a profile is written to it again.
 - Profiles (default): `Documents\ReflowLink\Profiles`

@@ -108,6 +108,14 @@ namespace ReflowLink.Model {
         /// </summary>
         public bool CsvLocalFormat { get; set; }
 
+        // Updates
+        /// <summary>Look for a newer release on GitHub when ReflowLink starts (at most once a day).</summary>
+        public bool CheckForUpdates { get; set; } = true;
+        /// <summary>When GitHub was last asked successfully.</summary>
+        public DateTime LastUpdateCheck { get; set; }
+        /// <summary>Release tag the user chose to skip; it isn't offered again at start-up.</summary>
+        public string SkippedUpdate { get; set; } = "";
+
         // Window
         public int WindowX { get; set; } = int.MinValue;
         public int WindowY { get; set; } = int.MinValue;

@@ -184,13 +184,23 @@ namespace ReflowLink.UI.Pages {
             var tip = Theme.CreateToolTip();
             tip.SetToolTip(copy, "Copies the version, setup, connection state and recent events, to paste into a support request");
             tip.SetToolTip(events, "Open the folder with the event logs and crash reports");
+            var update = new ModernButton("Check for updates", Glyph.Download) { Margin = new Padding(0, 0, Theme.S(8), 0) };
+            update.Click += async (o, e) => await State.Updates.CheckNowAsync();
+            tip.SetToolTip(update, "Ask GitHub whether a newer ReflowLink has been released");
+            var autoUpdate = Toggle("Check for updates at start-up", s.CheckForUpdates, v => s.CheckForUpdates = v);
+            autoUpdate.Margin = new Padding(0, 0, 0, Theme.S(10));
+            tip.SetToolTip(autoUpdate, "At most once a day. Only GitHub's public release information is read; nothing is downloaded or installed.");
+            var updateRow = Flow();
+            updateRow.Dock = DockStyle.Bottom;
+            updateRow.Controls.Add(autoUpdate);
             var aboutButtons = Flow();
             aboutButtons.Dock = DockStyle.Bottom;
-            aboutButtons.Controls.AddRange([copy, events]);
+            aboutButtons.Controls.AddRange([update, copy, events]);
             aboutCard.Controls.Add(about);
+            aboutCard.Controls.Add(updateRow);
             aboutCard.Controls.Add(aboutButtons);
             about.BringToFront();
-            aboutCard.Height = Theme.S(290);
+            aboutCard.Height = Theme.S(330);
 
             // ---------------------------------------------------------------- layout
             var grid = Table(2, 1);

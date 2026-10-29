@@ -1069,6 +1069,37 @@ namespace ReflowLink.Tests {
                 }
             });
 
+            Run("Updates: release tags compare with the program's version", () => {
+                Eq(new Version(2, 1, 1), UpdateChecker.ParseTag("v2.1.1"));
+                Eq(new Version(2, 1, 1), UpdateChecker.ParseTag("2.1.1"));
+                Eq(new Version(2, 2, 0), UpdateChecker.ParseTag("v2.2"));
+                Eq(new Version(3, 0, 0), UpdateChecker.ParseTag("V3.0.0-beta"));
+                Eq(null, UpdateChecker.ParseTag("latest"));
+                // 2.1.1.0 (assembly version) and v2.1.1 (tag) are the same release.
+                Eq(UpdateChecker.Normalize(new Version(2, 1, 1, 0)), UpdateChecker.ParseTag("v2.1.1"));
+                True(UpdateChecker.ParseTag("v2.1.2") > UpdateChecker.Normalize(new Version(2, 1, 1, 0)), "newer");
+                False(UpdateChecker.ParseTag("v2.1.0") > UpdateChecker.Normalize(new Version(2, 1, 1, 0)), "older");
+                True(UpdateChecker.ParseTag("v2.10.0") > UpdateChecker.ParseTag("v2.9.0"), "compared as numbers, not text");
+            });
+
+            Run("Updates: GitHub's release reply is read, and only this repository's pages are opened", () => {
+                string json = "{\"url\":\"https://api.github.com/repos/Sumutiu/ReflowLink/releases/1\",\"html_url\":\"https://github.com/Sumutiu/ReflowLink/releases/tag/v2.1.2\","
+                    + "\"id\":1,\"author\":{\"login\":\"Sumutiu\",\"id\":7},\"tag_name\":\"v2.1.2\",\"name\":\"ReflowLink v2.1.2\",\"draft\":false,\"prerelease\":false,"
+                    + "\"assets\":[{\"name\":\"ReflowLink.exe\",\"size\":123}],\"body\":\"## ReflowLink v2.1.2\\r\\n\\r\\n### Fixes\\r\\n- **Stop** works\\r\\n- `F12` too\"}";
+                var info = UpdateChecker.Parse(json);
+                Eq(new Version(2, 1, 2), info.Version);
+                Eq("v2.1.2", info.Tag);
+                Eq("https://github.com/Sumutiu/ReflowLink/releases/tag/v2.1.2", info.Url);
+                Eq("Fixes\r\n• Stop works\r\n• F12 too", UpdateChecker.Summary(info.Notes).Replace(Environment.NewLine, "\r\n"));
+
+                var foreign = UpdateChecker.Parse(json.Replace("https://github.com/Sumutiu/ReflowLink/releases/tag", "https://example.com/x"));
+                Eq(UpdateChecker.ReleasesPage, foreign.Url);
+                Eq(null, UpdateChecker.Parse(json.Replace("\"prerelease\":false", "\"prerelease\":true")));
+                Eq(null, UpdateChecker.Parse(json.Replace("v2.1.2\",\"name", "nightly\",\"name")));
+                string many = string.Join("\n", Enumerable.Range(1, 20).Select(i => "- item " + i));
+                True(UpdateChecker.Summary(many).EndsWith("…"), "long notes are cut short");
+            });
+
             Run("Pattern comparison lists what differs", () => {
                 var a = new ReflowProfile { Holdback = 5 };
                 a.Steps.Add(new ProfileStep(1, 150, 30) { BedTarget = 140 });

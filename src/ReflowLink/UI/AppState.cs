@@ -85,6 +85,9 @@ namespace ReflowLink.UI {
         public BedSwitchController BedSwitch { get; }
         public Form Owner { get; set; }
 
+        /// <summary>Checks GitHub for a newer release (set up by the main window).</summary>
+        public UpdateNotifier Updates { get; set; }
+
         /// <summary>Bed heat hardware chosen in Settings.</summary>
         public BedMode BedMode => Settings.Bed.Mode;
 
