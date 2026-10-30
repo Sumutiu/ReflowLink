@@ -1100,6 +1100,159 @@ namespace ReflowLink.Tests {
                 True(UpdateChecker.Summary(many).EndsWith("…"), "long notes are cut short");
             });
 
+            Run("Single PC410: a missed step reading doesn't switch the bed off and on again", () => {
+                var settings = new AppSettings();
+                settings.Bed.Mode = BedMode.SinglePc410;
+                settings.Bed.Switching.CycleSeconds = 4;
+                var prof = new ReflowProfile();
+                prof.Steps.Add(new ProfileStep(1.5, 120, 20) { BedTarget = 110 });
+                prof.Steps.Add(new ProfileStep(0.8, 160, 40) { BedTarget = 120 });
+                prof.Steps.Add(new ProfileStep(1.0, 205, 20) { BedTarget = 130 });
+                settings.SetSync(0, prof);
+                var device = new DeviceService();
+                try {
+                    device.ConnectAsync(new ConnectionOptions { UseSimulator = true, SimulatorSpeed = 10, PollIntervalMs = 200, ResponseTimeoutMs = 100, Retries = 0 }).Wait();
+                    var sim = (SimulatedPc410)device.RunAsync(d => d.Client.Transport).Result;
+                    device.ReadIn2 = device.ReadAlarm2 = true;
+                    var ctl = new BedSwitchController(device, settings) { Enabled = true, KnownPattern = slot => slot == 0 ? prof : null };
+                    var reasons = new System.Collections.Concurrent.ConcurrentQueue<string>();
+                    ctl.Changed += () => reasons.Enqueue(ctl.Reason);
+                    Thread.Sleep(600);
+                    device.RunAsync(d => d.Start(0)).Wait();
+                    True(WaitFor(() => ctl.Reason is "Heating" or "Regulating", 5000), "regulating: " + ctl.Reason);
+                    while (reasons.TryDequeue(out _)) { }
+                    // One or two polls without a step (a glitch on the cable).
+                    sim.MissingParameters.Add("SE");
+                    Thread.Sleep(350);
+                    sim.MissingParameters.Remove("SE");
+                    Thread.Sleep(600);
+                    False(reasons.Contains("Step not reported"), "bridged: " + string.Join(", ", reasons.Distinct()));
+                    // A step that stays missing does switch the bed off.
+                    sim.MissingParameters.Add("SE");
+                    True(WaitFor(() => ctl.Reason == "Step not reported", 9000), "lost: " + ctl.Reason);
+                    True(WaitFor(() => !sim.Out2, 3000), "and the bed is off");
+                    sim.MissingParameters.Remove("SE");
+                    device.RunAsync(d => d.Stop()).Wait();
+                } finally {
+                    device.Dispose();
+                }
+            });
+
+            Run("Polling: a missing optional reading costs one timeout, and a waiting command cuts the poll short", () => {
+                var sim = new SimulatedPc410(1);
+                sim.Open();
+                using var c = new Pc410Client(sim, 1) { ResponseTimeoutMs = 100, Retries = 2 };
+                var dev = new Pc410Device(c);
+                dev.Start(0);
+                sim.MissingParameters.Add("SP");
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var t = dev.ReadTelemetry();
+                Eq(null, t.Sp);
+                True(sw.ElapsedMilliseconds < 250, "asked once, not three times: " + sw.ElapsedMilliseconds + " ms");
+                True(t.Segment.HasValue && t.State == ProgramState.Running, "the rest is still read");
+                True(Throws(() => c.Read("SP")) >= 290, "a normal read still retries");
+
+                // A command waiting for the bus: the poll stops after PV.
+                sim.MissingParameters.Remove("SP");
+                sim.MissingParameters.UnionWith(["OS", "OP", "SE"]);
+                var poll = System.Threading.Tasks.Task.Run(() => dev.ReadTelemetry());
+                Thread.Sleep(30);
+                sw.Restart();
+                using (c.WaitingForBus()) {
+                    lock (c.SyncRoot) { }
+                }
+                long waited = sw.ElapsedMilliseconds;
+                var partial = poll.Result;
+                True(waited < 180, "the command waited " + waited + " ms");
+                True(partial.Partial && partial.Pv.HasValue, "partial poll with PV");
+                dev.Stop();
+
+                static long Throws(Action a) {
+                    var w = System.Diagnostics.Stopwatch.StartNew();
+                    try { a(); } catch (Pc410Exception) { }
+                    return w.ElapsedMilliseconds;
+                }
+            });
+
+            Run("Polling: a poll cut short shows the last complete readings", () => {
+                var device = new DeviceService();
+                try {
+                    device.ConnectAsync(new ConnectionOptions { UseSimulator = true, PollIntervalMs = 200 }).Wait();
+                    device.RunAsync(d => d.Start(0)).Wait();
+                    True(WaitFor(() => device.Last?.State == ProgramState.Running && device.Last.Sp.HasValue, 3000), "running");
+                    var seen = new System.Collections.Concurrent.ConcurrentQueue<Telemetry>();
+                    device.TelemetryReceived += t => seen.Enqueue(t);
+                    // Commands one after the other, so polls get cut short.
+                    for (int i = 0; i < 15; i++) device.RunAsync(d => d.ReadState()).Wait();
+                    Thread.Sleep(600);
+                    True(seen.Count > 0, "polls arrived");
+                    True(seen.All(t => t.State != ProgramState.Unknown && t.Sp.HasValue), "no gaps shown");
+                    device.RunAsync(d => d.Stop()).Wait();
+                } finally {
+                    device.Dispose();
+                }
+            });
+
+            Run("Backup & Restore: settings and profiles in one file, restored without overwriting", () => {
+                string root = Path.Combine(Path.GetTempPath(), "reflowlink_backup_test_" + Guid.NewGuid().ToString("N"));
+                string source = Path.Combine(root, "source"), target = Path.Combine(root, "target");
+                Directory.CreateDirectory(source);
+                try {
+                    var a = new ReflowProfile { Name = "Leaded" };
+                    a.Steps.Add(new ProfileStep(1, 150, 60));
+                    a.Save(Path.Combine(source, "Leaded.rlprofile"));
+                    var b = new ReflowProfile { Name = "Lead-free", Notes = "SAC305" };
+                    b.Steps.Add(new ProfileStep(0.8, 217, 30));
+                    b.Save(Path.Combine(source, "Lead-free.rlprofile"));
+                    File.WriteAllText(Path.Combine(source, "notes.txt"), "not a profile");
+                    File.WriteAllText(Path.Combine(source, "broken.rlprofile"), "<oops");
+
+                    var s = new AppSettings {
+                        StationId = StationCatalog.DefaultId,
+                        MaxTemperature = 240,
+                        LogFolder = @"C:\Users\someone\Logs",
+                        LastProfilePath = @"C:\Users\someone\Documents\ReflowLink\Profiles\Leaded.rlprofile",
+                        BlockedPatterns = [2]
+                    };
+                    s.Bed.Mode = BedMode.SinglePc410;
+                    s.SetSync(1, b);
+                    var backup = SetupBackup.Create(s, source);
+                    Eq(2, backup.Profiles.Count);
+                    Eq(1, backup.Unreadable.Count);
+                    string file = Path.Combine(root, "setup.rlbackup");
+                    backup.Save(file);
+                    False(File.ReadAllText(file).Contains("someone"), "no paths of this PC in the file");
+
+                    var loaded = SetupBackup.Load(file);
+                    Eq(240.0, loaded.Settings.MaxTemperature);
+                    Eq(BedMode.SinglePc410, loaded.Settings.Bed.Mode);
+                    True(loaded.Settings.SyncFor(1)?.HasTargets == true, "pattern data kept");
+                    Eq("SAC305", loaded.Profiles.Single(p => p.FileName == "Lead-free.rlprofile").Profile.Notes);
+
+                    var r1 = loaded.RestoreProfiles(target);
+                    Eq(2, r1.Added);
+                    var r2 = loaded.RestoreProfiles(target);
+                    Eq(2, r2.AlreadyThere);
+                    var changed = new ReflowProfile { Name = "Leaded" };
+                    changed.Steps.Add(new ProfileStep(2, 160, 10));
+                    changed.Save(Path.Combine(target, "Leaded.rlprofile"));
+                    var r3 = loaded.RestoreProfiles(target);
+                    Eq(1, r3.Renamed);
+                    Eq(160.0, ReflowProfile.Load(Path.Combine(target, "Leaded.rlprofile")).Steps[0].Target); // the user's own file is kept
+                    True(File.Exists(Path.Combine(target, "Leaded (imported).rlprofile")), "the imported one gets a new name");
+
+                    var here = new AppSettings { WindowX = 50, WindowWidth = 1500 };
+                    var installed = loaded.SettingsForThisPc(here, target);
+                    Eq(50, installed.WindowX);
+                    Eq(1500, installed.WindowWidth);
+                    Eq(Path.Combine(target, "Leaded.rlprofile"), installed.LastProfilePath);
+                    Eq("", installed.LogFolder);
+                    Throws<InvalidDataException>(() => SetupBackup.Load(Path.Combine(source, "broken.rlprofile")));
+                } finally {
+                    Directory.Delete(root, true);
+                }
+            });
+
             Run("Pattern comparison lists what differs", () => {
                 var a = new ReflowProfile { Holdback = 5 };
                 a.Steps.Add(new ProfileStep(1, 150, 30) { BedTarget = 140 });

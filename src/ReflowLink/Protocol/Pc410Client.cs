@@ -34,6 +34,20 @@ namespace ReflowLink.Protocol {
         public double TransmitMsPerByte { get; set; }
         public object SyncRoot => _sync;
 
+        private int _waiting;
+
+        /// <summary>
+        /// True while a command (Stop, a write, a read the user asked for) waits for the bus. The background poll then
+        /// skips its optional readings, so the command goes out sooner.
+        /// </summary>
+        public bool CommandWaiting => Volatile.Read(ref _waiting) > 0;
+
+        /// <summary>Announces a command that's about to wait for <see cref="SyncRoot"/>; dispose once it has the lock.</summary>
+        public IDisposable WaitingForBus() {
+            Interlocked.Increment(ref _waiting);
+            return new Scope(() => Interlocked.Decrement(ref _waiting));
+        }
+
         public event Action<TrafficEntry> Traffic;
 
         /// <summary>Marks traffic generated on the current thread as background polling.</summary>
@@ -51,17 +65,25 @@ namespace ReflowLink.Protocol {
 
         // ------------------------------------------------------------------ public API
 
-        public string Read(string mnemonic) {
+        public string Read(string mnemonic) => Read(mnemonic, Retries);
+
+        /// <summary>
+        /// Reads a value the poll can do without (setpoint, output, step, status, IN2, A2): asked once, without retries,
+        /// so a parameter that doesn't answer costs one timeout instead of one per attempt.
+        /// </summary>
+        public string ReadOptional(string mnemonic) => Read(mnemonic, 0);
+
+        private string Read(string mnemonic, int retries) {
             lock (_sync) {
                 Pc410Exception last = null;
-                for (int attempt = 0; attempt <= Retries; attempt++) {
+                for (int attempt = 0; attempt <= retries; attempt++) {
                     try { return ReadOnce(mnemonic); } catch (Pc410NakException) {
                         Log(TrafficKind.Error, null, $"Read {mnemonic}: rejected by controller");
                         throw new Pc410NakException($"Controller rejected a read of '{mnemonic}' (parameter not supported?).");
                     } catch (Pc410Exception ex) {
                         last = ex;
-                        Log(TrafficKind.Error, null, $"Read {mnemonic}: {ex.Message}" + (attempt < Retries ? " — retrying" : ""));
-                        Thread.Sleep(40);
+                        Log(TrafficKind.Error, null, $"Read {mnemonic}: {ex.Message}" + (attempt < retries ? " — retrying" : ""));
+                        if (attempt < retries) Thread.Sleep(40);
                     } catch (Exception ex) when (Pc410PortException.IsPortError(ex)) {
                         // The port itself failed: retrying won't help, and callers handle it like any controller error.
                         Log(TrafficKind.Error, null, $"Read {mnemonic}: serial port error: {ex.Message}");
@@ -82,7 +104,7 @@ namespace ReflowLink.Protocol {
                     } catch (Pc410Exception ex) {
                         last = ex;
                         Log(TrafficKind.Error, null, $"Write {mnemonic}={data}: {ex.Message}" + (attempt < Retries ? " — retrying" : ""));
-                        Thread.Sleep(40);
+                        if (attempt < Retries) Thread.Sleep(40);
                     } catch (Exception ex) when (Pc410PortException.IsPortError(ex)) {
                         Log(TrafficKind.Error, null, $"Write {mnemonic}={data}: serial port error: {ex.Message}");
                         throw new Pc410PortException(ex);
@@ -92,15 +114,23 @@ namespace ReflowLink.Protocol {
             }
         }
 
-        public double ReadNumber(string mnemonic) {
-            string d = Read(mnemonic);
+        public double ReadNumber(string mnemonic) => ParseNumber(mnemonic, Read(mnemonic));
+
+        /// <summary>A number the poll can do without: asked once (see <see cref="ReadOptional"/>).</summary>
+        public double ReadOptionalNumber(string mnemonic) => ParseNumber(mnemonic, ReadOptional(mnemonic));
+
+        private static double ParseNumber(string mnemonic, string d) {
             if (!Pc410Protocol.TryParseNumber(d, out double v))
                 throw new Pc410FrameException($"'{mnemonic}' returned a non-numeric value '{d}'.");
             return v;
         }
 
-        public int ReadHexWord(string mnemonic) {
-            string d = Read(mnemonic);
+        public int ReadHexWord(string mnemonic) => ParseHexWord(mnemonic, Read(mnemonic));
+
+        /// <summary>A status word the poll can do without: asked once (see <see cref="ReadOptional"/>).</summary>
+        public int ReadOptionalHexWord(string mnemonic) => ParseHexWord(mnemonic, ReadOptional(mnemonic));
+
+        private static int ParseHexWord(string mnemonic, string d) {
             if (Pc410Protocol.TryParseHexWord(d, out int v)) return v;
             if (Pc410Protocol.TryParseNumber(d, out double dv)) return (int)dv;
             throw new Pc410FrameException($"'{mnemonic}' returned an invalid status word '{d}'.");

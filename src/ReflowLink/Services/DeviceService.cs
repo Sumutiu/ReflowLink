@@ -125,6 +125,7 @@ namespace ReflowLink.Services {
                 });
                 PollIntervalMs = s.PollIntervalMs;
                 _lastState = ProgramState.Unknown;
+                _lastFull = null;
                 LastError = "";
                 SetState(LinkStatus.Connected);
                 StartPolling(device);
@@ -158,6 +159,7 @@ namespace ReflowLink.Services {
             ActivePattern = null;
             ControllerLimits = default;
             _lastState = ProgramState.Unknown;
+            _lastFull = null;
             SetState(LinkStatus.Disconnected);
         }
 
@@ -165,9 +167,11 @@ namespace ReflowLink.Services {
         public Task<T> RunAsync<T>(Func<Pc410Device, T> op) {
             var d = _device ?? throw new InvalidOperationException("Not connected.");
             return Task.Run(() => {
+                // Tells the poll a command is waiting, so it skips its remaining readings and frees the bus sooner.
+                var waiting = d.Client.WaitingForBus();
                 lock (d.Client.SyncRoot) {
-                    var r = op(d);
-                    return r;
+                    waiting.Dispose();
+                    return op(d);
                 }
             });
         }
@@ -183,9 +187,20 @@ namespace ReflowLink.Services {
             var b = second?._device;
             if (second != null && b == null) throw new InvalidOperationException("Not connected.");
             return Task.Run(() => {
-                lock (a.Client.SyncRoot) {
-                    if (b == null) return op(a, null);
-                    lock (b.Client.SyncRoot) return op(a, b);
+                var waitingA = a.Client.WaitingForBus();
+                var waitingB = b?.Client.WaitingForBus();
+                try {
+                    lock (a.Client.SyncRoot) {
+                        waitingA.Dispose();
+                        if (b == null) return op(a, null);
+                        lock (b.Client.SyncRoot) {
+                            waitingB.Dispose();
+                            return op(a, b);
+                        }
+                    }
+                } finally {
+                    waitingA.Dispose();
+                    waitingB?.Dispose();
                 }
             });
         }
@@ -260,7 +275,23 @@ namespace ReflowLink.Services {
             }
         }
 
+        private Telemetry _lastFull;
+
         private void Deliver(Telemetry t) {
+            // A poll cut short for a command has PV only: show the rest of the last complete poll (up to 3 s old) rather
+            // than gaps. IN2 and A2 aren't copied: the bed control judges those by their own age.
+            if (t.Partial && _lastFull != null && (t.Time - _lastFull.Time).TotalSeconds <= 3) {
+                t.Sp ??= _lastFull.Sp;
+                t.Op ??= _lastFull.Op;
+                t.StatusWord ??= _lastFull.StatusWord;
+                t.Segment ??= _lastFull.Segment;
+                if (t.State == ProgramState.Unknown) {
+                    t.State = _lastFull.State;
+                    t.Os ??= _lastFull.Os;
+                }
+            } else if (!t.Partial) {
+                _lastFull = t;
+            }
             Last = t;
             if (t.Pattern.HasValue) ActivePattern = t.Pattern;
             if (State != LinkStatus.Connected) { LastError = ""; SetState(LinkStatus.Connected); }

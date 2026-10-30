@@ -64,6 +64,12 @@ namespace ReflowLink.UI.Pages {
         private double _lastX;
         // Why ReflowLink stopped the run itself (a controller or the bed reading lost); null for a normal end or Stop.
         private string _abortReason;
+        // Shaded on the chart while Wait for Bed / Wait for IR holds a heater. The last band of each kind is kept, so waits
+        // that follow each other closely (hold, resume, hold again) show as one band.
+        private ChartBand _irWaitBand, _bedWaitBand;
+        private bool _irWaiting, _bedWaiting;
+        /// <summary>Waits less than this apart (chart seconds) are drawn as one band.</summary>
+        private const double WaitBandGap = 30;
 
         /// <summary>Raised when a program starts or ends (either controller running counts).</summary>
         public event Action<bool> ActiveChanged;
@@ -233,7 +239,7 @@ namespace ReflowLink.UI.Pages {
             State.Bed.StateChanged += (s, e) => OnBedLinkChanged();
             State.Bed.ProgramStateChanged += (prev, now) => { _bedState = now; OnCombinedStateChanged(); UpdateProgramInfo(State.Device.Last); UpdateButtons(); };
             State.BedEnabledChanged += ApplyBedMode;
-            State.Sync.Changed += () => { UpdateProgramInfo(State.Device.Last); UpdateButtons(); };
+            State.Sync.Changed += () => { UpdateWaitBands(); UpdateProgramInfo(State.Device.Last); UpdateButtons(); };
             State.Sync.CommandFailed += msg => State.SetStatus(msg, StatusKind.Error);
             State.Sync.BedLost += async () => await OnBedLost();
             State.Sync.WaitTimeout += async msg => await OnWaitTimeout(msg);
@@ -386,6 +392,7 @@ namespace ReflowLink.UI.Pages {
             if (string.IsNullOrEmpty(_opCard.Detail) || _opCard.Detail == "Not connected") _opCard.Detail = "Heater power";
 
             UpdateProgramInfo(t);
+            UpdateWaitBands();
 
             if (_recorder != null) {
                 try {
@@ -408,6 +415,7 @@ namespace ReflowLink.UI.Pages {
             double x = X(t.Time);
             // With the Top IR offline the bed's readings move the chart on.
             if (!State.Device.IsConnected && x > _lastX) _lastX = x;
+            UpdateWaitBands();
             if (t.Pv.HasValue) _bedPv.Points.Add(new PointD(x, t.Pv.Value));
             if (t.Sp.HasValue) _bedSp.Points.Add(new PointD(x, t.Sp.Value));
             if (t.Op.HasValue) _bedOp.Points.Add(new PointD(x, t.Op.Value));
@@ -455,6 +463,35 @@ namespace ReflowLink.UI.Pages {
             var first = pts[i];
             if (last.X - first.X < 2) return null;
             return (last.Y - first.Y) / (last.X - first.X);
+        }
+
+        /// <summary>
+        /// Shades the chart where Wait for Bed held the IR, or Wait for IR held the bed, so you can see afterwards where a run
+        /// lost time. A band grows while the wait lasts and stays when it ends.
+        /// </summary>
+        private void UpdateWaitBands() {
+            TrackWait(ref _irWaitBand, ref _irWaiting, State.Sync.IrWaiting, "IR waiting for bed", Theme.Yellow);
+            TrackWait(ref _bedWaitBand, ref _bedWaiting, State.Sync.BedWaiting, "Bed waiting for IR", BedSpColor);
+        }
+
+        private void TrackWait(ref ChartBand band, ref bool wasWaiting, bool waiting, string label, Color color) {
+            if (waiting) {
+                // A new wait shortly after the last one carries on the same band.
+                if (band == null || (!wasWaiting && _lastX - band.XTo > WaitBandGap)) {
+                    // Named in the legend and the hover read-out, not on the chart: waits can come back many times in a run.
+                    band = new ChartBand { XFrom = _lastX, XTo = _lastX, Label = label, Color = color, InLegend = true };
+                    _chart.Bands.Add(band);
+                }
+                band.XTo = Math.Max(band.XTo, _lastX);
+                _chart.Invalidate();
+            }
+            wasWaiting = waiting;
+        }
+
+        private void ClearWaitBands() {
+            _chart.Bands.Clear();
+            _irWaitBand = _bedWaitBand = null;
+            _irWaiting = _bedWaiting = false;
         }
 
         private static (string Text, Color Color) Describe(ProgramState state) => state switch {
@@ -556,6 +593,7 @@ namespace ReflowLink.UI.Pages {
                 _plan.Points.Clear();
                 _bedPlan.Points.Clear();
                 _chart.Markers.Clear();
+                ClearWaitBands();
                 _runPlan = _runBedPlan = null;
                 var prof = _runPattern.HasValue ? State.SlotProfiles[_runPattern.Value] : null;
                 if (_runPattern.HasValue && Bed) {
@@ -675,6 +713,7 @@ namespace ReflowLink.UI.Pages {
             _lastX = 0;
             foreach (var s in _chart.Series) s.Points.Clear();
             _chart.Markers.Clear();
+            ClearWaitBands();
             _runStart = null;
             _runPlan = _runBedPlan = null;
             UpdateWindow();

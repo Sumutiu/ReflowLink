@@ -43,6 +43,11 @@ namespace ReflowLink.UI.Controls {
         public double XFrom, XTo;
         public string Label;
         public Color Color = Theme.Accent;
+        /// <summary>
+        /// Named once in the legend (one entry per label, click it to hide those bands) and in the hover read-out, instead
+        /// of being written on the band. For bands that come back many times, which would fill the chart with text.
+        /// </summary>
+        public bool InLegend;
     }
 
     /// <summary>Lightweight time/temperature chart with hover read-out.</summary>
@@ -50,7 +55,16 @@ namespace ReflowLink.UI.Controls {
     public class ChartView : Control {
         private Point? _mouse;
 
-        private List<(ChartSeries Series, Rectangle Bounds)> _legend = [];
+        /// <summary>One legend entry: a curve, or a kind of band (by its label).</summary>
+        private sealed class LegendItem {
+            public ChartSeries Series;
+            public string Band;
+            public Color BandColor;
+            public Rectangle Bounds;
+        }
+
+        private List<LegendItem> _legend = [];
+        private readonly HashSet<string> _hiddenBands = [];
 
         public ChartView() {
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
@@ -62,29 +76,37 @@ namespace ReflowLink.UI.Controls {
         private static bool Drawn(ChartSeries s) => s.Visible && !s.Hidden;
 
         /// <summary>Lays the legend out from left to right, wrapping onto more rows when it doesn't fit.</summary>
-        private List<(ChartSeries Series, Rectangle Bounds)> LayoutLegend(int left, int right) {
-            var items = new List<(ChartSeries, Rectangle)>();
+        private List<LegendItem> LayoutLegend(int left, int right) {
+            var items = new List<LegendItem>();
+            for (int si = Series.Count - 1; si >= 0; si--)
+                if (Series[si].ShowInLegend) items.Add(new LegendItem { Series = Series[si] });
+            // Each kind of band once, once there is one.
+            foreach (var band in Bands) {
+                if (!band.InLegend || string.IsNullOrEmpty(band.Label) || items.Any(i => i.Band == band.Label)) continue;
+                items.Add(new LegendItem { Band = band.Label, BandColor = band.Color });
+            }
             int x = left, row = 0, rowH = Theme.S(22);
-            for (int si = Series.Count - 1; si >= 0; si--) {
-                var s = Series[si];
-                if (!s.ShowInLegend) continue;
-                int w = Theme.S(22) + TextRenderer.MeasureText(s.Name, Font).Width + Theme.S(4);
+            foreach (var item in items) {
+                int w = Theme.S(22) + TextRenderer.MeasureText(item.Series?.Name ?? item.Band, Font).Width + Theme.S(4);
                 if (x > left && x + w > right) {
                     row++;
                     x = left;
                 }
-                items.Add((s, new Rectangle(x, Theme.S(2) + row * rowH, w, rowH)));
+                item.Bounds = new Rectangle(x, Theme.S(2) + row * rowH, w, rowH);
                 x += w + Theme.S(12);
             }
             return items;
         }
 
+        private bool BandShown(ChartBand band) => !band.InLegend || !_hiddenBands.Contains(band.Label ?? "");
+
         protected override void OnMouseClick(MouseEventArgs e) {
             base.OnMouseClick(e);
             if (e.Button != MouseButtons.Left) return;
-            foreach (var (s, r) in _legend) {
-                if (!r.Contains(e.Location)) continue;
-                s.Hidden = !s.Hidden;
+            foreach (var item in _legend) {
+                if (!item.Bounds.Contains(e.Location)) continue;
+                if (item.Series != null) item.Series.Hidden = !item.Series.Hidden;
+                else if (!_hiddenBands.Remove(item.Band)) _hiddenBands.Add(item.Band);
                 Invalidate();
                 return;
             }
@@ -118,7 +140,7 @@ namespace ReflowLink.UI.Controls {
             base.OnMouseMove(e);
             _mouse = e.Location;
             bool overLegend = false;
-            foreach (var (_, r) in _legend) overLegend |= r.Contains(e.Location);
+            foreach (var item in _legend) overLegend |= item.Bounds.Contains(e.Location);
             Cursor = overLegend ? Cursors.Hand : Cursors.Default;
             Invalidate();
         }
@@ -221,6 +243,7 @@ namespace ReflowLink.UI.Controls {
 
             // Bands
             foreach (var band in Bands) {
+                if (!BandShown(band)) continue;
                 double from = Math.Max(xmin, band.XFrom), to = Math.Min(xmax, band.XTo);
                 if (to <= from) continue;
                 var rect = new RectangleF(X(from), plot.Top, X(to) - X(from), plot.Height);
@@ -229,7 +252,7 @@ namespace ReflowLink.UI.Controls {
                     g.DrawLine(pen, rect.Left, rect.Top, rect.Left, rect.Bottom);
                     g.DrawLine(pen, rect.Right, rect.Top, rect.Right, rect.Bottom);
                 }
-                if (!string.IsNullOrEmpty(band.Label))
+                if (!band.InLegend && !string.IsNullOrEmpty(band.Label))
                     TextRenderer.DrawText(g, band.Label, Theme.SmallBold, new Rectangle((int)rect.Left + Theme.S(4), plot.Top + Theme.S(4), Math.Max(Theme.S(40), (int)rect.Width - Theme.S(8)), Theme.S(18)),
                         Theme.Blend(band.Color, Theme.Text, 0.3f), TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
             }
@@ -275,8 +298,24 @@ namespace ReflowLink.UI.Controls {
             if (!any)
                 TextRenderer.DrawText(g, EmptyText, Theme.Body, plot, Theme.TextFaint, Theme.CenterMiddle);
 
-            // Legend: click an entry to hide or show its curve.
-            foreach (var (s, r) in _legend) {
+            // Legend: click an entry to hide or show its curve (or its bands).
+            foreach (var item in _legend) {
+                var r = item.Bounds;
+                if (item.Series == null) {
+                    bool shown = !_hiddenBands.Contains(item.Band);
+                    int by = r.Top + r.Height / 2;
+                    var swatch = new Rectangle(r.Left + Theme.S(2), by - Theme.S(6), Theme.S(12), Theme.S(12));
+                    using (var b = new SolidBrush(Theme.WithAlpha(shown ? item.BandColor : Theme.TextFaint, 60))) g.FillRectangle(b, swatch);
+                    using (var pen = new Pen(Theme.WithAlpha(shown ? item.BandColor : Theme.TextFaint, 160))) g.DrawRectangle(pen, swatch);
+                    var bandSize = TextRenderer.MeasureText(g, item.Band, Font);
+                    var bandPos = new Point(r.Left + Theme.S(22), by - bandSize.Height / 2);
+                    TextRenderer.DrawText(g, item.Band, Font, bandPos, shown ? Theme.TextDim : Theme.TextFaint, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+                    if (!shown)
+                        using (var pen = new Pen(Theme.TextFaint))
+                            g.DrawLine(pen, bandPos.X, by, bandPos.X + bandSize.Width, by);
+                    continue;
+                }
+                var s = item.Series;
                 bool drawn = Drawn(s);
                 var c = drawn ? s.Color : Theme.WithAlpha(Theme.TextFaint, 120);
                 int cy = r.Top + r.Height / 2;
@@ -297,6 +336,9 @@ namespace ReflowLink.UI.Controls {
                     g.DrawLine(pen, _mouse.Value.X, plot.Top, _mouse.Value.X, plot.Bottom);
 
                 var lines = new List<KeyValuePair<Color, string>> { new(Theme.TextDim, XLabel(hx)) };
+                // Bands named in the legend say what was going on at that moment.
+                foreach (var label in Bands.Where(b => b.InLegend && BandShown(b) && hx >= b.XFrom && hx <= b.XTo).Select(b => (b.Label, b.Color)).Distinct())
+                    lines.Add(new KeyValuePair<Color, string>(label.Color, label.Label));
                 for (int si = Series.Count - 1; si >= 0; si--) {
                     var s = Series[si];
                     if (!Drawn(s) || s.Points.Count == 0 || !s.ShowInLegend) continue;

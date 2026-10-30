@@ -62,7 +62,7 @@ namespace ReflowLink.UI {
                 AutoScroll = true,
                 FlowDirection = FlowDirection.TopDown,
                 WrapContents = false,
-                Height = Theme.S(8 * 44 + 4 * 30 + 12),
+                Height = Theme.S(9 * 44 + 4 * 30 + 12),
                 BackColor = Theme.Sidebar,
                 Padding = new Padding(0, Theme.S(4), 0, 0),
             };
@@ -85,6 +85,7 @@ namespace ReflowLink.UI {
             AddNav("bedconsole", "Console", Glyph.Console);
             AddHeader("ReflowLink");
             AddNav("settings", "Settings", Glyph.Settings);
+            AddNav("backup", "Backup & Restore", Glyph.Save);
 
             // Connection blocks at the bottom of the sidebar: top IR, then bed heat
             _irBox = new ConnectionBox("Top IR Connection") { Dock = DockStyle.Top };
@@ -137,6 +138,7 @@ namespace ReflowLink.UI {
             AddPage("console", new ConsolePage(_state, _state.Ir));
             AddPage("bedconsole", new ConsolePage(_state, _state.BedChannel));
             AddPage("settings", new SettingsPage(_state));
+            AddPage("backup", new BackupPage(_state));
             // Offers a newer release only while nothing is going on: no run, no operation, no other dialog open.
             _state.Updates = new UpdateNotifier(_state, this, () => !_dashboard.IsProgramActive && !_state.Busy && ActiveForm == this);
 
@@ -615,8 +617,9 @@ namespace ReflowLink.UI {
             protected override void OnPaint(PaintEventArgs e) {
                 var g = e.Graphics;
                 g.Clear(Theme.Window);
-                TextRenderer.DrawText(g, _title, Theme.Title, new Point(-Theme.S(1), 0), Theme.Text, TextFormatFlags.NoPadding);
-                TextRenderer.DrawText(g, _subtitle, Theme.Body, new Point(0, Theme.Title.Height + Theme.S(2)), Theme.TextDim, TextFormatFlags.NoPadding);
+                // NoPrefix: "&" is shown as is (Backup & Restore), not taken as a keyboard shortcut marker.
+                TextRenderer.DrawText(g, _title, Theme.Title, new Point(-Theme.S(1), 0), Theme.Text, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+                TextRenderer.DrawText(g, _subtitle, Theme.Body, new Point(0, Theme.Title.Height + Theme.S(2)), Theme.TextDim, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
             }
         }
     }

@@ -288,7 +288,19 @@ namespace ReflowLink.Model {
 
         /// <summary>Saves the settings without ever leaving a half-written file; the previous file is kept as a backup.</summary>
         public void Save() {
+            if (_installed) return; // imported settings are waiting for the restart: don't save over them
             try { SaveTo(SettingsPath); } catch { /* settings are best-effort */ }
+        }
+
+        private static bool _installed;
+
+        /// <summary>
+        /// Replaces the settings file with imported settings (the current file is kept as the backup) and stops this running
+        /// copy of ReflowLink from saving over them. ReflowLink must restart next to use them.
+        /// </summary>
+        public static void Install(AppSettings imported) {
+            imported.SaveTo(SettingsPath);
+            _installed = true;
         }
 
         internal void SaveTo(string path) {

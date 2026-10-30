@@ -209,6 +209,9 @@ namespace ReflowLink.Services {
             var virt = single ? virtualBed() : null;
             bool linked = Enabled && _ir.Device.State == LinkStatus.Connected && ir != null
                 && (single ? virt.HasValue : _bed.Device.State == LinkStatus.Connected && bed != null);
+            // A poll whose program state couldn't be read says nothing: decide on the next one. (Acting on it would forget
+            // a hold the coordinator made, and the held controller would never be resumed.)
+            if (linked && (ir.State == ProgramState.Unknown || (!single && bed.State == ProgramState.Unknown))) return;
             if (linked) _wasPairRun = (ir.State is ProgramState.Running or ProgramState.Hold) && (single || bed.State is ProgramState.Running or ProgramState.Hold);
             if (!linked || _userHold || Sync == null) {
                 StepUnknown = false;

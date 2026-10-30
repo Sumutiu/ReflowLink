@@ -112,7 +112,11 @@ namespace ReflowLink.Services {
     /// </para>
     /// </summary>
     public sealed class BedSwitchController {
-        /// <summary>Readings older than this don't count (seconds of real time).</summary>
+        /// <summary>
+        /// Readings older than this don't count (seconds of real time). Until then a missed reading (bed temperature, step
+        /// or program state) is bridged with the last good one, so a single glitch on the cable doesn't switch OUT2 off and
+        /// straight back on (two needless A2 writes and relay clicks).
+        /// </summary>
         private const double StaleSeconds = 5;
         /// <summary>A bed reading outside this range is treated as a sensor fault.</summary>
         private const double MinValid = -50, MaxValid = 600;
@@ -140,6 +144,9 @@ namespace ReflowLink.Services {
         private int _failures;
         private Task _pendingTask;
         private DateTime _lastBedReading = DateTime.MinValue, _retryAfter = DateTime.MinValue;
+        // Last step and program state the controller reported, for bridging a missed reading.
+        private int? _lastStep;
+        private DateTime _lastStepAt = DateTime.MinValue, _lastStateAt = DateTime.MinValue;
         private bool _enabled;
 
         public BedSwitchController(DeviceService ir, AppSettings settings) {
@@ -279,6 +286,7 @@ namespace ReflowLink.Services {
             _paired = PairedHint;
             _pairedEvidence = 0;
             _offQueued = _failureReported = _sensorLostReported = false;
+            _lastStep = null;
             _lastProcessTime = double.NaN;
             _failures = 0;
             _retryAfter = DateTime.MinValue;
@@ -342,9 +350,11 @@ namespace ReflowLink.Services {
             bool freshA2 = t.Alarm2.HasValue && (LastWrite == null || t.Time > LastWrite.Value);
             if (freshA2) Alarm2 = t.Alarm2;
 
-            // A poll whose program state couldn't be read says nothing about starts and ends: keep the run as it was, but
-            // don't heat on it.
+            // A poll whose program state couldn't be read says nothing about starts and ends: keep the run as it was. A
+            // short gap is bridged; after that the bed isn't heated on a guess.
             bool stateKnown = t.State != ProgramState.Unknown;
+            if (stateKnown) _lastStateAt = DateTime.Now;
+            bool stateFresh = stateKnown || (DateTime.Now - _lastStateAt).TotalSeconds <= StaleSeconds;
             bool active = stateKnown ? t.State is ProgramState.Running or ProgramState.Hold : _wasActive;
             if (stateKnown) {
                 if (_freshEnable) {
@@ -361,6 +371,7 @@ namespace ReflowLink.Services {
                     _plan = null; // program ended or stopped
                     _planFromBegin = false;
                     _halted = false;
+                    _lastStep = null;
                 }
                 if (!active) _stopHeld = false;
                 _wasActive = active;
@@ -377,10 +388,16 @@ namespace ReflowLink.Services {
                     if (!PairedHint && _planFromBegin) PairedDetected?.Invoke();
                 }
                 step = SyncCoordinator.StepOf(t.Segment, _plan.Steps, _paired);
+                if (step.HasValue) {
+                    _lastStep = step;
+                    _lastStepAt = DateTime.Now;
+                } else if (active && _lastStep.HasValue && (DateTime.Now - _lastStepAt).TotalSeconds <= StaleSeconds) {
+                    step = _lastStep; // a missed SE reading: the program is still in the step it last reported
+                }
             }
 
             var why = _holdOff ? "Switched off"
-                : !stateKnown ? "Program state unknown"
+                : !stateFresh ? "Program state unknown"
                 : Decide(_ir.State == LinkStatus.Connected, active, _halted, _plan, step, BedTemperature, _settings.Bed.MaxTemperature);
             if (why == "No bed targets") why = _noPlanReason;
             if (why == null) {
@@ -422,6 +439,7 @@ namespace ReflowLink.Services {
             _proportioner.Reset();
             _paired = PairedHint;
             _pairedEvidence = 0;
+            _lastStep = null;
             // A start that overtook a Stop doesn't switch the bed back on.
             _halted = _stopHeld;
             if (_stopHeld) return;

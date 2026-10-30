@@ -32,6 +32,8 @@ namespace ReflowLink.Protocol {
         public double? Pv2;
         /// <summary>Alarm 2 value (A2), which switches OUT2 with a single PC410. Read every other poll when asked for.</summary>
         public double? Alarm2;
+        /// <summary>The poll stopped early to let a command (Stop, a write) use the bus: readings after PV are missing.</summary>
+        public bool Partial;
     }
 
     public struct OperationProgress(int done, int total, string text) {
@@ -133,26 +135,40 @@ namespace ReflowLink.Protocol {
         /// <param name="includePattern">Also read the selected pattern (ch).</param>
         /// <param name="in2">Also read the second input IN2 (P2) every poll.</param>
         /// <param name="alarm2">Also read alarm 2 (A2) every other poll, for single PC410 bed control.</param>
+        /// <remarks>
+        /// The bus is locked per reading, not for the whole poll, and once a command is waiting for the bus (Stop, a write)
+        /// the readings still to come are skipped, so the command goes out after at most one reading. Everything but PV is
+        /// optional: asked once, without retries, so a missing answer costs one timeout. A reading skipped or missed this
+        /// way is bridged by the next poll (the bed control and the Dashboard keep the last good values for a few seconds).
+        /// </remarks>
         public Telemetry ReadTelemetry(bool includePattern = false, bool in2 = false, bool alarm2 = false) {
-            lock (Client.SyncRoot) {
-                var t = new Telemetry {
-                    Time = DateTime.Now,
-                    Pv = Client.ReadNumber(Pv),
-                    Sp = TryNumber(Sp),
-                    Op = TryNumber(Op)
-                };
+            var t = new Telemetry {
+                Time = DateTime.Now,
+                Pv = Client.ReadNumber(Pv),
+                State = ProgramState.Unknown,
+            };
+            try {
+                if (Yield()) return Partial(t);
+                t.Sp = TryNumber(Sp);
+                if (Yield()) return Partial(t);
+                // The program state comes early: the bed control and Wait for Bed rely on it.
+                try { t.Os = Client.ReadOptionalHexWord(Os); t.State = DecodeOs(t.Os.Value); } catch (Pc410Exception) { t.State = ProgramState.Unknown; }
+                if (Yield()) return Partial(t);
                 // A controller that doesn't answer them would cost a timeout every poll: after repeated misses they're only
                 // tried every 20th poll (a single PC410's bed is kept off meanwhile, since its temperature is unknown).
                 if (in2 && (_p2Supported || _cycle % 20 == 0)) t.Pv2 = TryOptional(BedInput, ref _p2Supported, ref _p2Misses);
+                if (Yield()) return Partial(t);
                 if (alarm2 && _cycle % 2 == 0 && (_a2Supported || _cycle % 20 == 0)) t.Alarm2 = TryOptional(BedAlarm, ref _a2Supported, ref _a2Misses);
-                try { t.Os = Client.ReadHexWord(Os); t.State = DecodeOs(t.Os.Value); } catch (Pc410Exception) { t.State = ProgramState.Unknown; }
+                if (Yield()) return Partial(t);
+                t.Op = TryNumber(Op);
+                if (Yield()) return Partial(t);
 
                 // Optional parameters: give up on them only after repeated failures in cycles where PV itself answered (so
                 // a cable glitch does not disable them). The step (SE) matters for Wait for Bed and the single PC410 bed, so
                 // it's still tried every 20th poll and comes back as soon as it answers again.
                 if (_seSupported || _cycle % 20 == 0) {
                     try {
-                        t.Segment = (int)Client.ReadNumber(Se);
+                        t.Segment = (int)Client.ReadOptionalNumber(Se);
                         _seSupported = true;
                         _seMisses = 0;
                     } catch (Pc410NakException) {
@@ -161,25 +177,36 @@ namespace ReflowLink.Protocol {
                         if (++_seMisses >= UnsupportedAfter) _seSupported = false;
                     }
                 }
+                if (Yield()) return Partial(t);
                 if (_swSupported && (_cycle % 5 == 0)) {
-                    try { t.StatusWord = Client.ReadHexWord(Sw); _swMisses = 0; } catch (Pc410NakException) { _swSupported = false; } catch (Pc410Exception) { if (++_swMisses >= UnsupportedAfter) _swSupported = false; }
+                    try { t.StatusWord = Client.ReadOptionalHexWord(Sw); _swMisses = 0; } catch (Pc410NakException) { _swSupported = false; } catch (Pc410Exception) { if (++_swMisses >= UnsupportedAfter) _swSupported = false; }
                 }
                 if (includePattern) {
-                    try { t.Pattern = ReadPattern(); } catch (Pc410Exception) { }
+                    if (Yield()) return Partial(t);
+                    try { t.Pattern = (int)Math.Round(Client.ReadOptionalNumber(Pattern)); } catch (Pc410Exception) { }
                 }
-                _cycle++;
                 return t;
+            } finally {
+                _cycle++;
             }
         }
 
+        /// <summary>A command waits for the bus: leave the rest of this poll's readings for the next one.</summary>
+        private bool Yield() => Client.CommandWaiting;
+
+        private static Telemetry Partial(Telemetry t) {
+            t.Partial = true;
+            return t;
+        }
+
         private double? TryNumber(string m) {
-            try { return Client.ReadNumber(m); } catch (Pc410Exception) { return null; }
+            try { return Client.ReadOptionalNumber(m); } catch (Pc410Exception) { return null; }
         }
 
         // Unlike SE and SW, one refusal doesn't give up on P2 / A2: they matter for the bed, so it takes repeated misses.
         private double? TryOptional(string m, ref bool supported, ref int misses) {
             try {
-                double v = Client.ReadNumber(m);
+                double v = Client.ReadOptionalNumber(m);
                 supported = true;
                 misses = 0;
                 return v;
