@@ -10,33 +10,111 @@ using ReflowLink.Protocol;
 
 namespace ReflowLink.Services {
     /// <summary>
-    /// The bed's setpoint path for one run with a single PC410. The bed has no program of its own, so its setpoint follows
-    /// the IR program: during a step's ramp it moves from the previous bed target to this step's bed target in proportion
-    /// to how far the IR setpoint has got, and during the hold it stays at the bed target.
+    /// The bed's program for one run with a single PC410. The PC410 only reads the bed on IN2 and switches it with OUT2,
+    /// so ReflowLink runs the bed's program itself, the way a second PC410 would run it:
+    /// <list type="bullet">
+    /// <item>Its own program (<see cref="OwnProgram"/>): each step ramps to the bed target at the bed's ramp rate, then
+    /// holds it for the step's hold time. Like the PC410, it waits while the bed is further from the setpoint than the bed
+    /// holdback, and while it's held (Hold, or Wait for IR). Wait for Bed / Wait for IR keep its steps in line with the IR
+    /// program's.</item>
+    /// <item>A pattern written before the bed had its own ramps: the setpoint follows the IR program. During a step's ramp
+    /// it moves from the previous bed target to this step's bed target in proportion to how far the IR setpoint has got,
+    /// and during the hold it stays at the bed target.</item>
+    /// </list>
     /// </summary>
     public sealed class BedPlan {
-        private readonly double[] _ir, _bed;
+        private readonly double[] _ir, _bed, _ramps, _holds;
+        private double _holdLeft;
 
-        public BedPlan(IReadOnlyList<double> irTargets, IReadOnlyList<double> bedTargets, double irStart, double bedStart) {
+        /// <param name="bedRamps">The bed's ramp rates (°C/s); null to follow the IR program.</param>
+        /// <param name="holds">Hold time of each step (s), with <paramref name="bedRamps"/>.</param>
+        public BedPlan(IReadOnlyList<double> irTargets, IReadOnlyList<double> bedTargets, double irStart, double bedStart,
+            IReadOnlyList<double> bedRamps = null, IReadOnlyList<double> holds = null, double holdback = ReflowProfile.HoldbackDefault) {
             if (irTargets == null || bedTargets == null || irTargets.Count == 0 || irTargets.Count != bedTargets.Count)
                 throw new ArgumentException("Every step needs an IR target and a bed target.");
             _ir = [.. irTargets];
             _bed = [.. bedTargets];
             IrStart = irStart;
             BedStart = bedStart;
+            if (bedRamps != null) {
+                if (bedRamps.Count != _bed.Length || holds == null || holds.Count != _bed.Length || bedRamps.Any(r => !(r > 0)))
+                    throw new ArgumentException("Every step needs a bed ramp rate and a hold time.");
+                _ramps = [.. bedRamps];
+                _holds = [.. holds.Select(h => Math.Max(0, h))];
+            }
+            Holdback = holdback > 0 ? holdback : ReflowProfile.HoldbackDefault;
+            Setpoint = bedStart;
         }
 
         /// <summary>The plan saved with a pattern, or null if none was saved (written before version 2.1).</summary>
         public static BedPlan From(PatternSync sync, double irStart, double bedStart) =>
-            sync != null && sync.HasTargets ? new BedPlan(sync.IrTargets, sync.BedTargets, irStart, bedStart) : null;
+            sync == null || !sync.HasTargets ? null
+            : sync.HasBedProgram ? new BedPlan(sync.IrTargets, sync.BedTargets, irStart, bedStart, sync.BedRamps, sync.Holds, sync.BedHoldback)
+            : new BedPlan(sync.IrTargets, sync.BedTargets, irStart, bedStart);
 
         public int Steps => _ir.Length;
         public double IrStart { get; }
         public double BedStart { get; }
         public double BedTarget(int step) => _bed[Math.Max(1, Math.Min(Steps, step)) - 1];
 
+        /// <summary>The bed runs its own ramps and holds; false when it follows the IR program (older patterns).</summary>
+        public bool OwnProgram => _ramps != null;
+        /// <summary>Bed holdback (°C): the program waits while the bed is further than this from the setpoint.</summary>
+        public double Holdback { get; }
+        /// <summary>Step of the bed's own program (1-based).</summary>
+        public int Step { get; private set; } = 1;
+        /// <summary>The bed's own program has reached its setpoint in the current step and is holding it.</summary>
+        public bool Holding { get; private set; }
+        /// <summary>The bed's own program has done its last hold; it stays at the last target until the IR program ends.</summary>
+        public bool Finished { get; private set; }
+        /// <summary>Setpoint of the bed's own program.</summary>
+        public double Setpoint { get; private set; }
+
+        /// <summary>
+        /// Runs the bed's own program for <paramref name="dt"/> seconds of process time. Nothing moves while
+        /// <paramref name="paused"/>, without a bed reading, or while the bed lags the setpoint by more than the holdback
+        /// (during a ramp: behind it in the direction of the ramp; during a hold: either way).
+        /// </summary>
+        public void Advance(double dt, double? bedTemperature, bool paused) {
+            if (!OwnProgram || Finished || paused || !(dt > 0)) return;
+            if (bedTemperature is not double pv || Lags(pv)) return;
+            double left = dt;
+            while (left > 1e-9 && !Finished) {
+                int i = Step - 1;
+                if (!Holding) {
+                    double d = _bed[i] - Setpoint, reach = Math.Abs(d) / _ramps[i];
+                    if (reach > left) {
+                        Setpoint += Math.Sign(d) * _ramps[i] * left;
+                        return;
+                    }
+                    left -= reach;
+                    Setpoint = _bed[i];
+                    Holding = true;
+                    _holdLeft = _holds[i];
+                } else if (_holdLeft > left) {
+                    _holdLeft -= left;
+                    return;
+                } else {
+                    left -= _holdLeft;
+                    if (Step == Steps) {
+                        Finished = true;
+                    } else {
+                        Step++;
+                        Holding = false;
+                    }
+                }
+            }
+        }
+
+        private bool Lags(double pv) {
+            if (Holding) return Math.Abs(pv - Setpoint) > Holdback;
+            // A bed that's ahead of a ramp (still warm, or quick) doesn't stop it.
+            return _bed[Step - 1] >= Setpoint ? pv < Setpoint - Holdback : pv > Setpoint + Holdback;
+        }
+
         /// <summary>Bed setpoint while the IR program is in <paramref name="step"/> (1-based) with working setpoint <paramref name="irSp"/>.</summary>
         public double SetpointAt(int step, double? irSp) {
+            if (OwnProgram) return Setpoint;
             step = Math.Max(1, Math.Min(Steps, step));
             double irFrom = step == 1 ? IrStart : _ir[step - 2];
             double bedFrom = step == 1 ? BedStart : _bed[step - 2];
@@ -46,6 +124,14 @@ namespace ReflowLink.Services {
             f = Math.Max(0, Math.Min(1, f));
             return bedFrom + f * (bedTo - bedFrom);
         }
+    }
+
+    /// <summary>What the coordinator needs to know about a bed regulated by ReflowLink (single PC410).</summary>
+    public readonly struct VirtualBedState(double? pv, double? sp, int? step) {
+        public double? Pv { get; } = pv;
+        public double? Sp { get; } = sp;
+        /// <summary>Step of the bed's own program; null when the bed follows the IR program (always in the IR's step).</summary>
+        public int? Step { get; } = step;
     }
 
     /// <summary>PI regulator for the bed: heating only, output 0..100 %.</summary>
@@ -210,9 +296,23 @@ namespace ReflowLink.Services {
         /// <summary>Raised once per run when the bed reading is lost while regulating.</summary>
         public event Action SensorLost;
 
-        /// <summary>Bed side for Wait for Bed: its temperature and setpoint, or null when it isn't being regulated.</summary>
-        public (double? Pv, double? Sp)? VirtualBed() =>
-            _enabled && _plan != null && BedTemperature.HasValue && Setpoint.HasValue ? (BedTemperature, Setpoint) : null;
+        /// <summary>
+        /// Bed side for Wait for Bed / Wait for IR: its temperature, setpoint and step (null: the IR's step, for a bed that
+        /// follows the IR program), or null when it isn't being regulated.
+        /// </summary>
+        public VirtualBedState? VirtualBed() =>
+            _enabled && _plan != null && BedTemperature.HasValue && Setpoint.HasValue
+                ? new VirtualBedState(BedTemperature, Setpoint, _plan.OwnProgram ? _plan.Step : null)
+                : null;
+
+        /// <summary>The bed's own program is held by Wait for IR (set by the <see cref="SyncCoordinator"/>).</summary>
+        public bool VirtualHold { get; set; }
+
+        /// <summary>
+        /// The IR program is on hold only because it waits for the bed (Wait for Bed), so the bed's program keeps going.
+        /// Any other hold (the user's) holds the bed's program too.
+        /// </summary>
+        public Func<bool> IrHeldForBed { get; set; }
 
         /// <summary>Sets the plan for the run being started from ReflowLink (also fine after its first poll arrived).</summary>
         public void Begin(BedPlan plan) {
@@ -288,6 +388,7 @@ namespace ReflowLink.Services {
             _offQueued = _failureReported = _sensorLostReported = false;
             _lastStep = null;
             _lastProcessTime = double.NaN;
+            VirtualHold = false;
             _failures = 0;
             _retryAfter = DateTime.MinValue;
             _regulator.Reset();
@@ -396,6 +497,13 @@ namespace ReflowLink.Services {
                 }
             }
 
+            // The bed's own program runs while the IR program does. It's paused with it when the user holds the program (a
+            // second PC410 would be held too), but not when the IR is only held to wait for the bed; and by Wait for IR.
+            if (active && _plan != null && !_halted && stateFresh) {
+                bool userHold = t.State == ProgramState.Hold && !(IrHeldForBed?.Invoke() ?? false);
+                _plan.Advance(dt, BedTemperature, userHold || VirtualHold);
+            }
+
             var why = _holdOff ? "Switched off"
                 : !stateFresh ? "Program state unknown"
                 : Decide(_ir.State == LinkStatus.Connected, active, _halted, _plan, step, BedTemperature, _settings.Bed.MaxTemperature);
@@ -403,6 +511,8 @@ namespace ReflowLink.Services {
             if (why == null) {
                 Setpoint = _plan.SetpointAt(step.Value, t.Sp);
                 Demand = _regulator.Update(Setpoint.Value, BedTemperature.Value, dt);
+                // Waiting for the IR (Wait for IR) at or above its set temperature: no power at all until the IR is there too.
+                if (VirtualHold && BedTemperature.Value >= Setpoint.Value) Demand = 0;
                 WantOn = _proportioner.On(now, Demand);
                 Reason = WantOn ? "Heating" : "Regulating";
             } else {
@@ -440,6 +550,7 @@ namespace ReflowLink.Services {
             _paired = PairedHint;
             _pairedEvidence = 0;
             _lastStep = null;
+            VirtualHold = false;
             // A start that overtook a Stop doesn't switch the bed back on.
             _halted = _stopHeld;
             if (_stopHeld) return;

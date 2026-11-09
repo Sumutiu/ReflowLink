@@ -28,7 +28,7 @@ namespace ReflowLink.UI.Pages {
             ef.Controls.Add(Para("The file holds:", Theme.Body, Theme.Text, 0));
             ef.Controls.Add(Para(
                 "• Settings: station, connections, temperature limits, bed heat setup, logging and recording options.\n"
-                + "• What ReflowLink keeps for each controller pattern: bed targets, Wait for Bed / Wait for IR, blocked patterns.\n"
+                + "• What ReflowLink keeps for each controller pattern: bed targets and ramps, Wait for Bed / Wait for IR, blocked patterns.\n"
                 + "• The P, I and D saved before an auto-tune.\n"
                 + "• Your profiles (the files in Documents\\ReflowLink\\Profiles), when switched on below.",
                 Theme.Small, Theme.TextDim, 4));

@@ -7,32 +7,41 @@ using ReflowLink.Protocol;
 
 namespace ReflowLink.Services {
     /// <summary>What the coordinator needs to know about one controller.</summary>
-    public readonly struct SyncSide(ProgramState state, double? pv, double? sp, int? step) {
+    public readonly struct SyncSide(ProgramState state, double? pv, double? sp, int? step, double? target = null) {
         public ProgramState State { get; } = state;
         public double? Pv { get; } = pv;
         public double? Sp { get; } = sp;
         /// <summary>Current program step (1-based); null when the controller doesn't report it.</summary>
         public int? Step { get; } = step;
+        /// <summary>Target of the current step (°C); null when not known (a pattern saved before version 2.1).</summary>
+        public double? Target { get; } = target;
 
         public bool Active => State is ProgramState.Running or ProgramState.Hold;
 
-        /// <summary>True when the temperature is further from the setpoint than the holdback band.</summary>
-        public bool Lags(double holdback) => Pv is double pv && Sp is double sp && Math.Abs(pv - sp) > holdback;
+        /// <summary>The step's ramp is done: the setpoint has reached the step's target (its hold time would start now).</summary>
+        public bool AtTarget => Sp is double sp && Target is double t && Math.Abs(sp - t) <= 0.15;
+
+        /// <summary>The heater is at the step's set temperature: ramp done, and the temperature within the holdback band.</summary>
+        public bool Reached(double holdback) => AtTarget && Pv is double pv && Math.Abs(pv - Target.Value) <= holdback;
     }
 
     /// <summary>
     /// Keeps the top IR and bed heat programs in step. The two PC410s can't talk to each other, so ReflowLink holds
     /// whichever one is ahead:
     /// <list type="bullet">
-    /// <item>Wait for Bed on a step: the IR doesn't get ahead of the bed in that step. While the bed is in the step,
-    /// the IR is held if it has already moved on to a later step, or if both are in the step and the bed is further
-    /// from its setpoint than the bed holdback.</item>
-    /// <item>Wait for IR on a step: the same for the bed, using the IR holdback.</item>
+    /// <item>Wait for Bed on a step: when the IR reaches the step's set temperature (its ramp is done), it's held before
+    /// its hold time until the bed is at its set temperature too (ramp done, temperature within the bed holdback). Then
+    /// both do the hold time together.</item>
+    /// <item>Wait for IR on a step: the same for the bed, waiting for the IR (within the IR holdback).</item>
+    /// <item>As a safety net (a 0 s hold time, a missed reading), a heater that has already moved on to the next step
+    /// is held there until the other one has too.</item>
     /// </list>
-    /// So a toggle goes on the step where the heaters drift apart (for example the step where the bed has the longer
-    /// ramp). A program held by the user is never resumed automatically.
-    /// <para>With a single PC410 (<see cref="VirtualBed"/>) only Wait for Bed applies: the IR is held while the bed,
-    /// regulated by ReflowLink, lags its setpoint.</para>
+    /// While held, a controller keeps regulating at its set temperature, so a heater that's above it gets no power.
+    /// So a toggle goes on the step where the heaters drift apart (Wait for Bed where the bed has the longer ramp). A
+    /// program held by the user is never resumed automatically.
+    /// <para>With a single PC410 (<see cref="VirtualBed"/>) the bed's program is run by ReflowLink, and Wait for IR holds
+    /// it there (<see cref="HoldVirtualBed"/>). For a pattern written before the bed had its own ramps, the bed follows the
+    /// IR program and only Wait for Bed applies: the IR is held while the bed lags its setpoint.</para>
     /// </summary>
     public sealed class SyncCoordinator {
         private sealed class Side(DeviceService device) {
@@ -50,6 +59,8 @@ namespace ReflowLink.Services {
         private readonly Side _ir, _bed;
         private bool _wasPairRun, _bedLostReported, _irLostReported;
         private int _pairedEvidence;
+        // Step in which both heaters have reached their set temperature: they're doing its hold time, nobody waits again.
+        private int _syncedStep;
         // Read from the command threads: a stop, a user hold or a lost link must cancel commands already queued.
         private volatile bool _userHold, _latched;
         private volatile int _generation;
@@ -70,11 +81,13 @@ namespace ReflowLink.Services {
         public PatternSync Sync { get; set; }
 
         /// <summary>
-        /// Single PC410: the bed's temperature and setpoint come from here instead of a second controller, and the bed is in
-        /// the same step as the IR. Only Wait for Bed applies (the bed has no program that could be held). Null with a
-        /// second PC410.
+        /// Single PC410: the bed's temperature, setpoint and step come from here instead of a second controller (the bed's
+        /// program run by ReflowLink). Null with a second PC410.
         /// </summary>
-        public Func<(double? Pv, double? Sp)?> VirtualBed { get; set; }
+        public Func<VirtualBedState?> VirtualBed { get; set; }
+
+        /// <summary>Single PC410: holds (true) or releases the bed's program run by ReflowLink, for Wait for IR.</summary>
+        public Action<bool> HoldVirtualBed { get; set; }
 
         /// <summary>
         /// The user held or is stopping the program: leave both controllers alone until it's cleared. Setting it also
@@ -85,11 +98,16 @@ namespace ReflowLink.Services {
             set {
                 _userHold = value;
                 _generation++;
-                if (value) _ir.AutoHeld = _bed.AutoHeld = false;
+                if (value) {
+                    _ir.AutoHeld = false;
+                    ReleaseVirtualBed();
+                }
             }
         }
 
         public bool IrWaiting => _ir.AutoHeld;
+        /// <summary>The IR is held, or about to be held or resumed, by the coordinator (not by the user).</summary>
+        public bool IrHeldForBed => _ir.AutoHeld || _ir.Pending;
         public bool BedWaiting => _bed.AutoHeld;
 
         public string WaitingText => _ir.AutoHeld ? "IR waiting for bed" : _bed.AutoHeld ? "Bed waiting for IR" : "";
@@ -147,9 +165,11 @@ namespace ReflowLink.Services {
         /// <summary>Forgets automatic holds and re-arms the coordinator (before a new run, or after the program ended).</summary>
         public void Reset() {
             _generation++;
-            _ir.AutoHeld = _bed.AutoHeld = false;
+            _ir.AutoHeld = false;
+            ReleaseVirtualBed();
             PairedSegments = PairedHint;
             _pairedEvidence = 0;
+            _syncedStep = 0;
             CheckedRun = false;
             foreach (var side in new[] { _ir, _bed }) {
                 side.HeldSince = side.ReleasedAt = null;
@@ -172,13 +192,15 @@ namespace ReflowLink.Services {
             _bedLostReported = _irLostReported = false;
             PairedSegments = PairedHint;
             _pairedEvidence = 0;
+            _syncedStep = 0;
         }
 
         /// <summary>Stops the coordinator from sending anything until <see cref="Reset"/> (used when the program is stopped).</summary>
         public void Halt() {
             _latched = true;
             _generation++;
-            _ir.AutoHeld = _bed.AutoHeld = false;
+            _ir.AutoHeld = false;
+            ReleaseVirtualBed();
             Changed?.Invoke();
         }
 
@@ -191,14 +213,23 @@ namespace ReflowLink.Services {
             return pairedSegments || (steps > 0 && s > steps) ? (s + 1) / 2 : s;
         }
 
-        /// <summary>Decides which controller should be held. Pure function, so it can be tested.</summary>
-        public static (bool HoldIr, bool HoldBed) Decide(PatternSync sync, SyncSide ir, SyncSide bed) {
+        /// <summary>
+        /// Decides which controller should be held. Pure function, so it can be tested.
+        /// </summary>
+        /// <param name="syncedStep">Step in which both have already reached their set temperature (0: none).</param>
+        public static (bool HoldIr, bool HoldBed) Decide(PatternSync sync, SyncSide ir, SyncSide bed, int syncedStep = 0) {
             if (sync == null || !sync.Any || !ir.Active || !bed.Active) return (false, false);
             if (ir.Step is not int irStep || bed.Step is not int bedStep) return (false, false);
-            bool holdIr = sync.WaitForBed(bedStep) && (irStep > bedStep || (irStep == bedStep && bed.Lags(sync.BedHoldback)));
-            bool holdBed = sync.WaitForIr(irStep) && (bedStep > irStep || (bedStep == irStep && ir.Lags(sync.IrHoldback)));
+            // In the same step, before its hold time: the one at its set temperature waits for the other.
+            bool waiting = irStep == bedStep && irStep != syncedStep;
+            bool holdIr = sync.WaitForBed(bedStep) && (irStep > bedStep || (waiting && ir.AtTarget && !bed.Reached(sync.BedHoldback)));
+            bool holdBed = sync.WaitForIr(irStep) && (bedStep > irStep || (waiting && bed.AtTarget && !ir.Reached(sync.IrHoldback)));
             return (holdIr, holdBed);
         }
+
+        /// <summary>Target of <paramref name="step"/> from a list saved with the pattern; null when unknown.</summary>
+        private static double? TargetOf(System.Collections.Generic.IReadOnlyList<double> targets, int? step) =>
+            step is int s && s >= 1 && s <= targets.Count ? targets[s - 1] : null;
 
         private void Evaluate() {
             if (_latched) return;
@@ -229,23 +260,45 @@ namespace ReflowLink.Services {
                 PairedSegments = true;
                 if (!PairedHint && CheckedRun) PairedDetected?.Invoke();
             }
-            var irSide = new SyncSide(ir.State, ir.Pv, ir.Sp, StepOf(ir.Segment, steps, PairedSegments));
-            // A single PC410's bed is always in the IR's step and "runs" exactly when the IR program does.
+            var irTargets = Sync.HasTargets ? Sync.IrTargets : [];
+            var bedTargets = Sync.HasTargets ? Sync.BedTargets : [];
+            int? irStep = StepOf(ir.Segment, steps, PairedSegments);
+            var irSide = new SyncSide(ir.State, ir.Pv, ir.Sp, irStep, TargetOf(irTargets, irStep));
+            // A single PC410's bed "runs" exactly when the IR program does; in its own step, or in the IR's when it follows it.
+            int? bedStep = single ? virt.Value.Step ?? irStep : StepOf(bed.Segment, steps, PairedSegments);
             var bedSide = single
-                ? new SyncSide(ir.State, virt.Value.Pv, virt.Value.Sp, irSide.Step)
-                : new SyncSide(bed.State, bed.Pv, bed.Sp, StepOf(bed.Segment, steps, PairedSegments));
+                ? new SyncSide(ir.State, virt.Value.Pv, virt.Value.Sp, bedStep, TargetOf(bedTargets, bedStep))
+                : new SyncSide(bed.State, bed.Pv, bed.Sp, bedStep, TargetOf(bedTargets, bedStep));
             StepUnknown = Sync.Any && irSide.Active && bedSide.Active && (irSide.Step == null || bedSide.Step == null);
+            // Both at their set temperature in the same step: they do its hold time together, without waiting again.
+            if (irStep is int both && both == bedStep && irSide.Reached(Sync.IrHoldback) && bedSide.Reached(Sync.BedHoldback))
+                _syncedStep = both;
 
-            var (holdIr, holdBed) = Decide(Sync, irSide, bedSide);
+            var (holdIr, holdBed) = Decide(Sync, irSide, bedSide, _syncedStep);
             Apply(_ir, holdIr, ir.State);
             if (!single) Apply(_bed, holdBed, bed.State);
-            CheckWaitTime(_ir, "The Top IR program has been waiting for the bed");
-            if (!single) CheckWaitTime(_bed, "The bed program has been waiting for the Top IR");
+            else if (virt.Value.Step.HasValue) ApplyVirtual(holdBed);
+            CheckWaitTime(_ir, "The Top IR program has been waiting for the bed", _ir.Device.TimeScale);
+            CheckWaitTime(_bed, "The bed program has been waiting for the Top IR", (single ? _ir : _bed).Device.TimeScale);
+        }
+
+        /// <summary>Single PC410: holds or releases the bed's program run by ReflowLink (it has no controller to send it to).</summary>
+        private void ApplyVirtual(bool hold) {
+            if (hold == _bed.AutoHeld || _userHold || _latched) return;
+            _bed.AutoHeld = hold;
+            HoldVirtualBed?.Invoke(hold);
+            Changed?.Invoke();
+        }
+
+        /// <summary>Forgets a hold of the bed (and releases the bed's program run by ReflowLink).</summary>
+        private void ReleaseVirtualBed() {
+            _bed.AutoHeld = false;
+            if (VirtualBed != null) HoldVirtualBed?.Invoke(false);
         }
 
         /// <summary>Asks the user once per wait when a hold lasts longer than <see cref="MaxWaitMinutes"/>.</summary>
-        private void CheckWaitTime(Side side, string what) {
-            double scale = Math.Max(1, side.Device.TimeScale);
+        private void CheckWaitTime(Side side, string what, double timeScale) {
+            double scale = Math.Max(1, timeScale);
             if (!side.AutoHeld) {
                 // Released: a wait that comes back within a minute is the same wait (a heater hovering at the holdback edge).
                 if (side.HeldSince == null) return;
@@ -267,7 +320,12 @@ namespace ReflowLink.Services {
 
         private void ReleaseAll() {
             if (_ir.AutoHeld) Apply(_ir, false, _ir.Device.Last?.State ?? ProgramState.Unknown);
-            if (_bed.AutoHeld) Apply(_bed, false, _bed.Device.Last?.State ?? ProgramState.Unknown);
+            if (_bed.AutoHeld && VirtualBed != null) {
+                ReleaseVirtualBed();
+                Changed?.Invoke();
+            } else if (_bed.AutoHeld) {
+                Apply(_bed, false, _bed.Device.Last?.State ?? ProgramState.Unknown);
+            }
         }
 
         private async void Apply(Side side, bool hold, ProgramState state) {

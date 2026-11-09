@@ -10,10 +10,15 @@ using System.Xml.Serialization;
 
 namespace ReflowLink.Model {
     public sealed class ProfileStep {
-        private double _bedTarget = double.NaN;
+        private double _bedTarget = double.NaN, _bedRamp = double.NaN;
 
-        /// <summary>Ramp rate in °C per second (used by both controllers).</summary>
+        /// <summary>Top IR ramp rate in °C per second.</summary>
         [XmlAttribute("ramp")] public double RampRate { get; set; } = 1.0;
+        /// <summary>
+        /// Bed heat ramp rate in °C per second. Profiles saved before the bed had its own ramp read it as the IR ramp.
+        /// </summary>
+        [XmlAttribute("bedRamp")]
+        public double BedRampRate { get => double.IsNaN(_bedRamp) ? RampRate : _bedRamp; set => _bedRamp = value; }
         /// <summary>Top IR target (level) temperature in °C.</summary>
         [XmlAttribute("target")] public double Target { get; set; } = 150;
         /// <summary>Bed heat target in °C. Profiles saved before bed heat control read it as the IR target.</summary>
@@ -31,6 +36,7 @@ namespace ReflowLink.Model {
 
         public ProfileStep Clone() => new(RampRate, Target, HoldSeconds) {
             BedTarget = BedTarget,
+            BedRampRate = BedRampRate,
             WaitForBed = WaitForBed,
             WaitForIr = WaitForIr,
         };
@@ -57,6 +63,67 @@ namespace ReflowLink.Model {
         [XmlArray("Steps"), XmlArrayItem("Step")]
         public List<ProfileStep> Steps { get; set; } = [];
 
+        // ---------------------------------------------------------------- constant temperature
+
+        /// <summary>Default temperature of the constant temperature mode (°C).</summary>
+        public const double DefaultConstantTarget = 150;
+        /// <summary>Default ramp to the constant temperature (°C/s), the same as a new step's.</summary>
+        public const double DefaultConstantRamp = 1;
+        /// <summary>Hold of each of the 8 steps of a constant temperature pattern (s): together just over 22 hours.</summary>
+        public const int ConstantHoldSeconds = 9999;
+
+        /// <summary>
+        /// Hold one temperature until Stop instead of running the steps. ACHI stations only drive the heater while a program
+        /// runs, so it's written as a pattern: 8 steps at the same temperature with the longest hold each (about 22 hours).
+        /// The profile's own steps are kept (and saved), and used again once this is switched off.
+        /// </summary>
+        public bool ConstantTemperature { get; set; }
+        /// <summary>Top IR temperature in constant temperature mode (°C).</summary>
+        public double ConstantTarget { get; set; } = DefaultConstantTarget;
+        /// <summary>Bed temperature in constant temperature mode (°C), when a bed heater is controlled.</summary>
+        public double ConstantBedTarget { get; set; } = DefaultConstantTarget;
+        /// <summary>Top IR ramp to the constant temperature (°C/s).</summary>
+        public double ConstantRamp { get; set; } = DefaultConstantRamp;
+        /// <summary>
+        /// Bed ramp to the constant temperature (°C/s). A second PC410 runs it in its own pattern; with a single PC410,
+        /// ReflowLink ramps the bed setpoint at this rate and switches OUT2 on the IN2 reading.
+        /// </summary>
+        public double ConstantBedRamp { get; set; } = DefaultConstantRamp;
+
+        /// <summary>Total length of a constant temperature pattern once the temperature is reached (s).</summary>
+        public static double ConstantTotalSeconds => (double)ConstantHoldSeconds * MaxSteps;
+
+        /// <summary>
+        /// The profile as it's written to the controller: its steps, or in constant temperature mode 8 steps that ramp to
+        /// the temperature and hold it.
+        /// </summary>
+        public ReflowProfile ForController() {
+            if (!ConstantTemperature) return this;
+            var p = Clone();
+            p.Steps = [.. Enumerable.Range(0, MaxSteps).Select(_ =>
+                new ProfileStep(ConstantRamp, ConstantTarget, ConstantHoldSeconds) { BedTarget = ConstantBedTarget, BedRampRate = ConstantBedRamp })];
+            return p;
+        }
+
+        /// <summary>
+        /// True when the steps are a constant temperature pattern as ReflowLink writes it (8 steps at one temperature, each
+        /// with the longest hold), for a pattern read back from the controller.
+        /// </summary>
+        public static bool LooksConstant(ReflowProfile p) =>
+            p != null && p.Steps.Count == MaxSteps
+            && p.Steps.All(s => Math.Abs(s.Target - p.Steps[0].Target) < 0.15 && Math.Abs(s.BedTarget - p.Steps[0].BedTarget) < 0.15
+                && s.HoldSeconds >= ConstantHoldSeconds - 10);
+
+        /// <summary>Marks a pattern read back from the controller as constant temperature (see <see cref="LooksConstant"/>).</summary>
+        public void MarkConstantIfItIs() {
+            if (!LooksConstant(this)) return;
+            ConstantTemperature = true;
+            ConstantTarget = Steps[0].Target;
+            ConstantBedTarget = Steps[0].BedTarget;
+            ConstantRamp = Steps[0].RampRate;
+            ConstantBedRamp = Steps[0].BedRampRate;
+        }
+
         /// <summary>Set by <see cref="Load"/> when the file needed changes to fit (too many steps, no steps). Not saved.</summary>
         [XmlIgnore]
         public string LoadNote { get; private set; }
@@ -68,19 +135,28 @@ namespace ReflowLink.Model {
             Holdback = Holdback,
             BedHoldback = BedHoldback,
             Steps = [.. Steps.Select(s => s.Clone())],
+            ConstantTemperature = ConstantTemperature,
+            ConstantTarget = ConstantTarget,
+            ConstantBedTarget = ConstantBedTarget,
+            ConstantRamp = ConstantRamp,
+            ConstantBedRamp = ConstantBedRamp,
         };
 
-        /// <summary>The profile as the bed heat controller runs it: same ramps and holds, bed targets and holdback.</summary>
+        /// <summary>
+        /// The profile as the bed heat runs it: the same steps and holds, with the bed's ramps, targets and holdback (in
+        /// constant temperature mode: the constant temperature pattern).
+        /// </summary>
         public ReflowProfile ForBed() => new() {
             Name = Name,
             Notes = Notes,
             Holdback = BedHoldback ?? HoldbackDefault,
-            Steps = [.. Steps.Select(s => new ProfileStep(s.RampRate, s.BedTarget, s.HoldSeconds))],
+            Steps = [.. ForController().Steps.Select(s => new ProfileStep(s.BedRampRate, s.BedTarget, s.HoldSeconds))],
         };
 
         /// <summary>
-        /// Combines a pattern read from the IR controller with the same pattern read from the bed controller.
-        /// Differences in step count, ramps or holds are reported, because both controllers should run the same timing.
+        /// Combines a pattern read from the IR controller with the same pattern read from the bed controller. Each heater
+        /// has its own ramps; a different number of steps or different holds are reported, because the steps are meant to
+        /// line up (Wait for Bed / Wait for IR keep them in step).
         /// </summary>
         public static ReflowProfile Combine(ReflowProfile ir, ReflowProfile bed, List<string> warnings) {
             var p = ir.Clone();
@@ -92,8 +168,9 @@ namespace ReflowLink.Model {
                 if (i >= bed.Steps.Count) continue;
                 var b = bed.Steps[i];
                 p.Steps[i].BedTarget = b.Target;
-                if (Math.Abs(b.RampRate - ir.Steps[i].RampRate) > 0.011 || b.HoldSeconds != ir.Steps[i].HoldSeconds)
-                    warnings?.Add($"Step {i + 1}: the bed controller has a different ramp or hold time than the IR controller.");
+                p.Steps[i].BedRampRate = b.RampRate;
+                if (b.HoldSeconds != ir.Steps[i].HoldSeconds)
+                    warnings?.Add($"Step {i + 1}: the bed controller has a different hold time than the IR controller.");
             }
             return p;
         }
@@ -116,6 +193,8 @@ namespace ReflowLink.Model {
             if (bedMaxTemperature is double bedMax) {
                 for (int i = 0; i < Steps.Count; i++) {
                     var s = Steps[i];
+                    if (!(s.BedRampRate > 0)) yield return $"Step {i + 1}: bed ramp rate must be greater than 0 °C/s.";
+                    if (s.BedRampRate > 10) yield return $"Step {i + 1}: bed ramp rate above 10 °C/s is not realistic.";
                     if (s.BedTarget < 0) yield return $"Step {i + 1}: bed target cannot be negative.";
                     if (s.BedTarget > bedMax) yield return $"Step {i + 1}: bed target {s.BedTarget:0.#} °C exceeds the {bedMax:0} °C bed limit.";
                 }
@@ -204,10 +283,27 @@ namespace ReflowLink.Model {
                 if (Math.Abs(x.RampRate - y.RampRate) > 0.011) list.Add($"Step {i + 1} ramp: editor {x.RampRate.ToString("0.##", c)}, pattern {y.RampRate.ToString("0.##", c)} °C/s.");
                 if (Math.Abs(x.Target - y.Target) > 0.11) list.Add($"Step {i + 1} target: editor {x.Target.ToString("0.#", c)}, pattern {y.Target.ToString("0.#", c)} °C.");
                 if (x.HoldSeconds != y.HoldSeconds) list.Add($"Step {i + 1} hold: editor {x.HoldSeconds} s, pattern {y.HoldSeconds} s.");
+                if (bed && Math.Abs(x.BedRampRate - y.BedRampRate) > 0.011)
+                    list.Add($"Step {i + 1} bed ramp: editor {x.BedRampRate.ToString("0.##", c)}, pattern {y.BedRampRate.ToString("0.##", c)} °C/s.");
                 if (bed && Math.Abs(x.BedTarget - y.BedTarget) > 0.11) list.Add($"Step {i + 1} bed target: editor {x.BedTarget.ToString("0.#", c)}, pattern {y.BedTarget.ToString("0.#", c)} °C.");
             }
             if (a.Holdback.HasValue && b.Holdback.HasValue && Math.Abs(a.Holdback.Value - b.Holdback.Value) > 0.05)
                 list.Add($"Holdback: editor {a.Holdback.Value.ToString("0.#", c)}, controller {b.Holdback.Value.ToString("0.#", c)} °C.");
+            return list;
+        }
+
+        /// <summary>
+        /// Seconds each step's ramp takes, for the top IR and the bed, starting from <paramref name="irStart"/> and
+        /// <paramref name="bedStart"/>. Where they differ, the heaters reach the step's targets at different times.
+        /// </summary>
+        public static List<(double Ir, double Bed)> RampTimes(ReflowProfile profile, double irStart, double bedStart) {
+            var list = new List<(double, double)>();
+            double ir = irStart, bed = bedStart;
+            foreach (var s in profile.Steps) {
+                list.Add((s.RampRate > 0 ? Math.Abs(s.Target - ir) / s.RampRate : 0, s.BedRampRate > 0 ? Math.Abs(s.BedTarget - bed) / s.BedRampRate : 0));
+                ir = s.Target;
+                bed = s.BedTarget;
+            }
             return list;
         }
 
@@ -239,8 +335,8 @@ namespace ReflowLink.Model {
         }
 
         /// <summary>
-        /// Bed setpoint path with a single PC410: the bed has no program, it follows the IR program and reaches each step's
-        /// bed target when the IR reaches its target (see <c>BedPlan</c>).
+        /// Bed setpoint path with a single PC410 for a pattern written before the bed had its own ramps: it follows the IR
+        /// program and reaches each step's bed target when the IR reaches its target (see <c>BedPlan</c>).
         /// </summary>
         public static PlannedCurve BuildFollowingCurve(ReflowProfile profile, double irStart, double bedStart) {
             var c = new PlannedCurve();
@@ -263,9 +359,53 @@ namespace ReflowLink.Model {
             return c;
         }
 
-        /// <summary>The bed's planned path: its own program on a second PC410, or following the IR with a single PC410.</summary>
+        /// <summary>
+        /// Planned paths of both heaters, each with its own ramps. Wait for Bed / Wait for IR are taken into account: a heater
+        /// that reaches its set temperature in a step with a wait for the other one stays there until the other has
+        /// reached its set temperature too, and then both do the hold time together.
+        /// </summary>
+        public static (PlannedCurve Ir, PlannedCurve Bed) BuildPairedCurves(ReflowProfile profile, double irStart, double bedStart) {
+            PlannedCurve ir = new(), bed = new();
+            double ti = 0, tb = 0, pi = irStart, pb = bedStart;
+            ir.Points.Add(new CurvePoint(0, pi));
+            bed.Points.Add(new CurvePoint(0, pb));
+            ir.PeakTemp = pi;
+            bed.PeakTemp = pb;
+            static double Ramp(double from, double to, double rate) => Math.Abs(to - from) / (rate > 0 ? rate : 1e9);
+            foreach (var s in profile.Steps) {
+                ir.StepStarts.Add(ti);
+                bed.StepStarts.Add(tb);
+                ti += Ramp(pi, s.Target, s.RampRate);
+                tb += Ramp(pb, s.BedTarget, s.BedRampRate);
+                pi = s.Target;
+                pb = s.BedTarget;
+                ir.Points.Add(new CurvePoint(ti, pi));
+                bed.Points.Add(new CurvePoint(tb, pb));
+                // The hold time starts once the heater is at its set temperature, or once both are when it waits for the other.
+                double irHold = s.WaitForBed ? Math.Max(ti, tb) : ti, bedHold = s.WaitForIr ? Math.Max(tb, ti) : tb;
+                double irEnd = irHold + s.HoldSeconds, bedEnd = bedHold + s.HoldSeconds;
+                if (irEnd > ti) ir.Points.Add(new CurvePoint(irEnd, pi));
+                if (bedEnd > tb) bed.Points.Add(new CurvePoint(bedEnd, pb));
+                ti = irEnd;
+                tb = bedEnd;
+                ir.PeakTemp = Math.Max(ir.PeakTemp, pi);
+                bed.PeakTemp = Math.Max(bed.PeakTemp, pb);
+            }
+            ir.TotalSeconds = ti;
+            bed.TotalSeconds = tb;
+            return (ir, bed);
+        }
+
+        /// <summary>
+        /// Planned paths of both heaters for a run (<see cref="BuildPairedCurves"/>). For a single PC410 pattern written
+        /// before the bed had its own ramps (<paramref name="bedFollowsIr"/>), the bed follows the IR program instead.
+        /// </summary>
+        public static (PlannedCurve Ir, PlannedCurve Bed) BuildRunCurves(ReflowProfile profile, double irStart, double bedStart, bool bedFollowsIr) =>
+            bedFollowsIr ? (BuildPlannedCurve(profile, irStart), BuildFollowingCurve(profile, irStart, bedStart)) : BuildPairedCurves(profile, irStart, bedStart);
+
+        /// <summary>The bed's planned path (see <see cref="BuildRunCurves"/>).</summary>
         public static PlannedCurve BuildBedCurve(ReflowProfile profile, double irStart, double bedStart, bool followsIr) =>
-            followsIr ? BuildFollowingCurve(profile, irStart, bedStart) : BuildPlannedCurve(profile.ForBed(), bedStart);
+            BuildRunCurves(profile, irStart, bedStart, followsIr).Bed;
 
         public static string FormatDuration(double seconds) {
             if (double.IsNaN(seconds) || seconds < 0) seconds = 0;

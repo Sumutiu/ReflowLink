@@ -168,6 +168,8 @@ namespace ReflowLink.UI {
             bool single = SingleBed;
             Sync.Enabled = BedEnabled;
             Sync.VirtualBed = single ? BedSwitch.VirtualBed : null;
+            Sync.HoldVirtualBed = single ? held => BedSwitch.VirtualHold = held : null;
+            BedSwitch.IrHeldForBed = () => Sync.IrHeldForBed;
             BedSwitch.Enabled = single;
             Device.ReadIn2 = single || Settings.ReadIn2;
             Device.ReadAlarm2 = single;

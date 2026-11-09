@@ -169,6 +169,7 @@ namespace ReflowLink.UI {
                 if (read[slot].Warnings.Count > 0) mismatched++;
                 var sync = _state.Settings.SyncFor(slot);
                 if (sync?.ApplyTo(p, _state.SingleBed) != true) sync?.ApplyTo(p);
+                p.MarkConstantIfItIs();
                 var known = _state.SlotProfiles[slot];
                 if (known != null && known.Steps.Count == p.Steps.Count) {
                     p.Name = known.Name;
@@ -185,7 +186,8 @@ namespace ReflowLink.UI {
 
         private void Compare() {
             var stored = _state.SlotProfiles[_list.Selected];
-            var editor = _editorProfile();
+            // What the editor would write: its steps, or the constant temperature pattern.
+            var editor = _editorProfile()?.ForController();
             if (stored == null || editor == null) return;
             var diff = ProfileMath.Differences(editor, stored, _state.BedEnabled);
             DarkDialog.Show(this, $"Editor vs pattern {_list.Selected}",
@@ -247,14 +249,16 @@ namespace ReflowLink.UI {
                     }
                     var known = _state.SlotProfiles[slot];
                     bool blocked = _state.IsSlotBlocked(slot);
-                    string name = known == null ? (_empty.Contains(slot) ? "Empty" : "Not read yet") : string.IsNullOrWhiteSpace(known.Name) ? $"{known.Steps.Count} step(s)" : $"{known.Name} · {known.Steps.Count} step(s)";
+                    string contents = known?.ConstantTemperature == true ? $"constant {known.ConstantTarget:0.#} °C" : $"{known?.Steps.Count} step(s)";
+                    string name = known == null ? (_empty.Contains(slot) ? "Empty" : "Not read yet") : string.IsNullOrWhiteSpace(known.Name) ? contents : $"{known.Name} · {contents}";
                     var curve = known != null ? ProfileMath.BuildPlannedCurve(known, start) : null;
                     string status = blocked ? "Rejected: rewrite" : _state.Device.ActivePattern == slot ? "Selected" : "";
                     Color text = known == null ? Theme.TextFaint : Theme.Text;
                     TextRenderer.DrawText(g, slot.ToString(CultureInfo.InvariantCulture), Theme.BodyBold, new Rectangle(x[0], r.Top, Theme.S(70), h), Theme.TextDim, Theme.LeftMiddle);
                     TextRenderer.DrawText(g, name, Theme.Body, new Rectangle(x[1], r.Top, x[2] - x[1] - Theme.S(8), h), text, Theme.LeftMiddle);
                     TextRenderer.DrawText(g, curve != null ? $"{curve.PeakTemp:0} °C" : "—", Theme.Body, new Rectangle(x[2], r.Top, Theme.S(76), h), text, Theme.LeftMiddle);
-                    TextRenderer.DrawText(g, curve != null ? ProfileMath.FormatDuration(curve.TotalSeconds) : "—", Theme.Body, new Rectangle(x[3], r.Top, Theme.S(76), h), text, Theme.LeftMiddle);
+                    string length = curve == null ? "—" : known.ConstantTemperature ? "Until Stop" : ProfileMath.FormatDuration(curve.TotalSeconds);
+                    TextRenderer.DrawText(g, length, Theme.Body, new Rectangle(x[3], r.Top, Theme.S(76), h), text, Theme.LeftMiddle);
                     TextRenderer.DrawText(g, status, Theme.Small, new Rectangle(x[4], r.Top, Width - x[4], h), blocked ? Theme.Red : Theme.Green, Theme.LeftMiddle);
                 }
             }

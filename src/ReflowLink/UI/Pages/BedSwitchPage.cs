@@ -38,9 +38,10 @@ namespace ReflowLink.UI.Pages {
             Row(rf, "Cycle time", _cycle, "OUT2 is on for the demanded share of each cycle (a 10 s cycle at 40 % is 4 s on, 6 s off). "
                 + "Longer cycles switch less often, which spares a relay on OUT2.");
             Row(rf, "", new ThemedLabel(
-                "The bed setpoint follows the IR program: during a step's ramp it moves towards the step's Bed Heat Target as the IR setpoint "
-                + "moves towards its own target, and it holds the bed target during the step's hold. Wait for Bed holds the IR program while "
-                + "the bed lags by more than the bed holdback.", Theme.Small, Theme.TextFaint) { MaximumSize = new Size(Theme.S(320), 0) }, null);
+                "ReflowLink runs the bed's program the way a second PC410 would: each step ramps the bed setpoint to the Bed Heat Target "
+                + "at the step's Bed Ramp, then holds it for the step's hold time, and waits while the bed lags by more than the bed holdback. "
+                + "With Wait for Bed / Wait for IR, the heater that reaches its set temperature first waits there (the bed with OUT2 off once "
+                + "it's at or above it) until the other is there too; then both do the hold time.", Theme.Small, Theme.TextFaint) { MaximumSize = new Size(Theme.S(320), 0) }, null);
             FitCard(regulation, rf);
 
             // ---------------------------------------------------------------- wiring checklist

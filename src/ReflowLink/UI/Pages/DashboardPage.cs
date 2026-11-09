@@ -67,6 +67,8 @@ namespace ReflowLink.UI.Pages {
         // Shaded on the chart while Wait for Bed / Wait for IR holds a heater. The last band of each kind is kept, so waits
         // that follow each other closely (hold, resume, hold again) show as one band.
         private ChartBand _irWaitBand, _bedWaitBand;
+        // The run holds a constant temperature until Stop (its pattern has 8 holds, about 22 hours in all).
+        private bool _runConstant;
         private bool _irWaiting, _bedWaiting;
         /// <summary>Waits less than this apart (chart seconds) are drawn as one band.</summary>
         private const double WaitBandGap = 30;
@@ -534,7 +536,7 @@ namespace ReflowLink.UI.Pages {
             string seg = t?.Segment.HasValue == true && t.Segment.Value > 0
                 ? (steps > 0 ? $"{t.Segment.Value} of {steps}" : t.Segment.Value.ToString())
                 : "—";
-            _rowStep.Value = active ? seg : "—";
+            _rowStep.Value = !active ? "—" : _runConstant ? "Constant" : seg;
             if (Bed) {
                 var (irText, irColor) = State.Device.IsConnected ? Describe(_state) : ("Offline", Theme.TextFaint);
                 var (bedText, bedColor) = Dual
@@ -554,7 +556,7 @@ namespace ReflowLink.UI.Pages {
                 double el = _lastX - _runStart.Value;
                 double planned = PlannedTotal();
                 _rowElapsed.Value = ProfileMath.FormatDuration(el);
-                _rowRemaining.Value = planned > 0 ? ProfileMath.FormatDuration(Math.Max(0, planned - el)) : "—";
+                _rowRemaining.Value = _runConstant ? "Until Stop" : planned > 0 ? ProfileMath.FormatDuration(Math.Max(0, planned - el)) : "—";
                 _stateCard.Detail = State.Sync.StepUnknown
                     ? "Steps not reported: can't wait"
                     : $"Pattern {pattern?.ToString() ?? "?"} · {ProfileMath.FormatDuration(el)} elapsed";
@@ -596,6 +598,7 @@ namespace ReflowLink.UI.Pages {
                 ClearWaitBands();
                 _runPlan = _runBedPlan = null;
                 var prof = _runPattern.HasValue ? State.SlotProfiles[_runPattern.Value] : null;
+                _runConstant = prof?.ConstantTemperature == true;
                 if (_runPattern.HasValue && Bed) {
                     // Started here or on the front panel: use the choices last written to this pattern, if they still fit.
                     var sync = State.Settings.SyncFor(_runPattern.Value);
@@ -603,16 +606,23 @@ namespace ReflowLink.UI.Pages {
                 }
                 if (prof != null && prev != ProgramState.Unknown) {
                     double start = _pv.Points.Count > 0 ? _pv.Points[_pv.Points.Count - 1].Y : State.Settings.PreviewStartTemperature;
-                    _runPlan = ProfileMath.BuildPlannedCurve(prof, start);
-                    foreach (var p in _runPlan.Points) _plan.Points.Add(new PointD(_runStart.Value + p.Time, p.Temp));
                     if (Bed) {
+                        // Both heaters with their own ramps, lined up by Wait for Bed / Wait for IR.
                         double bedStart = _bedPv.Points.Count > 0 ? _bedPv.Points[_bedPv.Points.Count - 1].Y : start;
-                        _runBedPlan = ProfileMath.BuildBedCurve(prof, start, bedStart, State.SingleBed);
+                        (_runPlan, _runBedPlan) = ProfileMath.BuildRunCurves(prof, start, bedStart, BedFollowsIr(_runPattern));
                         foreach (var p in _runBedPlan.Points) _bedPlan.Points.Add(new PointD(_runStart.Value + p.Time, p.Temp));
+                    } else {
+                        _runPlan = ProfileMath.BuildPlannedCurve(prof, start);
                     }
-                    for (int i = 0; i < _runPlan.StepStarts.Count; i++)
-                        _chart.Markers.Add(new ChartMarker { X = _runStart.Value + _runPlan.StepStarts[i], Label = "S" + (i + 1) });
-                    _rowPlanned.Value = ProfileMath.FormatDuration(PlannedTotal());
+                    foreach (var p in _runPlan.Points) _plan.Points.Add(new PointD(_runStart.Value + p.Time, p.Temp));
+                    if (_runConstant) {
+                        _chart.Markers.Add(new ChartMarker { X = _runStart.Value, Label = $"Constant {prof.ConstantTarget:0.#} °C" });
+                        _rowPlanned.Value = "Until Stop";
+                    } else {
+                        for (int i = 0; i < _runPlan.StepStarts.Count; i++)
+                            _chart.Markers.Add(new ChartMarker { X = _runStart.Value + _runPlan.StepStarts[i], Label = "S" + (i + 1) });
+                        _rowPlanned.Value = ProfileMath.FormatDuration(PlannedTotal());
+                    }
                 } else {
                     _chart.Markers.Add(new ChartMarker { X = _runStart.Value, Label = prev == ProgramState.Unknown ? "Run in progress" : "Start" });
                     _rowPlanned.Value = "—";
@@ -664,9 +674,16 @@ namespace ReflowLink.UI.Pages {
                 _rowPlanned.Value = "—";
                 return;
             }
+            if (p.ConstantTemperature) {
+                _rowPlanned.Value = "Until Stop";
+                return;
+            }
             double start = State.Settings.PreviewStartTemperature;
             double total = ProfileMath.BuildPlannedCurve(p, start).TotalSeconds;
-            if (Bed) total = Math.Max(total, ProfileMath.BuildBedCurve(p, start, start, State.SingleBed).TotalSeconds);
+            if (Bed) {
+                var (ir, bed) = ProfileMath.BuildRunCurves(p, start, start, BedFollowsIr(slot));
+                total = Math.Max(ir.TotalSeconds, bed.TotalSeconds);
+            }
             _rowPlanned.Value = ProfileMath.FormatDuration(total);
         }
 
@@ -679,6 +696,9 @@ namespace ReflowLink.UI.Pages {
                 if (_runStart.HasValue) {
                     _chart.XMin = Math.Max(0, _runStart.Value - 10);
                     double end = _runPlan != null ? _runStart.Value + PlannedTotal() + 30 : now;
+                    // A constant temperature runs until Stop: show the way up and the last minutes, not the 22-hour pattern.
+                    if (_runConstant && _runPlan != null)
+                        end = Math.Max(now, _runStart.Value + Math.Max(Reached(_runPlan), Reached(_runBedPlan))) + 300;
                     _chart.XMax = Math.Max(now + 5, end);
                     _chart.MinXSpan = 60;
                 } else { _chart.XMin = Math.Max(0, now - 300); _chart.XMax = Math.Max(now, 300); _chart.MinXSpan = 300; }
@@ -792,6 +812,7 @@ namespace ReflowLink.UI.Pages {
             } else if (sync != null) {
                 State.SetStatus("The Wait for Bed / Wait for IR choices saved for this pattern don't match it any more, so they aren't used. Write the profile again.", StatusKind.Warning);
             }
+            prof.MarkConstantIfItIs();
             State.SetSlotProfile(slot, prof);
             State.Device.NotePattern(slot);
             if (both) State.Bed.NotePattern(slot);
@@ -944,6 +965,15 @@ namespace ReflowLink.UI.Pages {
             }
         }
 
+        /// <summary>
+        /// A single PC410's bed follows the IR program only for a pattern written before the bed had its own ramps;
+        /// otherwise ReflowLink runs the bed's own program.
+        /// </summary>
+        private bool BedFollowsIr(int? slot) => State.SingleBed && slot is int s && State.Settings.SyncFor(s)?.HasBedProgram != true;
+
+        /// <summary>When a curve first reaches its target (the end of its first ramp); 0 without a curve.</summary>
+        private static double Reached(PlannedCurve curve) => curve != null && curve.Points.Count > 1 ? curve.Points[1].Time : 0;
+
         /// <summary>Describes the run at the top of the CSV file, so a recording can be understood (and overlaid) later.</summary>
         private System.Collections.Generic.List<string> RunMetadata(int? pattern, ReflowProfile prof) {
             var s = State.Settings;
@@ -959,11 +989,16 @@ namespace ReflowLink.UI.Pages {
             if (prof != null) {
                 if (!string.IsNullOrWhiteSpace(prof.Name)) lines.Add("Profile: " + prof.Name);
                 var c = System.Globalization.CultureInfo.InvariantCulture;
+                if (prof.ConstantTemperature) {
+                    string bedPart = !Bed ? "" : $", bed {prof.ConstantBedTarget.ToString("0.#", c)} °C at {prof.ConstantBedRamp.ToString("0.####", c)} °C/s";
+                    lines.Add($"Constant temperature: {prof.ConstantTarget.ToString("0.#", c)} °C at {prof.ConstantRamp.ToString("0.####", c)} °C/s{bedPart}, until Stop");
+                    return lines;
+                }
                 for (int i = 0; i < prof.Steps.Count; i++) {
                     var st = prof.Steps[i];
-                    string bed = Bed ? $", bed {st.BedTarget.ToString("0.#", c)} °C" : "";
+                    string bed = Bed ? $", bed {st.BedRampRate.ToString("0.####", c)} °C/s to {st.BedTarget.ToString("0.#", c)} °C" : "";
                     string waits = (st.WaitForBed ? ", wait for bed" : "") + (st.WaitForIr ? ", wait for IR" : "");
-                    lines.Add($"Step {i + 1}: {st.RampRate.ToString("0.##", c)} °C/s to {st.Target.ToString("0.#", c)} °C, hold {st.HoldSeconds.ToString("0", c)} s{bed}{waits}");
+                    lines.Add($"Step {i + 1}: {st.RampRate.ToString("0.####", c)} °C/s to {st.Target.ToString("0.#", c)} °C, hold {st.HoldSeconds.ToString("0", c)} s{bed}{waits}");
                 }
             }
             return lines;

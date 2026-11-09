@@ -60,7 +60,7 @@ namespace ReflowLink.Model {
         public BedSettings Bed { get; set; } = new();
 
         /// <summary>
-        /// Wait for Bed / Wait for IR choices (and, for a single PC410, the bed targets) per pattern; the controllers can't
+        /// Wait for Bed / Wait for IR choices (and, for a single PC410, the bed targets, ramps and holds) per pattern; the controllers can't
         /// store them, so ReflowLink does.
         /// </summary>
         public List<PatternSync> PatternSyncs { get; set; } = [];
@@ -481,6 +481,13 @@ namespace ReflowLink.Model {
         [XmlAttribute("irTargets")] public string IrTargetList { get; set; } = "";
         /// <summary>Bed targets of the steps. With a single PC410 no controller stores them, so ReflowLink does.</summary>
         [XmlAttribute("bedTargets")] public string BedTargetList { get; set; } = "";
+        /// <summary>
+        /// Bed ramp rates of the steps (°C/s). With a single PC410 ReflowLink runs the bed's program itself, so it keeps
+        /// them, with the holds. Empty for patterns written before the bed had its own ramps: the bed then follows the IR.
+        /// </summary>
+        [XmlAttribute("bedRamps")] public string BedRampList { get; set; } = "";
+        /// <summary>Hold times of the steps (s), for the bed's program with a single PC410.</summary>
+        [XmlAttribute("holds")] public string HoldList { get; set; } = "";
 
         /// <summary>True when any step waits for the other heater.</summary>
         public bool Any => (WaitForBedMask | WaitForIrMask) != 0;
@@ -491,8 +498,20 @@ namespace ReflowLink.Model {
         [XmlIgnore]
         public IReadOnlyList<double> BedTargets => ParseList(BedTargetList);
 
+        [XmlIgnore]
+        public IReadOnlyList<double> BedRamps => ParseList(BedRampList);
+
+        [XmlIgnore]
+        public IReadOnlyList<double> Holds => ParseList(HoldList);
+
         /// <summary>A bed target and an IR target were saved for every step (written by version 2.1 or later).</summary>
         public bool HasTargets => Steps > 0 && IrTargets.Count == Steps && BedTargets.Count == Steps;
+
+        /// <summary>
+        /// The bed's own ramps and the holds were saved for every step, so a single PC410's bed can run its own program.
+        /// Otherwise (written by an older version) it follows the IR program.
+        /// </summary>
+        public bool HasBedProgram => HasTargets && BedRamps.Count == Steps && BedRamps.All(r => r is > 0 and <= 10) && Holds.Count == Steps;
 
         /// <summary>True when <paramref name="p"/> (read from the controller) has the steps and IR targets saved here.</summary>
         public bool Matches(ReflowProfile p) {
@@ -513,8 +532,8 @@ namespace ReflowLink.Model {
             return list;
         }
 
-        private static string JoinList(IEnumerable<double> values) =>
-            string.Join(";", values.Select(v => Math.Round(v, 2).ToString("0.##", CultureInfo.InvariantCulture)));
+        private static string JoinList(IEnumerable<double> values, int decimals = 2) =>
+            string.Join(";", values.Select(v => Math.Round(v, decimals).ToString("0.####", CultureInfo.InvariantCulture)));
 
         public bool WaitForBed(int step) => step is >= 1 and <= 30 && (WaitForBedMask & (1 << (step - 1))) != 0;
         public bool WaitForIr(int step) => step is >= 1 and <= 30 && (WaitForIrMask & (1 << (step - 1))) != 0;
@@ -527,6 +546,8 @@ namespace ReflowLink.Model {
                 BedHoldback = p.BedHoldback ?? ReflowProfile.HoldbackDefault,
                 IrTargetList = JoinList(p.Steps.Select(st => st.Target)),
                 BedTargetList = withBedTargets ? JoinList(p.Steps.Select(st => st.BedTarget)) : "",
+                BedRampList = withBedTargets ? JoinList(p.Steps.Select(st => st.BedRampRate), 4) : "",
+                HoldList = withBedTargets ? JoinList(p.Steps.Select(st => (double)st.HoldSeconds), 0) : "",
             };
             for (int i = 0; i < p.Steps.Count; i++) {
                 if (p.Steps[i].WaitForBed) s.WaitForBedMask |= 1 << i;
@@ -547,10 +568,12 @@ namespace ReflowLink.Model {
             if (p.Steps.Count != Steps) return false;
             if (includeBed && !Matches(p)) return false;
             var bed = BedTargets;
+            var ramps = HasBedProgram ? BedRamps : null;
             for (int i = 0; i < p.Steps.Count; i++) {
                 p.Steps[i].WaitForBed = WaitForBed(i + 1);
                 p.Steps[i].WaitForIr = WaitForIr(i + 1);
                 if (includeBed) p.Steps[i].BedTarget = bed[i];
+                if (includeBed && ramps != null) p.Steps[i].BedRampRate = ramps[i];
             }
             if (includeBed) p.BedHoldback = BedHoldback;
             return true;

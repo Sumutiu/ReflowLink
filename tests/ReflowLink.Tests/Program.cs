@@ -312,43 +312,52 @@ namespace ReflowLink.Tests {
                 True(read.Steps[2].WaitForBed && read.Steps[2].WaitForIr && read.Steps[0].WaitForBed && !read.Steps[0].WaitForIr, "applied to a read profile");
             });
 
-            Run("Bed heat: the coordinator holds whichever heater is ahead", () => {
+            Run("Bed heat: the heater at its set temperature first waits for the other, before the hold time", () => {
                 var p = new ReflowProfile { Holdback = 5, BedHoldback = 5 };
-                p.Steps.Add(new ProfileStep(1, 150, 30) { WaitForBed = true });
-                p.Steps.Add(new ProfileStep(1, 200, 30) { WaitForIr = true });
-                p.Steps.Add(new ProfileStep(1, 230, 30));
-                p.Steps.Add(new ProfileStep(1, 230, 30) { WaitForBed = true, WaitForIr = true });
+                p.Steps.Add(new ProfileStep(1, 150, 30) { BedTarget = 120, WaitForBed = true });
+                p.Steps.Add(new ProfileStep(1, 200, 30) { BedTarget = 160, WaitForIr = true });
+                p.Steps.Add(new ProfileStep(1, 230, 30) { BedTarget = 180 });
+                p.Steps.Add(new ProfileStep(1, 230, 30) { BedTarget = 180, WaitForBed = true, WaitForIr = true });
                 var sync = PatternSync.From(0, p);
-                SyncSide Side(ProgramState st, double pv, double sp, int? step) => new(st, pv, sp, step);
+                double?[] irT = [150, 200, 230, 230], bedT = [120, 160, 180, 180];
+                SyncSide Ir(ProgramState st, double pv, double sp, int? step) => new(st, pv, sp, step, step is int s ? irT[s - 1] : null);
+                SyncSide Bed(ProgramState st, double pv, double sp, int? step) => new(st, pv, sp, step, step is int s ? bedT[s - 1] : null);
                 var run = ProgramState.Running;
-                // Step 1 has Wait for Bed: the bed 10 °C behind its setpoint holds the IR.
-                Eq((true, false), SyncCoordinator.Decide(sync, Side(run, 140, 140, 1), Side(run, 100, 110, 1)));
-                // Within the bed holdback: nobody waits.
-                Eq((false, false), SyncCoordinator.Decide(sync, Side(run, 140, 140, 1), Side(run, 107, 110, 1)));
-                // The IR finished step 1 (Wait for Bed) first: it waits for the bed to finish step 1 too.
-                Eq((true, false), SyncCoordinator.Decide(sync, Side(run, 150, 152, 2), Side(run, 120, 120, 1)));
-                // The bed finished step 1 first, but step 1 has no Wait for IR: it carries on.
-                Eq((false, false), SyncCoordinator.Decide(sync, Side(run, 150, 150, 1), Side(run, 120, 120, 2)));
-                // Step 2, same step: the IR lagging holds the bed; the bed lagging doesn't hold the IR.
-                Eq((false, true), SyncCoordinator.Decide(sync, Side(run, 150, 170, 2), Side(run, 120, 120, 2)));
-                Eq((false, false), SyncCoordinator.Decide(sync, Side(run, 170, 170, 2), Side(run, 100, 120, 2)));
+                // Step 1, Wait for Bed. The IR still ramping isn't held, however far the bed is behind.
+                Eq((false, false), SyncCoordinator.Decide(sync, Ir(run, 140, 140, 1), Bed(run, 60, 80, 1)));
+                // The IR at its set temperature (ramp done): held before its hold time while the bed is still ramping...
+                Eq((true, false), SyncCoordinator.Decide(sync, Ir(run, 150, 150, 1), Bed(run, 100, 110, 1)));
+                // ... or has finished its ramp but isn't within the bed holdback yet.
+                Eq((true, false), SyncCoordinator.Decide(sync, Ir(run, 150, 150, 1), Bed(run, 110, 120, 1)));
+                // An IR that went above its set temperature while waiting still waits.
+                Eq((true, false), SyncCoordinator.Decide(sync, Ir(run, 158, 150, 1), Bed(run, 110, 120, 1)));
+                // The bed is at its set temperature: the IR goes on, and both do the hold time.
+                Eq((false, false), SyncCoordinator.Decide(sync, Ir(run, 150, 150, 1), Bed(run, 116, 120, 1)));
+                // Once both were there, the step's hold time isn't interrupted again.
+                Eq((false, false), SyncCoordinator.Decide(sync, Ir(run, 150, 150, 1), Bed(run, 110, 120, 1), syncedStep: 1));
+                // Safety net: the IR already in step 2 while the bed is still in step 1.
+                Eq((true, false), SyncCoordinator.Decide(sync, Ir(run, 150, 152, 2), Bed(run, 120, 120, 1)));
+                // Step 1 has no Wait for IR: a bed that's there first doesn't wait.
+                Eq((false, false), SyncCoordinator.Decide(sync, Ir(run, 140, 140, 1), Bed(run, 120, 120, 1)));
+                // Step 2, Wait for IR: the bed at its set temperature waits for the IR, then goes on.
+                Eq((false, true), SyncCoordinator.Decide(sync, Ir(run, 180, 180, 2), Bed(run, 160, 160, 2)));
+                Eq((false, true), SyncCoordinator.Decide(sync, Ir(run, 190, 200, 2), Bed(run, 160, 160, 2)));
+                Eq((false, false), SyncCoordinator.Decide(sync, Ir(run, 197, 200, 2), Bed(run, 160, 160, 2)));
+                // The bed already in step 3 while the IR is in step 2.
+                Eq((false, true), SyncCoordinator.Decide(sync, Ir(run, 190, 190, 2), Bed(run, 160, 162, 3)));
                 // Step 3 has no waits.
-                Eq((false, false), SyncCoordinator.Decide(sync, Side(run, 150, 230, 3), Side(run, 100, 150, 3)));
-                // The bed finished step 2 (Wait for IR) first: it waits for the IR.
-                Eq((false, true), SyncCoordinator.Decide(sync, Side(run, 190, 190, 2), Side(run, 150, 150, 3)));
-                // Step 4 has both: whichever lags holds the other.
-                Eq((true, false), SyncCoordinator.Decide(sync, Side(run, 230, 230, 4), Side(run, 200, 230, 4)));
-                Eq((false, true), SyncCoordinator.Decide(sync, Side(run, 200, 230, 4), Side(run, 230, 230, 4)));
+                Eq((false, false), SyncCoordinator.Decide(sync, Ir(run, 230, 230, 3), Bed(run, 100, 150, 3)));
+                // Step 4 has both: whichever is there first waits.
+                Eq((true, false), SyncCoordinator.Decide(sync, Ir(run, 230, 230, 4), Bed(run, 170, 175, 4)));
+                Eq((false, true), SyncCoordinator.Decide(sync, Ir(run, 225, 228, 4), Bed(run, 180, 180, 4)));
+                Eq((false, false), SyncCoordinator.Decide(sync, Ir(run, 229, 230, 4), Bed(run, 179, 180, 4)));
                 // One controller finished or stopped: never hold the other.
-                Eq((false, false), SyncCoordinator.Decide(sync, Side(run, 150, 152, 2), Side(ProgramState.Idle, 120, 120, null)));
+                Eq((false, false), SyncCoordinator.Decide(sync, Ir(run, 150, 152, 2), Bed(ProgramState.Idle, 120, 120, null)));
                 // Steps not reported: can't apply per-step choices.
-                Eq((false, false), SyncCoordinator.Decide(sync, Side(run, 140, 140, null), Side(run, 100, 110, null)));
-                Eq((false, false), SyncCoordinator.Decide(null, Side(run, 140, 140, 1), Side(run, 100, 110, 1)));
-                // Segment numbering: plain steps, or ramp + dwell counted separately.
-                Eq(3, SyncCoordinator.StepOf(3, 8, false));
-                Eq(2, SyncCoordinator.StepOf(4, 3, false));
-                Eq(3, SyncCoordinator.StepOf(5, 8, true));
-                Eq(null, SyncCoordinator.StepOf(0, 8, false));
+                Eq((false, false), SyncCoordinator.Decide(sync, Ir(run, 150, 150, null), Bed(run, 100, 110, null)));
+                // A pattern saved without targets (before 2.1): only the safety net.
+                Eq((false, false), SyncCoordinator.Decide(sync, new SyncSide(run, 150, 150, 1), new SyncSide(run, 100, 110, 1)));
+                Eq((true, false), SyncCoordinator.Decide(sync, new SyncSide(run, 150, 152, 2), new SyncSide(run, 100, 110, 1)));
             });
 
             Run("Bed heat: a pattern is written to and read from both controllers", () => {
@@ -581,6 +590,90 @@ namespace ReflowLink.Tests {
                 Eq(100.0, plan.SetpointAt(1, 400));   // never beyond the step's target
                 var flat = new BedPlan([120, 120], [100, 140], 25, 25);
                 Eq(140.0, flat.SetpointAt(2, 120));   // IR doesn't move in step 2: the bed goes straight to its target
+            });
+
+            Run("Single PC410: ReflowLink runs the bed's own program (ramps, holds, holdback, hold)", () => {
+                var plan = new BedPlan([150, 200], [100, 140], irStart: 25, bedStart: 30, bedRamps: [0.5, 2], holds: [20, 10], holdback: 5);
+                True(plan.OwnProgram, "own program");
+                Eq(30.0, plan.Setpoint);
+                plan.Advance(40, 30, false);
+                Eq(50.0, plan.Setpoint);              // 0.5 °C/s, whatever the IR does
+                plan.Advance(10, 40, false);
+                Eq(50.0, plan.Setpoint);              // the bed is 10 °C behind: holdback, like the PC410
+                plan.Advance(2, 60, false);
+                Eq(51.0, plan.Setpoint);              // a bed ahead of the ramp doesn't stop it
+                plan.Advance(-2, 50, false);          // (no time: nothing moves)
+                Eq(51.0, plan.Setpoint);
+                plan.Advance(10, 51, true);
+                Eq(51.0, plan.Setpoint);              // held (Hold, or Wait for IR)
+                plan.Advance(98, 51, false);
+                Eq(100.0, plan.Setpoint);
+                True(plan.Step == 1 && plan.Holding, "reached step 1's target, holding");
+                Eq(100.0, plan.SetpointAt(1, 150));
+                plan.Advance(25, 100, false);         // 20 s hold, then 5 s of step 2 at 2 °C/s
+                Eq(2, plan.Step);
+                Eq(110.0, plan.Setpoint);
+                plan.Advance(15, 110, false);
+                True(plan.Holding && Math.Abs(plan.Setpoint - 140) < 1e-9, "step 2 reached");
+                plan.Advance(10, 140, false);
+                True(plan.Finished, "last hold done");
+                Eq(140.0, plan.SetpointAt(2, 200));
+                var down = new BedPlan([150], [60], 25, 100, [1.0], [0.0]);
+                down.Advance(20, 100, false);
+                Eq(80.0, down.Setpoint);              // down to a lower temperature too
+                False(new BedPlan([150], [120], 25, 25).OwnProgram, "without ramps the bed follows the IR");
+
+                // No controller stores the bed's ramps with a single PC410: they're kept per pattern, with the holds.
+                var settings = new AppSettings();
+                var p = new ReflowProfile();
+                p.Steps.Add(new ProfileStep(1, 150, 30) { BedTarget = 120, BedRampRate = 0.0167 });
+                p.Steps.Add(new ProfileStep(2, 200, 0) { BedTarget = 130, BedRampRate = 0.5 });
+                settings.SetSync(3, p);
+                var sync = settings.SyncFor(3);
+                True(sync.HasBedProgram, "bed program saved");
+                Eq(0.0167, sync.BedRamps[0]);
+                Eq(30.0, sync.Holds[0]);
+                True(BedPlan.From(sync, 25, 25).OwnProgram, "used for the run");
+                var read = p.Clone();
+                foreach (var s in read.Steps) s.BedRampRate = s.RampRate;
+                True(sync.ApplyTo(read, true), "applied");
+                Eq(0.0167, read.Steps[0].BedRampRate);
+                Eq(0.5, read.Steps[1].BedRampRate);
+                // Written by an older version: no ramps saved, so the bed follows the IR program as before.
+                var old = new PatternSync { Steps = 1, IrTargetList = "150", BedTargetList = "120" };
+                True(old.HasTargets && !old.HasBedProgram, "older pattern");
+                False(BedPlan.From(old, 25, 25).OwnProgram, "follows the IR");
+            });
+
+            Run("Planned paths: each heater has its own ramps, and the waits line the steps up", () => {
+                var p = new ReflowProfile();
+                p.Steps.Add(new ProfileStep(1, 125, 10) { BedTarget = 75, BedRampRate = 0.25 }); // IR 100 s, bed 200 s
+                p.Steps.Add(new ProfileStep(1, 135, 0) { BedTarget = 85, BedRampRate = 1 });     // both 10 s
+                var (ir, bed) = ProfileMath.BuildPairedCurves(p, 25, 25);
+                Eq(120.0, ir.TotalSeconds);   // without waits each runs on its own: the bed ends 100 s later
+                Eq(220.0, bed.TotalSeconds);
+                Eq(110.0, ir.StepStarts[1]);
+                Eq(210.0, bed.StepStarts[1]);
+                p.Steps[0].WaitForBed = true;
+                (ir, bed) = ProfileMath.BuildPairedCurves(p, 25, 25);
+                Eq(210.0, ir.Points[2].Time); // the IR stays at 125 °C until the bed is at 75 °C (200 s), then the 10 s hold time
+                Eq(210.0, ir.StepStarts[1]);
+                Eq(210.0, bed.StepStarts[1]);
+                Eq(220.0, ir.TotalSeconds);
+                Eq(220.0, bed.TotalSeconds);
+                var times = ProfileMath.RampTimes(p, 25, 25);
+                Eq(100.0, times[0].Ir);
+                Eq(200.0, times[0].Bed);
+                // The other way round: the bed waits for a slower IR.
+                var q = new ReflowProfile();
+                q.Steps.Add(new ProfileStep(0.5, 75, 0) { BedTarget = 75, BedRampRate = 2, WaitForIr = true });
+                q.Steps.Add(new ProfileStep(1, 85, 0) { BedTarget = 85, BedRampRate = 1 });
+                (ir, bed) = ProfileMath.BuildPairedCurves(q, 25, 25);
+                Eq(100.0, bed.StepStarts[1]);
+                Eq(110.0, bed.TotalSeconds);
+                // A single PC410 pattern from an older version: the bed follows the IR.
+                var (_, follows) = ProfileMath.BuildRunCurves(p, 25, 25, true);
+                Eq(100.0, follows.Points[1].Time); // reaches 75 °C when the IR reaches 125 °C
             });
 
             Run("Single PC410: regulator and time proportioning", () => {
@@ -1036,6 +1129,154 @@ namespace ReflowLink.Tests {
                 }
             });
 
+            Run("Single PC410: a constant temperature run ramps the bed setpoint at the bed's rate", () => {
+                var settings = new AppSettings();
+                settings.Bed.Mode = BedMode.SinglePc410;
+                var prof = new ReflowProfile { ConstantTemperature = true, ConstantTarget = 150, ConstantRamp = 3, ConstantBedTarget = 120, ConstantBedRamp = 0.5 }.ForController();
+                settings.SetSync(0, prof);
+                var device = new DeviceService();
+                try {
+                    device.ConnectAsync(new ConnectionOptions { UseSimulator = true, SimulatorSpeed = 10, PollIntervalMs = 200 }).Wait();
+                    device.ReadIn2 = device.ReadAlarm2 = true;
+                    device.RunAsync(d => d.UploadProfile(prof, 0, UnusedStepMode.Zeros, true, null, CancellationToken.None)).Wait();
+                    var ctl = new BedSwitchController(device, settings) { Enabled = true, KnownPattern = slot => slot == 0 ? prof : null };
+                    Thread.Sleep(600);
+                    device.RunAsync(d => d.Start(0)).Wait();
+                    True(WaitFor(() => ctl.Plan != null && ctl.Setpoint.HasValue, 3000), "regulating: " + ctl.Reason);
+                    double bedStart = ctl.Plan.BedStart;
+                    Thread.Sleep(2500); // about 25 s of process time
+                    double bedSp = ctl.Setpoint.Value - bedStart, irSp = device.Last.Sp.Value;
+                    True(bedSp > 3 && bedSp < 25, $"the bed climbs at about 0.5 °C/s ({bedSp:0.0} °C so far)");
+                    True(irSp > 70, $"while the IR climbs at 3 °C/s ({irSp:0} °C)");
+                    device.RunAsync(d => d.Hold()).Wait();
+                    Thread.Sleep(600);
+                    double held = ctl.Setpoint.Value;
+                    Thread.Sleep(1500);
+                    True(Math.Abs(ctl.Setpoint.Value - held) < 0.6, "on hold the bed ramp waits too");
+                    device.RunAsync(d => d.Stop()).Wait();
+                } finally {
+                    device.Dispose();
+                }
+            });
+
+            Run("Single PC410: Wait for Bed keeps the IR in step with a slower bed ramp", () => {
+                var s = new AppSettings { StationId = StationCatalog.DefaultId };
+                s.Bed.Mode = BedMode.SinglePc410;
+                s.Bed.Switching.CycleSeconds = 4;
+                var prof = new ReflowProfile { Holdback = 5, BedHoldback = 5 };
+                prof.Steps.Add(new ProfileStep(3, 100, 5) { BedTarget = 60, BedRampRate = 0.3, WaitForBed = true });
+                prof.Steps.Add(new ProfileStep(3, 120, 60) { BedTarget = 70, BedRampRate = 0.3 });
+                s.SetSync(0, prof);
+                var ir = new DeviceService();
+                var bed = new DeviceService();
+                try {
+                    var st = new ReflowLink.UI.AppState(s, ir, bed);
+                    ir.ConnectAsync(new ConnectionOptions { UseSimulator = true, SimulatorSpeed = 10, PollIntervalMs = 200 }).Wait();
+                    ir.RunAsync(d => d.UploadProfile(prof, 0, UnusedStepMode.Zeros, true, null, CancellationToken.None)).Wait();
+                    st.SetSlotProfile(0, prof);
+                    Thread.Sleep(600);
+                    st.Sync.Sync = s.SyncFor(0);
+                    ir.RunAsync(d => d.Start(0)).Wait();
+                    int IrStep() => SyncCoordinator.StepOf(ir.Last?.Segment, 2, st.Sync.PairedSegments) ?? 0;
+                    True(WaitFor(() => st.Sync.IrWaiting, 10000), "the IR waits for the bed");
+                    Eq(1, IrStep());
+                    Eq(100.0, ir.Last.Sp);         // at its set temperature, before its hold time
+                    Eq(1, st.BedSwitch.Plan.Step); // the bed is still on its way to 60 °C
+                    True(st.BedSwitch.Setpoint < 60, $"bed setpoint {st.BedSwitch.Setpoint:0.0} °C");
+                    Thread.Sleep(1000);
+                    True(st.Sync.IrWaiting, "still waiting");
+                    True(WaitFor(() => !st.Sync.IrWaiting, 25000), "released once the bed is at its set temperature");
+                    True(IrStep() == 1 && st.BedSwitch.Plan.Step == 1, "both do step 1's hold time");
+                    True(WaitFor(() => IrStep() == 2, 5000), "the IR goes on to step 2");
+                    True(WaitFor(() => st.BedSwitch.Plan.Step == 2, 1500), "and the bed with it");
+                    ir.RunAsync(d => d.Stop()).Wait();
+                } finally {
+                    ir.Dispose();
+                    bed.Dispose();
+                }
+            });
+
+            Run("Single PC410: Wait for IR holds the bed's program while the IR is slower", () => {
+                var s = new AppSettings { StationId = StationCatalog.DefaultId };
+                s.Bed.Mode = BedMode.SinglePc410;
+                s.Bed.Switching.CycleSeconds = 4;
+                var prof = new ReflowProfile { Holdback = 5, BedHoldback = 5 };
+                prof.Steps.Add(new ProfileStep(0.3, 60, 5) { BedTarget = 50, BedRampRate = 2, WaitForIr = true });
+                prof.Steps.Add(new ProfileStep(0.3, 70, 60) { BedTarget = 60, BedRampRate = 2 });
+                s.SetSync(0, prof);
+                var ir = new DeviceService();
+                var bed = new DeviceService();
+                try {
+                    var st = new ReflowLink.UI.AppState(s, ir, bed);
+                    ir.ConnectAsync(new ConnectionOptions { UseSimulator = true, SimulatorSpeed = 10, PollIntervalMs = 200 }).Wait();
+                    ir.RunAsync(d => d.UploadProfile(prof, 0, UnusedStepMode.Zeros, true, null, CancellationToken.None)).Wait();
+                    st.SetSlotProfile(0, prof);
+                    Thread.Sleep(600);
+                    st.Sync.Sync = s.SyncFor(0);
+                    ir.RunAsync(d => d.Start(0)).Wait();
+                    int IrStep() => SyncCoordinator.StepOf(ir.Last?.Segment, 2, st.Sync.PairedSegments) ?? 0;
+                    True(WaitFor(() => st.Sync.BedWaiting, 10000), "the bed waits for the IR");
+                    True(st.BedSwitch.VirtualHold, "its program is held");
+                    True(st.BedSwitch.Plan.Step == 1 && st.BedSwitch.Plan.Holding, "at its set temperature, before its hold time");
+                    Eq(50.0, st.BedSwitch.Setpoint);
+                    Eq(1, IrStep());
+                    for (int i = 0; i < 6; i++) {
+                        Thread.Sleep(250);
+                        var b = st.BedSwitch;
+                        True(!b.VirtualHold || b.BedTemperature < b.Setpoint || b.Demand == 0, $"no power above the set temperature while waiting ({b.BedTemperature:0.0} °C, {b.Demand:0} %)");
+                    }
+                    True(st.BedSwitch.Plan.Step == 1 && Math.Abs(st.BedSwitch.Setpoint.Value - 50) < 0.01, "still there");
+                    True(WaitFor(() => !st.Sync.BedWaiting, 25000), "released once the IR is at its set temperature");
+                    False(st.BedSwitch.VirtualHold, "its program runs again");
+                    True(IrStep() == 1 && st.BedSwitch.Plan.Step == 1, "both do step 1's hold time");
+                    True(WaitFor(() => st.BedSwitch.Plan.Step == 2, 5000), "the bed goes on to step 2");
+                    True(WaitFor(() => IrStep() == 2, 1500), "and the IR with it");
+                    ir.RunAsync(d => d.Stop()).Wait();
+                } finally {
+                    ir.Dispose();
+                    bed.Dispose();
+                }
+            });
+
+            Run("Second PC410: Wait for IR keeps the bed in step with a slower IR ramp", () => {
+                var s = new AppSettings { StationId = StationCatalog.DefaultId };
+                s.Bed.Mode = BedMode.SecondPc410;
+                s.Bed.Enabled = true;
+                var prof = new ReflowProfile { Holdback = 5, BedHoldback = 5 };
+                prof.Steps.Add(new ProfileStep(0.3, 60, 5) { BedTarget = 100, BedRampRate = 3, WaitForIr = true });
+                prof.Steps.Add(new ProfileStep(0.3, 70, 60) { BedTarget = 120, BedRampRate = 3 });
+                s.SetSync(0, prof);
+                var ir = new DeviceService();
+                var bed = new DeviceService();
+                try {
+                    var st = new ReflowLink.UI.AppState(s, ir, bed);
+                    var options = new ConnectionOptions { UseSimulator = true, SimulatorSpeed = 10, PollIntervalMs = 200 };
+                    ir.ConnectAsync(options).Wait();
+                    bed.ConnectAsync(options).Wait();
+                    DeviceService.RunBothAsync(ir, bed, (a, b) => PatternPair.Write(a, b, prof, 0, UnusedStepMode.Zeros, true, null, CancellationToken.None)).Wait();
+                    DeviceService.RunBothAsync(ir, bed, (a, b) => PatternPair.Check(a, b, 0, 260, 260, null, CancellationToken.None)).Wait(); // different ramps are fine
+                    Thread.Sleep(600);
+                    st.Sync.Sync = s.SyncFor(0);
+                    DeviceService.RunBothAsync(ir, bed, (a, b) => { PatternPair.Start(a, b, 0); return true; }).Wait();
+                    int IrStep() => SyncCoordinator.StepOf(ir.Last?.Segment, 2, st.Sync.PairedSegments) ?? 0;
+                    int BedStep() => SyncCoordinator.StepOf(bed.Last?.Segment, 2, st.Sync.PairedSegments) ?? 0;
+                    True(WaitFor(() => st.Sync.BedWaiting, 10000), "the bed waits for the IR");
+                    Eq(1, IrStep()); // the IR is still on its way to 60 °C
+                    Eq(1, BedStep());
+                    Eq(100.0, bed.Last.Sp); // at its set temperature, before its hold time
+                    Thread.Sleep(1000);
+                    True(st.Sync.BedWaiting, "still waiting");
+                    True(WaitFor(() => !st.Sync.BedWaiting, 25000), "released once the IR is at its set temperature");
+                    True(IrStep() == 1 && BedStep() == 1, "both do step 1's hold time");
+                    True(WaitFor(() => IrStep() == 2, 5000), "the IR goes on to step 2");
+                    True(WaitFor(() => BedStep() == 2, 1500), "and the bed with it");
+                    DeviceService.RunBothAsync(ir, bed, (a, b) => { PatternPair.Stop(a, b); return true; }).Wait();
+                } finally {
+                    ir.Dispose();
+                    bed.Dispose();
+                }
+            });
+
             Run("Single PC410: a start that overtakes Stop doesn't switch the bed back on", () => {
                 var settings = new AppSettings();
                 settings.Bed.Mode = BedMode.SinglePc410;
@@ -1251,6 +1492,109 @@ namespace ReflowLink.Tests {
                 } finally {
                     Directory.Delete(root, true);
                 }
+            });
+
+            Run("Constant temperature: written as 8 holds, saved with the profile's own steps", () => {
+                var p = new ReflowProfile { Name = "Dry board" };
+                p.Steps.Add(new ProfileStep(1, 120, 60) { WaitForBed = true });
+                Eq(false, p.ConstantTemperature);
+                Eq(150.0, p.ConstantTarget);
+                True(ReferenceEquals(p, p.ForController()), "off: the steps are written");
+
+                p.ConstantTemperature = true;
+                p.ConstantTarget = 125;
+                p.ConstantBedTarget = 100;
+                Eq(1.0, p.ConstantRamp);
+                Eq(1.0, p.ConstantBedRamp);
+                p.ConstantRamp = 2;
+                p.ConstantBedRamp = 0.5;
+                var written = p.ForController();
+                Eq(8, written.Steps.Count);
+                True(written.Steps.All(s => s.Target == 125 && s.BedTarget == 100 && s.HoldSeconds == ReflowProfile.ConstantHoldSeconds && !s.WaitForBed),
+                    "8 steps at the temperature with the longest hold");
+                True(written.Steps.All(s => s.RampRate == 2), "the IR ramp");
+                var bed = written.ForBed();
+                True(bed.Steps.Count == 8 && bed.Steps.All(s => s.RampRate == 0.5 && s.Target == 100 && s.HoldSeconds == ReflowProfile.ConstantHoldSeconds),
+                    "the bed ramps at its own rate");
+                Eq(150.0, ProfileMath.BuildBedCurve(written, 25, 25, false).Points[1].Time); // 75 °C at 0.5 °C/s
+                Eq(50.0, ProfileMath.BuildPlannedCurve(written, 25).Points[1].Time); // 100 °C at 2 °C/s
+                Eq(1, p.Steps.Count); // the profile's own steps are left alone
+                True(ProfileMath.BuildPlannedCurve(written, 25).TotalSeconds > 22 * 3600, "about 22 hours");
+                Eq(0, written.Validate(260, 260).Count());
+
+                string path = Path.Combine(Path.GetTempPath(), "reflowlink_constant_test.rlprofile");
+                try {
+                    p.Save(path);
+                    var loaded = ReflowProfile.Load(path);
+                    True(loaded.ConstantTemperature, "mode saved");
+                    Eq(125.0, loaded.ConstantTarget);
+                    Eq(100.0, loaded.ConstantBedTarget);
+                    Eq(2.0, loaded.ConstantRamp);
+                    Eq(0.5, loaded.ConstantBedRamp);
+                    Eq(1, loaded.Steps.Count);
+                    Eq(120.0, loaded.Steps[0].Target);
+                    // A file from an older version has none of it: off, at the default temperature.
+                    File.WriteAllText(path, "<ReflowProfile><Name>Old</Name><Steps><Step ramp=\"1\" target=\"150\" hold=\"30\" /></Steps></ReflowProfile>");
+                    var old = ReflowProfile.Load(path);
+                    False(old.ConstantTemperature, "off in old files");
+                    Eq(150.0, old.ConstantTarget);
+                    Eq(1.0, old.ConstantRamp);
+                } finally {
+                    File.Delete(path);
+                }
+            });
+
+            Run("Constant temperature: a pattern read back from the controller is recognised", () => {
+                foreach (var units in new[] { ControllerUnits.SecondsBased, ControllerUnits.MinutesBased }) {
+                    var sim = new SimulatedPc410(1, 1, units);
+                    sim.Open();
+                    using var c = new Pc410Client(sim, 1) { ResponseTimeoutMs = 150, Retries = 1 };
+                    var dev = new Pc410Device(c) { Units = units };
+                    var p = new ReflowProfile { ConstantTemperature = true, ConstantTarget = 180 };
+                    var res = dev.UploadProfile(p.ForController(), 6, UnusedStepMode.Zeros, true, null, CancellationToken.None);
+                    Eq(0, res.Warnings.Count);
+                    var back = dev.DownloadProfile(6, null, CancellationToken.None);
+                    False(back.ConstantTemperature, "not marked until checked");
+                    back.MarkConstantIfItIs();
+                    True(back.ConstantTemperature, "recognised (" + units.Dwell + ")");
+                    Eq(180.0, back.ConstantTarget);
+                    Eq(1.0, back.ConstantRamp);
+                }
+                var normal = new ReflowProfile();
+                for (int i = 0; i < 8; i++) normal.Steps.Add(new ProfileStep(1, 150, 60));
+                normal.MarkConstantIfItIs();
+                False(normal.ConstantTemperature, "short holds: an ordinary profile");
+            });
+
+            Run("Constant temperature: a second PC410 may ramp at its own rate", () => {
+                using var ci = NewSim(out _);
+                using var cb = NewSim(out _);
+                var ir = new Pc410Device(ci);
+                var bed = new Pc410Device(cb);
+                var p = new ReflowProfile { ConstantTemperature = true, ConstantTarget = 160, ConstantBedTarget = 120, ConstantRamp = 1.5, ConstantBedRamp = 0.3 };
+                PatternPair.Write(ir, bed, p.ForController(), 7, UnusedStepMode.Zeros, true, null, CancellationToken.None);
+                var checkedPair = PatternPair.Check(ir, bed, 7, 260, 260, null, CancellationToken.None); // not refused as a mismatch
+                checkedPair.MarkConstantIfItIs();
+                True(checkedPair.ConstantTemperature, "recognised");
+                Eq(1.5, checkedPair.ConstantRamp);
+                Eq(0.3, checkedPair.ConstantBedRamp);
+                Eq(120.0, checkedPair.ConstantBedTarget);
+                var read = PatternPair.Read(ir, bed, 7, null, CancellationToken.None);
+                Eq(0, read.Warnings.Count);
+
+                // Each heater has its own ramps; the holds must match.
+                var a = new ReflowProfile();
+                a.Steps.Add(new ProfileStep(1, 150, 30));
+                var b = a.Clone();
+                b.Steps[0].RampRate = 2;
+                var warnings = new List<string>();
+                var both = ReflowProfile.Combine(a, b, warnings);
+                Eq(0, warnings.Count);
+                Eq(2.0, both.Steps[0].BedRampRate);
+                Eq(1.0, both.Steps[0].RampRate);
+                b.Steps[0].HoldSeconds = 40;
+                ReflowProfile.Combine(a, b, warnings);
+                Eq(1, warnings.Count);
             });
 
             Run("Pattern comparison lists what differs", () => {
