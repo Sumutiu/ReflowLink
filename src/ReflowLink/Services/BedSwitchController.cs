@@ -73,9 +73,10 @@ namespace ReflowLink.Services {
         /// <summary>
         /// Runs the bed's own program for <paramref name="dt"/> seconds of process time. Nothing moves while
         /// <paramref name="paused"/>, without a bed reading, or while the bed lags the setpoint by more than the holdback
-        /// (during a ramp: behind it in the direction of the ramp; during a hold: either way).
+        /// (during a ramp: behind it in the direction of the ramp; during a hold: either way). At its set temperature it
+        /// waits, before the hold time (or before the next step), while <paramref name="mayHold"/> says no (Wait for IR).
         /// </summary>
-        public void Advance(double dt, double? bedTemperature, bool paused) {
+        public void Advance(double dt, double? bedTemperature, bool paused, Func<int, bool> mayHold = null) {
             if (!OwnProgram || Finished || paused || !(dt > 0)) return;
             if (bedTemperature is not double pv || Lags(pv)) return;
             double left = dt;
@@ -91,6 +92,8 @@ namespace ReflowLink.Services {
                     Setpoint = _bed[i];
                     Holding = true;
                     _holdLeft = _holds[i];
+                } else if (mayHold != null && !mayHold(Step)) {
+                    return; // at the set temperature, waiting for the IR before the hold time
                 } else if (_holdLeft > left) {
                     _holdLeft -= left;
                     return;
@@ -309,6 +312,12 @@ namespace ReflowLink.Services {
         public bool VirtualHold { get; set; }
 
         /// <summary>
+        /// Whether the bed's own program may do a step's hold time and go on (Wait for IR, see
+        /// <see cref="SyncCoordinator.BedMayStartHold"/>); null: always.
+        /// </summary>
+        public Func<int, bool> MayStartHold { get; set; }
+
+        /// <summary>
         /// The IR program is on hold only because it waits for the bed (Wait for Bed), so the bed's program keeps going.
         /// Any other hold (the user's) holds the bed's program too.
         /// </summary>
@@ -501,7 +510,7 @@ namespace ReflowLink.Services {
             // second PC410 would be held too), but not when the IR is only held to wait for the bed; and by Wait for IR.
             if (active && _plan != null && !_halted && stateFresh) {
                 bool userHold = t.State == ProgramState.Hold && !(IrHeldForBed?.Invoke() ?? false);
-                _plan.Advance(dt, BedTemperature, userHold || VirtualHold);
+                _plan.Advance(dt, BedTemperature, userHold || VirtualHold, MayStartHold);
             }
 
             var why = _holdOff ? "Switched off"
@@ -537,7 +546,8 @@ namespace ReflowLink.Services {
                 Sp = Setpoint,
                 Op = Demand,
                 State = t.State,
-                Segment = t.Segment,
+                // The bed's own step when ReflowLink runs its program; otherwise it's in the IR's step.
+                Segment = _plan?.OwnProgram == true && active ? _plan.Step : t.Segment,
             };
             TelemetryReady?.Invoke(Last);
             Changed?.Invoke();

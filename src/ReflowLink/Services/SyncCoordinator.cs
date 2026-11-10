@@ -33,8 +33,10 @@ namespace ReflowLink.Services {
     /// its hold time until the bed is at its set temperature too (ramp done, temperature within the bed holdback). Then
     /// both do the hold time together.</item>
     /// <item>Wait for IR on a step: the same for the bed, waiting for the IR (within the IR holdback).</item>
-    /// <item>As a safety net (a 0 s hold time, a missed reading), a heater that has already moved on to the next step
-    /// is held there until the other one has too.</item>
+    /// <item>With no hold time (or a missed reading), the waiting heater can reach the next step before it's held: it's
+    /// then held there until the other one has started that step too. With a single PC410 the bed's program doesn't
+    /// even get there: it waits at the end of the step (<see cref="BedMayStartHold"/>).</item>
+    /// <item>Without either toggle on a step, the heaters run it independently.</item>
     /// </list>
     /// While held, a controller keeps regulating at its set temperature, so a heater that's above it gets no power.
     /// So a toggle goes on the step where the heaters drift apart (Wait for Bed where the bed has the longer ramp). A
@@ -61,6 +63,8 @@ namespace ReflowLink.Services {
         private int _pairedEvidence;
         // Step in which both heaters have reached their set temperature: they're doing its hold time, nobody waits again.
         private int _syncedStep;
+        // Since when the polls have been incomplete (cut short for a command, or a reading missing); null while complete.
+        private DateTime? _incompleteSince;
         // Read from the command threads: a stop, a user hold or a lost link must cancel commands already queued.
         private volatile bool _userHold, _latched;
         private volatile int _generation;
@@ -170,6 +174,7 @@ namespace ReflowLink.Services {
             PairedSegments = PairedHint;
             _pairedEvidence = 0;
             _syncedStep = 0;
+            _incompleteSince = null;
             CheckedRun = false;
             foreach (var side in new[] { _ir, _bed }) {
                 side.HeldSince = side.ReleasedAt = null;
@@ -222,10 +227,45 @@ namespace ReflowLink.Services {
             if (ir.Step is not int irStep || bed.Step is not int bedStep) return (false, false);
             // In the same step, before its hold time: the one at its set temperature waits for the other.
             bool waiting = irStep == bedStep && irStep != syncedStep;
-            bool holdIr = sync.WaitForBed(bedStep) && (irStep > bedStep || (waiting && ir.AtTarget && !bed.Reached(sync.BedHoldback)));
-            bool holdBed = sync.WaitForIr(irStep) && (bedStep > irStep || (waiting && bed.AtTarget && !ir.Reached(sync.IrHoldback)));
+            bool holdIr = sync.WaitForBed(bedStep) && waiting && ir.AtTarget && !bed.Reached(sync.BedHoldback);
+            bool holdBed = sync.WaitForIr(irStep) && waiting && bed.AtTarget && !ir.Reached(sync.IrHoldback);
+            // Already in the next step (no hold time, or a missed reading): held there until the other has got there too.
+            holdIr |= irStep > bedStep && sync.WaitForBed(bedStep);
+            holdBed |= bedStep > irStep && sync.WaitForIr(irStep);
             return (holdIr, holdBed);
         }
+
+        /// <summary>
+        /// Single PC410: whether the bed's program may do the hold time of <paramref name="step"/> and go on to the next step.
+        /// With Wait for IR on the step, not before the IR is at its set temperature in that step (or past it); so the bed
+        /// waits exactly at the start of the hold time, or at the end of a step without one.
+        /// </summary>
+        public bool BedMayStartHold(int step) {
+            var sync = Sync;
+            if (!Enabled || _userHold || _latched || sync == null || !sync.WaitForIr(step) || step == _syncedStep) return true;
+            var ir = _ir.Device.Last;
+            if (ir == null || ir.State is not (ProgramState.Running or ProgramState.Hold)) return true; // nothing to wait for
+            int? irStep = StepOf(ir.Segment, sync.Steps, PairedSegments);
+            if (irStep.HasValue) {
+                _lastIrStep = irStep;
+                _lastIrStepAt = DateTime.Now;
+            } else if ((DateTime.Now - _lastIrStepAt).TotalSeconds <= IncompleteSeconds) {
+                irStep = _lastIrStep; // a missed SE reading: the IR is still in the step it last reported
+            }
+            if (irStep is not int s) return true; // steps not reported: the per-step choices can't be applied
+            if (s != step) return s > step;
+            double? target = sync.HasTargets ? sync.IrTargets[step - 1] : null;
+            return target == null || new SyncSide(ir.State, ir.Pv, ir.Sp, s, target).Reached(sync.IrHoldback);
+        }
+
+        private int? _lastIrStep;
+        private DateTime _lastIrStepAt = DateTime.MinValue;
+
+        /// <summary>How long incomplete polls are waited out before deciding on them anyway (s).</summary>
+        private const double IncompleteSeconds = 5;
+
+        private static bool Incomplete(Telemetry t) =>
+            t.Partial || t.Sp == null || t.Pv == null || (t.State is ProgramState.Running or ProgramState.Hold && t.Segment == null);
 
         /// <summary>Target of <paramref name="step"/> from a list saved with the pattern; null when unknown.</summary>
         private static double? TargetOf(System.Collections.Generic.IReadOnlyList<double> targets, int? step) =>
@@ -250,6 +290,16 @@ namespace ReflowLink.Services {
                 // (A controller that stopped answering latches the coordinator instead, see OnLinkChanged.)
                 if (!_userHold) ReleaseAll();
                 return;
+            }
+
+            // A poll cut short for a command (its program state and setpoint may then be up to 3 s old) or with a reading
+            // missing says too little: acting on it could resume a waiting heater. Decide on the next complete one; only
+            // after a few seconds without one, decide on what there is.
+            if (Incomplete(ir) || (!single && Incomplete(bed))) {
+                _incompleteSince ??= DateTime.Now;
+                if ((DateTime.Now - _incompleteSince.Value).TotalSeconds < IncompleteSeconds) return;
+            } else {
+                _incompleteSince = null;
             }
 
             int steps = Sync.Steps;

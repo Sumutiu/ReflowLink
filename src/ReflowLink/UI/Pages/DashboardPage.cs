@@ -543,7 +543,8 @@ namespace ReflowLink.UI.Pages {
                     ? State.Bed.IsConnected ? Describe(_bedState) : ("Offline", Theme.TextFaint)
                     : State.Device.IsConnected ? DescribeSwitch() : ("Offline", Theme.TextFaint);
                 string irStep = active && _state != ProgramState.Idle ? StepText(t?.Segment, steps) : "";
-                string bedStep = !Dual ? "" : active && _bedState != ProgramState.Idle ? StepText(State.Bed.Last?.Segment, steps) : "";
+                string bedStep = Dual ? active && _bedState != ProgramState.Idle ? StepText(State.Bed.Last?.Segment, steps) : ""
+                    : active && State.BedSwitch.Plan is { OwnProgram: true } plan ? steps > 0 ? $"step {plan.Step} of {steps}" : $"step {plan.Step}" : "";
                 if (State.Sync.IrWaiting) (irText, irColor) = ("Waiting for bed", Theme.Yellow);
                 if (State.Sync.BedWaiting) (bedText, bedColor) = ("Waiting for IR", Theme.Yellow);
                 _rowIr.Value = irStep.Length > 0 ? $"{irText} · {irStep}" : irText;
@@ -783,6 +784,7 @@ namespace ReflowLink.UI.Pages {
             bool both = Dual, single = State.SingleBed;
             var sync = Bed ? State.Settings.SyncFor(slot) : null;
             if (single && !CanStartSingleBed(slot, sync)) return;
+            if (!ConfirmStartTemperatures(slot, sync)) return;
             State.Sync.Reset();
             State.Sync.Sync = null; // set once the pattern has been checked
             int stops = State.StopCount;
@@ -819,6 +821,31 @@ namespace ReflowLink.UI.Pages {
         }
 
         /// <summary>Single PC410: the pattern needs saved bed targets and the bed has to be readable before a start.</summary>
+        /// <summary>
+        /// Warns when a heater is more than its holdback above step 1's set temperature: its program would pause until it
+        /// has cooled down, and heat from the other heater can keep it there. Uses what's known about the pattern (written,
+        /// read or started in this session, or saved bed targets); without that, nothing is checked. Returns false to cancel.
+        /// </summary>
+        private bool ConfirmStartTemperatures(int slot, PatternSync sync) {
+            var known = State.SlotProfiles[slot];
+            var first = known != null && known.Steps.Count > 0 ? known.Steps[0] : null;
+            bool targets = sync?.HasTargets == true;
+            double? irTarget = first?.Target ?? (targets ? sync.IrTargets[0] : null);
+            double? bedTarget = !Bed ? null : first?.BedTarget ?? (targets ? sync.BedTargets[0] : null);
+            double irHoldback = known?.Holdback ?? sync?.IrHoldback ?? ReflowProfile.HoldbackDefault;
+            double bedHoldback = known?.BedHoldback ?? sync?.BedHoldback ?? ReflowProfile.HoldbackDefault;
+            double? bedTemperature = Dual ? State.Bed.Last?.Pv : State.SingleBed ? State.BedSwitch.BedTemperature : null;
+            var issues = new[] {
+                ProfileMath.TooHotToStart("The Top IR", State.Device.Last?.Pv, irTarget, irHoldback),
+                ProfileMath.TooHotToStart("The bed", bedTemperature, bedTarget, bedHoldback),
+            }.Where(m => m != null).ToList();
+            if (issues.Count == 0) return true;
+            return DarkDialog.Show(FindForm(), "Above step 1's set temperature", string.Join("\n", issues)
+                + "\n\nA program pauses while its temperature is further from the setpoint than the holdback, so step 1 waits until "
+                + (issues.Count > 1 ? "they have" : "it has") + " cooled down, and heat from the other heater can keep it waiting. "
+                + "Let it cool first, or start anyway.", DialogTone.Warning, ["Start anyway", "Cancel"], 1) == 0;
+        }
+
         private bool CanStartSingleBed(int slot, PatternSync sync) {
             if (sync == null || !sync.HasTargets) {
                 DarkDialog.Error(FindForm(), $"No bed targets for pattern {slot}",

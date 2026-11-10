@@ -128,9 +128,10 @@ namespace ReflowLink.UI.Pages {
             grid.Dock = DockStyle.Top;
             grid.AutoSize = true;
             grid.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-            int[] widths = [24, 44, 84, 84, 78, 78, 70, 54, 54, 48];
+            // The Wait headers break after "for", and their columns leave room for "WAIT FOR" with wider fonts too.
+            int[] widths = [24, 42, 84, 84, 74, 74, 66, 70, 70, 46];
             foreach (var w in widths) grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Theme.S(w)));
-            string[] heads = ["#", "Use", "IR Ramp", "Bed Ramp", "IR Target", "Bed Heat Target", "Hold Time", "Wait for Bed", "Wait for IR", "Time"];
+            string[] heads = ["#", "Use", "IR Ramp", "Bed Ramp", "IR Target", "Bed Heat Target", "Hold Time", "Wait for\nBed", "Wait for\nIR", "Time"];
             for (int c = 0; c < heads.Length; c++) {
                 var h = new ThemedLabel(heads[c].ToUpperInvariant(), Theme.SmallBold, Theme.TextFaint) {
                     AutoSize = false,
@@ -156,9 +157,9 @@ namespace ReflowLink.UI.Pages {
                     Use = new ToggleSwitch() { Anchor = AnchorStyles.Left, Margin = Padding.Empty },
                     Ramp = Box(0.01, 10, 2, 0.1, "°C/s", 78),
                     BedRamp = Box(0.01, 10, 2, 0.1, "°C/s", 78),
-                    Target = Box(0, 400, 1, 1, "°C", 72),
-                    BedTarget = Box(0, 400, 1, 1, "°C", 72),
-                    Hold = Box(0, 9999, 0, 5, "s", 64),
+                    Target = Box(0, 400, 1, 1, "°C", 68),
+                    BedTarget = Box(0, 400, 1, 1, "°C", 68),
+                    Hold = Box(0, 9999, 0, 5, "s", 60),
                     WaitForBed = new ToggleSwitch() { Anchor = AnchorStyles.Left, Margin = new Padding(Theme.S(6), 0, 0, 0) },
                     WaitForIr = new ToggleSwitch() { Anchor = AnchorStyles.Left, Margin = new Padding(Theme.S(6), 0, 0, 0) },
                     Time = new ThemedLabel("", Theme.Small, Theme.TextDim) { Anchor = AnchorStyles.Left, Margin = new Padding(Theme.S(4), 0, 0, 0) },
@@ -409,8 +410,9 @@ namespace ReflowLink.UI.Pages {
                 r.Target.Value = src.Target;
                 r.BedTarget.Value = src.BedTarget;
                 r.Hold.Value = src.HoldSeconds;
-                r.WaitForBed.Checked = s?.WaitForBed ?? false;
-                r.WaitForIr.Checked = s?.WaitForIr ?? false;
+                // A step that isn't used yet starts with both waits on, like the steps of a new profile.
+                r.WaitForBed.Checked = s?.WaitForBed ?? true;
+                r.WaitForIr.Checked = s?.WaitForIr ?? true;
             }
             _holdback.Value = p.Holdback ?? ReflowProfile.HoldbackDefault;
             _bedHoldback.Value = p.BedHoldback ?? ReflowProfile.HoldbackDefault;

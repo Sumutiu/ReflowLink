@@ -307,6 +307,15 @@ namespace ReflowLink.Model {
             return list;
         }
 
+        /// <summary>
+        /// A heater that starts more than its holdback above step 1's set temperature: its program pauses (holdback) until
+        /// it has cooled to within the band, so step 1 stalls meanwhile. A sentence for the start warning, or null.
+        /// </summary>
+        public static string TooHotToStart(string heater, double? temperature, double? target, double holdback) =>
+            temperature is double t && target is double s && t > s + holdback
+                ? $"{heater} is at {t:0} °C, more than its {holdback:0.#} °C holdback above step 1's set temperature ({s:0.#} °C)."
+                : null;
+
         /// <summary>The steepest ramp rate of the profile (°C/s); 0 without steps.</summary>
         public static double SteepestRamp(ReflowProfile profile) =>
             profile.Steps.Count == 0 ? 0 : profile.Steps.Max(s => s.RampRate);
@@ -420,6 +429,12 @@ namespace ReflowLink.Model {
             public Func<ReflowProfile> Create;
         }
 
+        /// <summary>New profiles start with Wait for Bed and Wait for IR on for every step, so the heaters stay in step.</summary>
+        private static ReflowProfile WithWaits(ReflowProfile p) {
+            foreach (var s in p.Steps) s.WaitForBed = s.WaitForIr = true;
+            return p;
+        }
+
         /// <summary>
         /// Starting points only — every board, sensor position and heater behaves differently.
         /// Temperatures are as measured by the station's board thermocouple.
@@ -427,7 +442,7 @@ namespace ReflowLink.Model {
         public static readonly Preset[] All = [
             new() {
                 Title = "Lead-free solder (SAC305) — starting point",
-                Create = () => new ReflowProfile {
+                Create = () => WithWaits(new ReflowProfile {
                     Name = "Lead-free SAC305",
                     Notes = "Example profile. The board sensor usually reads below the joint temperature; verify with an external thermocouple.",
                     Steps = {
@@ -442,11 +457,11 @@ namespace ReflowLink.Model {
                     },
                     Holdback = 5,
                     BedHoldback = 5,
-                }
+                })
             },
             new() {
                 Title = "Leaded solder (Sn63/Pb37) — starting point",
-                Create = () => new ReflowProfile {
+                Create = () => WithWaits(new ReflowProfile {
                     Name = "Leaded Sn63Pb37",
                     Notes = "Example profile. Tune ramp rates and hold times for your board and sensor placement.",
                     Steps = {
@@ -460,24 +475,24 @@ namespace ReflowLink.Model {
                     },
                     Holdback = 5,
                     BedHoldback = 5,
-                }
+                })
             },
             new() {
                 Title = "Board pre-bake / gentle warm-up",
-                Create = () => new ReflowProfile {
+                Create = () => WithWaits(new ReflowProfile {
                     Name = "Pre-heat 120 °C",
                     Notes = "Slow warm-up and soak, useful to drive moisture out before rework.",
                     Steps = {
                         new ProfileStep(0.5, 120, 600),
                     },
-                }
+                })
             },
             new() {
                 Title = "Empty profile (1 step)",
-                Create = () => new ReflowProfile {
+                Create = () => WithWaits(new ReflowProfile {
                     Name = "New profile",
                     Steps = { new ProfileStep(1.0, 150, 30) },
-                }
+                })
             },
         ];
     }
