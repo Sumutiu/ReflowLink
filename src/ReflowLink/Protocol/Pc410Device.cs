@@ -168,7 +168,11 @@ namespace ReflowLink.Protocol {
                 // it's still tried every 20th poll and comes back as soon as it answers again.
                 if (_seSupported || _cycle % 20 == 0) {
                     try {
-                        t.Segment = (int)Client.ReadOptionalNumber(Se);
+                        double se = Client.ReadOptionalNumber(Se);
+                        // PC410 (genuine and clone, as PSoft reads it): "0.0NN" = zero-based segment NN, ramp/dwell pairs.
+                        // 0.000 while running = step 1 ramp; while idle = no step.
+                        bool running = t.State is ProgramState.Running or ProgramState.Hold;
+                        t.Segment = se < 1 ? (running ? (int)Math.Round(se * 1000) / 2 + 1 : 0) : (int)se;
                         _seSupported = true;
                         _seMisses = 0;
                     } catch (Pc410NakException) {
