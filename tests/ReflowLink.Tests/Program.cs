@@ -1659,6 +1659,19 @@ namespace ReflowLink.Tests {
                 Eq(1, warnings.Count);
             });
 
+            Run("SE: a plain step, or \"0.0NN\" (zero-based segment, ramp and dwell counted separately)", () => {
+                var run = ProgramState.Running;
+                Eq((int?)3, Pc410Device.DecodeSegment(3, run));                   // plain step number
+                Eq((int?)1, Pc410Device.DecodeSegment(0.000, run));               // step 1 ramp
+                Eq((int?)1, Pc410Device.DecodeSegment(0.001, run));               // step 1 dwell
+                Eq((int?)6, Pc410Device.DecodeSegment(0.011, ProgramState.Hold)); // step 6 dwell, on hold
+                Eq((int?)7, Pc410Device.DecodeSegment(0.012, run));               // step 7 ramp
+                Eq((int?)8, Pc410Device.DecodeSegment(0.015, run));               // step 8 dwell
+                Eq((int?)0, Pc410Device.DecodeSegment(0.000, ProgramState.Idle)); // idle: no step
+                Eq((int?)null, Pc410Device.DecodeSegment(0.004, ProgramState.Unknown));
+                Eq((int?)1, Pc410Device.DecodeSegment(1, ProgramState.Unknown));  // a plain step needs no state
+            });
+
             Run("Start warning: a heater more than its holdback above step 1's set temperature", () => {
                 Eq("The Top IR is at 169 °C, more than its 5 °C holdback above step 1's set temperature (153 °C).",
                     ProfileMath.TooHotToStart("The Top IR", 169, 153, 5));

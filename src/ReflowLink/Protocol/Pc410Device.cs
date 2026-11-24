@@ -168,11 +168,7 @@ namespace ReflowLink.Protocol {
                 // it's still tried every 20th poll and comes back as soon as it answers again.
                 if (_seSupported || _cycle % 20 == 0) {
                     try {
-                        double se = Client.ReadOptionalNumber(Se);
-                        // PC410 (genuine and clone, as PSoft reads it): "0.0NN" = zero-based segment NN, ramp/dwell pairs.
-                        // 0.000 while running = step 1 ramp; while idle = no step.
-                        bool running = t.State is ProgramState.Running or ProgramState.Hold;
-                        t.Segment = se < 1 ? (running ? (int)Math.Round(se * 1000) / 2 + 1 : 0) : (int)se;
+                        t.Segment = DecodeSegment(Client.ReadOptionalNumber(Se), t.State);
                         _seSupported = true;
                         _seMisses = 0;
                     } catch (Pc410NakException) {
@@ -193,6 +189,18 @@ namespace ReflowLink.Protocol {
             } finally {
                 _cycle++;
             }
+        }
+
+        /// <summary>
+        /// The program step from SE. Some PC410s report a plain step number; others report "0.0NN", where NN is the
+        /// zero-based segment with ramp and dwell counted separately (0.000 = step 1 ramp, 0.001 = step 1 dwell,
+        /// 0.011 = step 6 dwell). "0.000" is also what those report while idle, so it's only a step while a program
+        /// runs or is held; with the program state unknown, the step is too (null).
+        /// </summary>
+        public static int? DecodeSegment(double se, ProgramState state) {
+            if (se >= 1) return (int)se;
+            if (state == ProgramState.Unknown) return null;
+            return state is ProgramState.Running or ProgramState.Hold ? (int)Math.Round(se * 1000) / 2 + 1 : 0;
         }
 
         /// <summary>A command waits for the bus: leave the rest of this poll's readings for the next one.</summary>
